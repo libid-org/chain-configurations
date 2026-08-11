@@ -1,0 +1,62 @@
+# Mainnet — TEMPLATE. Copy to mainnet.toml, fill the INPUT keys, and leave
+# every OUTPUT key empty: the first `apply --confirm-fresh-deploy` run fills
+# them and opens a PR recording what it deployed.
+#
+# See networks/eden-testnet.toml for a fully-populated example and the
+# input-vs-output key convention.
+
+[network]
+name = "mainnet"
+# The chain id `apply` refuses to run without matching on-chain.
+chain_id = 0
+rpc_url = ""
+
+[aws]
+region = ""
+# KMS key id, `alias/...` name, or full ARN of the deployer key. Create it as
+# ECC_SECG_P256K1 / SIGN_VERIFY and fund its derived address before applying.
+kms_deployer = ""
+
+# Addresses of KEYS (not contracts): the X notary, the JWKS-rotation (OIDC)
+# notary, and the backend signing identity. Derive each from its own KMS key.
+[accounts]
+notary = ""
+oidc_notary = ""
+backend = ""
+
+# OUTPUT — leave empty. Filled by `libid-deploy apply`.
+[contracts]
+bank = ""
+registry = ""
+wallet_factory = ""
+notary_registry = ""
+x_zk_verifier = ""
+google_oidc_verifier = ""
+
+# OUTPUT — the identity-names stack. Uncomment to request it; a key present
+# but empty is a deploy request, an absent key is "not wanted".
+# [identity]
+# identity_names = ""
+# github_identity_verifier = ""
+# x_identity_verifier = ""
+# google_identity_verifier = ""   # also deploys identity_jwks_roots
+
+# INPUT: OAuth client ids (public, not secrets) and bot handles. The Google
+# client id is REQUIRED to deploy the OIDC verifier — it is enforced on-chain
+# as the JWT audience. An empty x_client_id skips the X ZK verifier deploy.
+[platforms]
+x_client_id = ""
+google_client_id = ""
+github_bot_handle = ""
+x_bot_handle = ""
+
+# INPUT: tokens to register on the Bank.
+# [[tokens]]
+# symbol = "$TIA"
+# address = "0x0000000000000000000000000000000000000000" # native
+
+# INPUT: comment templates pushed to the Bank, keyed by platform domain.
+# Placeholders: {recipient}, {amount}, {token}.
+[templates]
+# "api.github.com" = ["@bot honor @{recipient} with {amount} of {token}"]
+# "api.x.com" = ["@bot honor @{recipient} with {amount} of {token}"]
