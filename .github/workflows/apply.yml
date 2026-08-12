@@ -23,7 +23,9 @@ on:
       network:
         description: "Network file under networks/ (add new networks to this list)"
         type: choice
-        # eden-testnet is a LEGACY record: plan works, apply refuses it.
+        # eden-testnet is a canonical declarative file now, so both plan and
+        # apply work on it. Its FIRST apply needs confirm_fresh_deploy: the
+        # factory is virgin on that chain.
         options: [eden-testnet]
         default: eden-testnet
       mode:

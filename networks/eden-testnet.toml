@@ -1,32 +1,14 @@
 # Eden testnet — desired state for the libid contract stack.
 #
-# ============================================================================
-# LEGACY DEPLOYMENT (pre-Notary, pre-factory, libid-contracts 0.1.x)
+# Every address under [contracts] and [identity] is CANONICAL: each entry deploys
+# through LibidFactory via CREATE3 with `salt = keccak256(canonical name)`, so an
+# address depends only on the contract's name — not its bytecode, not its
+# constructor arguments, not which chain it is on. They are identical on every EVM
+# chain, and `validate` enforces that equality offline. Regenerate the table with
+# `libid-deploy plan --print-addresses`, never by hand.
 #
-# This file describes the deployment made BEFORE the shared Notary contract
-# existed: each contract here was initialized with the notary SIGNER address
-# directly, and there is no Notary proxy on this chain. Consequences:
-#
-#   - `plan` reports `contracts.notary` as missing (DEPLOY) — expected.
-#   - Consumer wiring checks (`*.notary_wiring`) WARN: these contracts have
-#     no `notaryContract()` getter. Also expected.
-#   - `validate` still passes; the file stays the record of what is live
-#     until the planned fresh redeploy replaces this stack with one wired
-#     through the Notary contract.
-#
-# Do NOT run `apply` expecting convergence: the 0.2.0+ flow cannot retrofit
-# a Notary contract into contracts initialized without one.
-#
-# These addresses also predate the deterministic factory (libid-contracts
-# 0.3.0): they were plain CREATE deploys and do NOT match the canonical
-# name-derived CREATE3 addresses a fresh apply produces. That is why
-# `network.legacy_addresses = true` below: it exempts this file from the
-# canonical-address equality check `validate` enforces on declarative
-# files, keeps the old empty-means-not-deployed reading for `plan`, and
-# makes `apply` refuse outright. The planned fresh redeploy will REPLACE
-# this file with a fully pre-filled declarative one carrying the canonical
-# address table (see networks/mainnet.toml.example for the shape).
-# ============================================================================
+# The first apply needs `confirm_fresh_deploy: true` while the factory is not yet
+# deployed here; that guard reads chain state, not this file.
 #
 # HOW TO READ THIS FILE
 #
@@ -37,72 +19,86 @@
 # INPUT keys describe what should exist: accounts, client ids, tokens,
 # templates. You edit these.
 #
-# OUTPUT keys record what a deploy produced: everything under [contracts]
-# and [identity]. An EMPTY value ("" ) or an ABSENT key means "not deployed
-# yet" — `libid-deploy apply` deploys it and writes the address back here,
-# then CI opens a PR so the file catches up with reality. Do not fill these
-# by hand unless you are restoring a lost record.
-#
-# Seeded from dyaka's real testnet deployment (deploy/envs/testnet/): the
-# addresses were read from the running backend, not transcribed by hand.
+# OUTPUT keys are everything under [contracts] and [identity]. Since
+# libid-deploy 0.4.0 they are pre-filled and declarative: `apply` reads
+# chain state to decide what is missing and NEVER rewrites this file.
 
 [network]
 name = "eden-testnet"
 chain_id = 3735928814
 rpc_url = "https://ev-reth-eden-testnet.binarybuilders.services:8545"
-# Pre-factory deployment recorded verbatim — see the header.
-legacy_addresses = true
 
 [aws]
 region = "eu-central-1"
-# The deployer's KMS key. Owns every UUPS proxy and the Bank diamond.
+# The deployer's KMS key. It owns every UUPS proxy and the Bank diamond.
+#
+# It must be the FACTORY GENESIS ADMIN, and it is: this alias derives to
+# 0x5bb76b0f81f028de363150602cc6d0ca929e3c31, which is the address baked into
+# the factory's frozen init code (FactoryGenesis.sol:25). `factory.deploy` is
+# owner-gated and impersonation is refused on real chains, so no other key can
+# perform this apply. Verified funded on Eden.
 kms_deployer = "alias/dyaka-testnet-deployer"
 
-# The ADDRESSES OF KEYS, not contracts. `notary` is the notary SIGNER — the
-# EOA/KMS identity whose signatures the stack accepts; on a 0.2.0 deployment
-# the Notary CONTRACT (`contracts.notary`) stores it. `oidc_notary` is the
-# legacy separate JWKS-rotation authority this pre-Notary deployment wired
-# into its OIDC verifier; 0.2.0 no longer uses it. `backend` is the backend's
-# own signing identity; the Bank grants it the backend role at construction.
+# The ADDRESSES OF KEYS, not contracts.
 [accounts]
+# The notary SIGNER — the identity whose signatures the whole stack accepts.
+# `apply` initializes the Notary CONTRACT with this and `setNotary`s it when
+# they drift, so this one value rotates every consumer at once. Both notary
+# service instances (dyaka's and the identity product's) sign with this key.
 notary = "0x7a3646e8431a4b0c8bb586a7d26d7da7ae4aa2b5"
-oidc_notary = "0x3b02dc7c278125dd3ea686d09335f7cd6604e5f2"
+
+# The WALLET PRODUCT's backend signing identity (alias/dyaka-testnet-backend),
+# wired into Registry.initialize(_backend) and the Bank diamond. The Bank grants
+# it the backend role, which is the authority to move user funds — so this value
+# matters, and it is the one that cannot be corrected afterwards: the Bank sets
+# its backend once in BankInit and exposes no setter, short of a diamond facet
+# upgrade. Registry does have `setBackend` (onlyOwner).
+#
+# Nothing under [identity] reads this — the notary is the identity stack's only
+# trust root and the identity backend holds no key. The field is required for the
+# two wallet contracts above.
 backend = "0xe9b132c2eccca08efaf62d18c301945f38ddc267"
 
-# OUTPUT: deployed contract addresses. Empty/absent = not deployed yet.
-#
-# `notary` is the Notary PROXY — the one contract everything verifies notary
-# attestations through since 0.2.0. Empty here because this legacy stack
-# predates it (see the header). The retired NotaryRegistry proxy of the
-# 0.1.x deployment lived at 0xe460b1bf58f48a2ac90889b269d27e145e845a92;
-# kept as a comment so the record is not lost.
-[contracts]
-notary = ""
-bank = "0x954a99f1756cf281caa0aa81c12b582fcf7c8d94"
-registry = "0xd764dbc5e51a042c004c52833f7e2f32b0cc651e"
-wallet_factory = "0xd46181cab629aeda48406b462656513821de6775"
-x_zk_verifier = "0x3f753cde17a261d6a6edf9d6846785d18bdb6efd"
-google_oidc_verifier = "0x69cc7c69b39ada71ce908d432868d5ef9a6a6d0e"
+# The operational owner the factory ends up with. Empty = the deployer, which
+# on this network IS the KMS genesis admin, so the default is exact.
+owner = ""
 
-# OUTPUT: the identity-names stack. The whole section is absent because it is
-# not deployed on this network yet. To request it, add:
+# OUTPUT: the canonical contract addresses. Do not hand-edit.
+[contracts]
+factory = "0xa92244c3f4462aad08bd1a33c3940b9b936321ad"
+notary = "0x4bddfe9fb875d03838e5013c338e2dea9dcc2fc5"
+bank = "0x060708036a9ee89c6513346abab0929427bc9b06"
+registry = "0x03c2b8d5f4d5cf7b7f81f876035046e262c4c9c9"
+wallet_factory = "0x945b8a7a480a2552ec3c61c24d4363c9558107a8"
+x_zk_verifier = "0xf8ddccfebfefdc5cbae308f0aac9a12e275eda5f"
+google_oidc_verifier = "0xef53a51e3a46e5f82248a39ddff0b7b901ab438c"
+
+# OUTPUT: the identity-names stack. A key being PRESENT is what requests it.
 #
-#   [identity]
-#   identity_names = ""
-#   github_identity_verifier = ""
-#   # optional, each needs a large Honk circuit verifier:
-#   x_identity_verifier = ""
-#   google_identity_verifier = ""   # also deploys identity_jwks_roots
-#
-# A key that is PRESENT but empty is a deploy request; a key that is ABSENT
-# is "not wanted". GitHub needs only the notary+backend keys and is always
-# wired once the section exists.
+# All five are requested: GitHub needs only the Notary contract, while X and
+# Google each need a large Honk circuit verifier, and Google additionally needs
+# the JWKS trust list — declaring `google_identity_verifier` without
+# `identity_jwks_roots` fails validation.
+[identity]
+identity_names = "0xd467d48769c26faee36ba6b6fc9228f14aef6dd2"
+github_identity_verifier = "0x936067c1b5d77c67358210e77f664382191d2015"
+x_identity_verifier = "0xda66811e494a918e9ae0e5797206fca04333c055"
+google_identity_verifier = "0x1b9db690ee040ca92d44d1585b3aab625a475c27"
+# Deploys EMPTY. Until a keeper tick lands a notarized reading of Google's live
+# JWKS, every Google claim reverts with UntrustedModulus(). The deployment repo
+# runs the keeper hourly; the first tick has to be run deliberately, right after
+# this apply.
+identity_jwks_roots = "0x589b56f95d5df5483c79e46e7b20293135c9ebd9"
 
 # INPUT: platform rules — OAuth client ids and the bot handles the on-chain
 # templates mention. Client ids are bound into proofs on-chain (the OIDC
 # verifier cannot be deployed without `google_client_id`; it becomes the
 # expected JWT audience). Changing a client id after deploy is NOT applied to
 # an already-deployed verifier — see `--upgrade oidc-verifier`.
+#
+# NOTE for when handles.link gets its own Google OAuth client: these ids are the
+# audience the identity verifiers expect too, so either add the new origin's
+# redirect URI to this same Google client, or plan an `--upgrade oidc-verifier`.
 [platforms]
 x_client_id = "TC1ub1JmTDNDSlJjajUxanlrOXA6MTpjaQ"
 google_client_id = "391814431594-1piqeo3a0g2lmnmpseto3106tde3ja97.apps.googleusercontent.com"
@@ -129,13 +125,13 @@ address = "0x0D136f5F3C27Bf87E7d00B7516DABD5deead01FA"
 
 # INPUT: platform comment templates pushed to the Bank (@testyakly bots).
 # `apply` clears each listed platform first (setPlatformTemplate is
-# append-only on-chain) and re-seeds exactly this list, so what a reader
-# sees here matches what is on-chain.
+# append-only on-chain) and re-seeds exactly this list, so what a reader sees
+# here matches what is on-chain.
 #
-# The template string must appear in the user's post/comment for
-# verification. Use {recipient}, {amount} and {token} placeholders. A
-# template may omit {recipient} (recipient-less form) — the recipient is
-# then inferred from the reply/quote parent.
+# The template string must appear in the user's post/comment for verification.
+# Use {recipient}, {amount} and {token} placeholders. A template may omit
+# {recipient} (recipient-less form) — the recipient is then inferred from the
+# reply/quote parent.
 [templates]
 "api.github.com" = [
     "@testyakly honor @{recipient} with {amount} of {token}",
