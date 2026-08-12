@@ -11,9 +11,11 @@ name: Apply
 # change, not a redeploy.
 #
 # THIS WORKFLOW IS MANUAL ONLY. It never runs on push. `mode: plan` (the
-# default) is read-only; `mode: apply` sends transactions and then opens a
-# PR recording any addresses the run minted, so the network file catches up
-# with reality.
+# default) is read-only; `mode: apply` sends transactions. The network file
+# is DECLARATIVE: it already carries every canonical address (validated to
+# equal the CREATE3 prediction), presence is read from chain state, and
+# apply never rewrites the file — so there is no write-back and no PR step.
+# The run's plan and apply summaries land in the step summary.
 
 on:
   workflow_dispatch:
@@ -21,6 +23,7 @@ on:
       network:
         description: "Network file under networks/ (add new networks to this list)"
         type: choice
+        # eden-testnet is a LEGACY record: plan works, apply refuses it.
         options: [eden-testnet]
         default: eden-testnet
       mode:
@@ -33,7 +36,7 @@ on:
         type: string
         default: ""
       confirm_fresh_deploy:
-        description: "Required ONLY for a first deploy. Orphans any existing contracts and balances."
+        description: "Required ONLY when the LibidFactory has no code on-chain (virgin network): that first apply publishes the whole declared stack."
         type: boolean
         default: false
       source:
@@ -50,8 +53,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write # to push the branch that records freshly deployed addresses
-  pull-requests: write # to open the PR for it
+  contents: read # checkout only — apply never writes the network file back
   id-token: write # required to mint the OIDC token AWS exchanges for a role
 
 jobs:
@@ -202,31 +204,15 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # peter-evans/create-pull-request is a no-op when the working tree is
-      # clean, so an apply that recorded nothing opens nothing. `base` is
-      # the branch this run was dispatched from, so a hotfix-branch apply
-      # records its addresses there.
-      - name: Open PR with configuration changes
+      # The config is declarative and apply never rewrites it, so the tree
+      # MUST be clean afterwards — anything else is a bug worth failing on.
+      - name: Working tree is untouched
         if: inputs.mode == 'apply'
-        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
-        with:
-          base: ${{ github.ref_name }}
-          branch: apply/${{ inputs.network }}-${{ github.run_id }}
-          title: "chore(${{ inputs.network }}): record contract addresses from apply"
-          commit-message: "chore(${{ inputs.network }}): record contract addresses from apply"
-          add-paths: ${{ env.NETWORK_FILE }}
-          body: |
-            The network file changed during an **apply** run
-            ([${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}))
-            against `${{ inputs.network }}`, signed by KMS key
-            `${{ steps.cfg.outputs.kms_key_id }}` as
-            `${{ steps.identity.outputs.address }}`
-            (upgrade: `${{ inputs.upgrade || 'none' }}`).
-
-            Merging makes the file read as populated, so later runs
-            reconcile instead of redeploying.
-
-            **Checklist — propagate the new addresses downstream:**
-            - [ ] backend deployment env (kustomize overlay / pod env)
-            - [ ] frontend env (`NEXT_PUBLIC_*` contract addresses)
-            - [ ] any notary / JWKS-rotation service pinning verifier addresses
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet; then
+            echo "::error::apply modified the working tree — the declarative model forbids write-back"
+            git diff
+            exit 1
+          fi
+          echo "Config untouched, as declared."

@@ -4,16 +4,28 @@ Desired-state configuration for the libid contract stack, one file per
 network, plus the `libid-deploy` binary and the GitHub Actions that apply a
 file to its chain with an AWS KMS signer.
 
-The model is converge-and-record:
+The model is DECLARATIVE (0.4.0):
 
-1. `networks/<name>.toml` says what should exist on a chain.
-2. `libid-deploy plan` compares it with what does — read-only.
-3. `libid-deploy apply` deploys whatever is missing, re-sends the idempotent
-   configuration, performs explicitly requested upgrades, and **rewrites the
-   file** with the addresses it minted.
-4. The apply workflow opens a PR with the modified file, so the
-   configuration catches up with reality and the next run reconciles
-   instead of redeploying.
+1. `networks/<name>.toml` declares what should exist on a chain — including
+   **every address, pre-filled up front**. Canonical contracts live at
+   CREATE3-deterministic addresses, so the file carries the full address
+   table before the chain has anything on it; `validate` rejects a
+   canonical key whose value is not exactly `predict_address(factory,
+   name)`, naming the expected value.
+2. Deployed-vs-not is determined from **chain state** (`eth_getCode` at the
+   declared address / the factory's `deployedAt` record) — never from
+   config emptiness. The old "empty = not deployed" convention is dead on
+   declarative files.
+3. `libid-deploy plan` compares the declarations with the chain, read-only:
+   each component is "declared + present" (ok) or "declared + missing"
+   (DEPLOY — apply would put it at exactly the declared address). A wrong
+   declared address never gets that far: it fails validation at load.
+4. `libid-deploy apply` deploys whatever the CHAIN lacks, re-sends the
+   idempotent configuration, and performs explicitly requested upgrades.
+   It **never rewrites the file** — after an apply the config is
+   byte-identical, and there is no write-back PR. Integration tests can
+   therefore use identical config data regardless of which chain (or how
+   little of the stack) exists yet.
 
 All contract bytecode is embedded in the binary via the
 [`libid-contracts`](https://github.com/libid-org/libid-contracts) crate —
@@ -86,9 +98,11 @@ How apply gets there, in order:
 
 One exception: `--upgrade oidc-verifier` REPLACES the GoogleOidcVerifier
 with a plain CREATE deployment — the canonical name is single-use and the
-replacement's address is meant to change. After a replace, the live
-(config) address legitimately diverges from the factory's `deployedAt`
-record; `plan` knows and does not warn.
+replacement's address is meant to change. The new address is recorded
+**on-chain only**: `Registry.oidcVerifierOf` is the record, and the config
+keeps declaring the canonical first-deploy address (the file is never
+rewritten). `plan` knows the pattern and reports the divergence as ok, not
+a warning.
 
 ## Config schema
 
@@ -98,14 +112,25 @@ leaves AWS.
 
 | Section | Kind | Contents |
 |---|---|---|
-| `[network]` | input | `name`, `chain_id` (apply refuses a mismatch), `rpc_url` |
+| `[network]` | input | `name`, `chain_id` (apply refuses a mismatch), `rpc_url`, `legacy_addresses` (marks a pre-factory record — see below) |
 | `[aws]` | input | `region`, `kms_deployer` (key id / `alias/...` / ARN; the default signer) |
-| `[accounts]` | input | `notary` (the notary **signer** — see below), `backend` — addresses of **keys**, not contracts. `oidc_notary` is accepted for legacy pre-Notary files but no longer wired anywhere |
-| `[contracts]` | output | `factory` (the deterministic LibidFactory — predictable, recorded anyway), `notary` (the Notary **proxy**), `bank`, `registry`, `wallet_factory`, `x_zk_verifier`, `google_oidc_verifier` |
-| `[identity]` | output | `identity_names`, `github_identity_verifier`, `x_identity_verifier`, `google_identity_verifier`, `identity_jwks_roots` |
+| `[accounts]` | input | `notary` (the notary **signer** — see below), `backend`, `owner` (the operational owner the factory ends up with; empty = the deployer) — addresses of **keys**, not contracts. `oidc_notary` is accepted for legacy pre-Notary files but no longer wired anywhere |
+| `[contracts]` | declared | `factory` (the deterministic LibidFactory), `notary` (the Notary **proxy**), `bank`, `registry`, `wallet_factory`, `x_zk_verifier`, `google_oidc_verifier` — always present, pre-filled with the canonical table, validated against the prediction |
+| `[identity]` | declared | `identity_names`, `github_identity_verifier`, `x_identity_verifier`, `google_identity_verifier`, `identity_jwks_roots` — same rules; the optional keys signal wanted-ness by presence |
 | `[platforms]` | input | `x_client_id`, `google_client_id`, `github_bot_handle`, `x_bot_handle` |
-| `[[tokens]]` | input | `symbol`, `address` (zero address = native) |
+| `[[tokens]]` | input | `symbol`, `address` (zero address = native; token addresses are non-canonical and stay free-form) |
 | `[templates]` | input | per-platform comment templates (string or array), keyed by platform domain |
+
+The `[accounts].owner` flow: the factory's genesis owner is the libID
+deployer KMS address baked into its frozen init code. `apply` needs factory
+ownership only while it has names left to `factory.deploy`; at the end of
+every run it converges ownership onto `owner`. Empty `owner` = the deployer
+— exact on real networks, where the KMS genesis admin IS the apply signer.
+A different `owner` makes apply INITIATE the Ownable2Step handover (that
+key must `acceptOwnership` itself). Local dev configs set
+`owner = <anvil #0>` explicitly, and on a dev chain (anvil/hardhat) apply
+completes the handover by impersonation, so the stack ends fully owned by
+the declared operational owner.
 
 The Notary split (libid-contracts 0.2.0):
 
@@ -123,26 +148,35 @@ The Notary split (libid-contracts 0.2.0):
   (or a pre-Notary contract without the getter) is a WARN that apply does
   not fix silently.
 
-Output-key semantics:
+Declared-address semantics:
 
-- **Empty (`""`) or absent** = not deployed yet; `apply` deploys and fills
-  it. `apply` never overwrites a non-empty value — except
-  `--upgrade oidc-verifier`, which REPLACES that verifier so its address
-  genuinely changes.
-- An entirely empty `[contracts]` section is a **fresh deploy** and
-  requires `--confirm-fresh-deploy` (it orphans anything already on the
-  chain, including balances).
+- Every canonical key is **always present and pre-filled** with the
+  canonical table; `validate` errors on a value that does not equal
+  `predict_address(factory, name)` (naming the expected value) and on an
+  empty canonical key. Presence on-chain is checked via `eth_getCode` at
+  plan/apply time; `apply` deploys whatever the CHAIN lacks and never
+  touches the file.
+- The **fresh-deploy guard keys on chain state**: `--confirm-fresh-deploy`
+  is required exactly when the FACTORY has no code on-chain (a virgin
+  network — that first apply publishes the entire declared stack). With
+  the factory present, apply converges incrementally without the flag.
 - `[identity]` absent = the identity-names stack is not wanted. Once the
   section exists, `identity_names` and `github_identity_verifier` are
   always converged; `x_identity_verifier` / `google_identity_verifier` are
-  requested by their key being *present* (even if empty). Google also
-  deploys `identity_jwks_roots`, which starts EMPTY — point a JWKS rotation
-  listener at it before Google names work.
+  requested by their key being *present* (carrying the canonical address).
+  Google requires `identity_jwks_roots` declared alongside; the roots
+  contract starts EMPTY — point a JWKS rotation listener at it before
+  Google names work.
 - The verifiers are guarded: the X ZK verifier deploys only when
   `x_client_id` is set and the Registry slot is zero; the Google OIDC
   verifier only when `google_client_id` is set and the slot is zero. A
   changed client id is **not** applied to an already-deployed verifier —
   that is what `--upgrade oidc-verifier` is for.
+- **Legacy files** (`network.legacy_addresses = true`, today only
+  `networks/eden-testnet.toml`) record a pre-factory deployment verbatim:
+  the canonical equality check is skipped, `plan` keeps the old
+  empty-means-not-deployed reading, and `apply` refuses to run — the
+  planned fresh redeploy replaces such stacks.
 
 ## Running locally
 
@@ -171,15 +205,19 @@ key rather than shipped to AWS.
 Upgrade components: `registry`, `wallet-factory`, `notary` (UUPS
 `upgradeToAndCall`; the proxy address and its stored signer survive),
 `bank` (diamond facet REPLACE — the diamond is the storage, the facets are
-the code), `oidc-verifier` (redeploy + re-point; new address, recorded in
-the PR). Upgrades never move an entry address — the canonical CREATE3
-addresses are stable across every upgrade except the OIDC REPLACE, whose
-address change is the point.
+the code), `oidc-verifier` (redeploy + re-point; the new address is
+recorded on-chain in `Registry.oidcVerifierOf`, not in the file). Upgrades
+never move an entry address — the canonical CREATE3 addresses are stable
+across every upgrade except the OIDC REPLACE, whose address change is the
+point.
 
 For anvil rehearsal, `apply --dev` (or just letting apply detect anvil)
 covers the factory-ownership wrinkle: the local signer is not the baked
 genesis admin, so apply impersonates the admin and Ownable2Step-transfers
-factory ownership to the signer. This path is refused on real chains.
+factory ownership to the signer for the deploys, then converges it onto
+the declared `[accounts].owner` (the anvil #0 wallet in the local dev
+configs), completing the handover by impersonation. This path is refused
+on real chains.
 
 ## How the Apply action works
 
@@ -194,10 +232,12 @@ factory ownership to the signer. This path is refused on real chains.
    enabled `ECC_SECG_P256K1`/`SIGN_VERIFY` key, the deployer address is
    derived from `get-public-key` via `cast keccak`, and its balance must be
    nonzero.
-4. Runs `plan` always; `apply` only when `mode: apply`.
-5. Opens a PR (`apply/<network>-<run id>`) with the rewritten network file,
-   including the deployer identity and a downstream-propagation checklist.
-   No changes → no PR.
+4. Runs `plan` always; `apply` only when `mode: apply`. Both render into
+   the step summary.
+5. There is **no write-back and no PR step**: the file already declares
+   every canonical address, so an apply discovers nothing to record — a
+   post-apply check fails the job if the working tree changed at all. The
+   permissions are read-only on repo contents accordingly.
 
 One apply per network at a time (`concurrency`, no cancel-in-progress:
 a half-applied upgrade is worse than a queued one). The job runs in the
@@ -206,9 +246,12 @@ demand reviewers.
 
 ## Adding a network
 
-Copy `networks/mainnet.toml.example`, fill the input keys, add the name to
-the `network` choice list in `apply.yml`, and run the workflow with
-`mode: plan` first.
+Copy `networks/mainnet.toml.example` — it ships FULLY pre-filled with the
+canonical address table, which is valid on every EVM network — fill the
+input keys (chain, RPC, AWS, accounts, platforms, tokens, templates), add
+the name to the `network` choice list in `apply.yml`, and run the workflow
+with `mode: plan` first. The first apply on a virgin network needs
+`confirm_fresh_deploy`.
 
 ## Release process
 
@@ -225,8 +268,9 @@ workflow's default `source: release` consumes the newest x86_64 asset.
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test` — the integration tests need `anvil` on PATH (spawned bare:
   `--disable-default-create2-deployer`, proving the install path) and cover
-  the critical cycle — empty file → fresh apply → file rewritten → second
-  apply is a no-op — plus the network-invariance proof: two separate bare
-  anvils converge to IDENTICAL canonical addresses matching the offline
-  prediction.
+  the critical declarative cycle — pre-filled file → fresh apply on a
+  virgin anvil lands everything AT the declared addresses → second apply is
+  a no-op without any flag → the file is BYTE-IDENTICAL throughout — plus
+  the network-invariance proof: two separate bare anvils converge onto the
+  same declared canonical addresses.
 - Every commit must be signed off (`git commit -s`); see CONTRIBUTING.md.

@@ -1,19 +1,19 @@
-# Mainnet — TEMPLATE. Copy to mainnet.toml, fill the INPUT keys, and leave
-# every OUTPUT key empty: the first `apply --confirm-fresh-deploy` run fills
-# them and opens a PR recording what it deployed.
+# Mainnet — TEMPLATE. Copy to mainnet.toml and fill the INPUT keys (chain,
+# RPC, AWS, accounts, platforms, tokens, templates). The address keys are
+# ALREADY final: every canonical contract deploys through the deterministic
+# LibidFactory via CREATE3, so its address is a pure function of its frozen
+# name — the same on every EVM network, known before the chain has anything
+# on it. This file therefore ships FULLY pre-filled and is NEVER rewritten:
+# whether a declared contract exists is read from CHAIN STATE
+# (`eth_getCode`) at plan/apply time, and `apply` deploys whatever the chain
+# lacks, landing at exactly these addresses.
 #
-# This template describes the CURRENT (libid-contracts 0.3.0, factory-first)
-# schema: apply first makes sure the keyless CREATE2 deployer and the
-# deterministic LibidFactory exist (a chain that cannot host them cannot
-# host the stack), then deploys every top-level contract THROUGH the factory
-# via CREATE3 under a fixed canonical name — so each entry address is a pure
-# function of its name, identical on every EVM network and computable before
-# anything is deployed (`libid-deploy plan --print-addresses`). The shared
-# Notary contract still deploys first among them and every other contract is
-# wired to its proxy at initialize. networks/eden-testnet.toml is a
-# fully-populated example of the input-vs-output key convention, but note
-# that it records the LEGACY pre-Notary, pre-factory deployment (see its
-# header).
+# `validate` enforces the declarations: a canonical key whose value is not
+# exactly `predict_address(factory, name)` is a validation ERROR. Reprint
+# the table any time with `libid-deploy plan --print-addresses` (offline).
+#
+# The first apply on a VIRGIN network (no factory code on-chain) requires
+# `--confirm-fresh-deploy`; after that, applies converge incrementally.
 
 [network]
 name = "mainnet"
@@ -34,40 +34,53 @@ kms_deployer = ""
 # stores this address: apply initializes it with this value, and later
 # editing this key makes apply rotate the on-chain signer via `setNotary`
 # (one transaction; every consumer follows the contract).
+#
+# `owner` is the OPERATIONAL OWNER the factory should end up with. On real
+# networks this is the KMS genesis admin — the libID deployer key baked
+# into the factory's frozen init code, i.e. the SAME identity as the apply
+# signer — so leaving it empty (= default to the deployer) is exact. Set it
+# only to hand the factory to a different key: apply then INITIATES the
+# Ownable2Step transfer and that key must acceptOwnership itself. (Local
+# dev configs set it to the anvil #0 wallet and apply completes the
+# handover by impersonation.)
 [accounts]
 notary = ""
 backend = ""
+owner = ""
 
-# OUTPUT — leave empty. Filled by `libid-deploy apply`.
+# DECLARED canonical addresses — identical on every EVM network; validated
+# to equal predict_address(factory, name). Do not edit: a different value
+# is a validation error naming the expected one.
 #
-# Every address below except `factory` is name-deterministic: it equals
-# predict_address(factory, name) for a fixed canonical name (see the README
-# name table), so the SAME addresses appear on every network. Renaming a
-# canonical name would mean a new address forever — names are frozen.
-#
-# `factory` is the deterministic LibidFactory proxy. Fully predictable (one
-# canonical address on every EVM chain), recorded anyway so this file stays
-# the complete deployment record.
-#
-# `notary` is the Notary PROXY address — the one contract everything else
-# verifies notary attestations through. It deploys FIRST and is wired into
+# `factory` is the deterministic LibidFactory proxy (CREATE2, frozen init
+# code). `notary` is the Notary PROXY — the one contract everything else
+# verifies notary attestations through; it deploys FIRST and is wired into
 # every consumer at initialize. Not the signer; that is `accounts.notary`.
+#
+# `google_oidc_verifier` stays declared at its canonical address even after
+# an `--upgrade oidc-verifier` REPLACE: the replacement is recorded
+# on-chain only, in `Registry.oidcVerifierOf` — the chain is the record.
 [contracts]
-factory = ""
-notary = ""
-bank = ""
-registry = ""
-wallet_factory = ""
-x_zk_verifier = ""
-google_oidc_verifier = ""
+factory = "0xa92244c3f4462aad08bd1a33c3940b9b936321ad"
+notary = "0x4bddfe9fb875d03838e5013c338e2dea9dcc2fc5"
+bank = "0x060708036a9ee89c6513346abab0929427bc9b06"
+registry = "0x03c2b8d5f4d5cf7b7f81f876035046e262c4c9c9"
+wallet_factory = "0x945b8a7a480a2552ec3c61c24d4363c9558107a8"
+x_zk_verifier = "0xf8ddccfebfefdc5cbae308f0aac9a12e275eda5f"
+google_oidc_verifier = "0xef53a51e3a46e5f82248a39ddff0b7b901ab438c"
 
-# OUTPUT — the identity-names stack. Uncomment to request it; a key present
-# but empty is a deploy request, an absent key is "not wanted".
-# [identity]
-# identity_names = ""
-# github_identity_verifier = ""
-# x_identity_verifier = ""
-# google_identity_verifier = ""   # also deploys identity_jwks_roots
+# DECLARED — the identity-names stack. Delete the whole section to opt out;
+# delete the x/google keys individually to opt out of those verifiers (an
+# ABSENT optional key means "not wanted", a PRESENT one must carry the
+# canonical address). Google requires `identity_jwks_roots` alongside it,
+# and the roots contract starts EMPTY on-chain — point a JWKS rotation
+# listener at it before Google names work.
+[identity]
+identity_names = "0xd467d48769c26faee36ba6b6fc9228f14aef6dd2"
+github_identity_verifier = "0x936067c1b5d77c67358210e77f664382191d2015"
+x_identity_verifier = "0xda66811e494a918e9ae0e5797206fca04333c055"
+google_identity_verifier = "0x1b9db690ee040ca92d44d1585b3aab625a475c27"
+identity_jwks_roots = "0x589b56f95d5df5483c79e46e7b20293135c9ebd9"
 
 # INPUT: OAuth client ids (public, not secrets) and bot handles. The Google
 # client id is REQUIRED to deploy the OIDC verifier — it is enforced on-chain

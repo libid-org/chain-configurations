@@ -1,12 +1,17 @@
-//! The network file: schema, parsing, validation, and the comment-preserving
-//! rewrite that records deployed addresses.
+//! The network file: schema, parsing, and validation.
 //!
-//! Convention: keys under `[contracts]` and `[identity]` are OUTPUTS. An
-//! empty string or an absent key means "not deployed yet"; `apply` fills
-//! only those and never overwrites a non-empty value (the one exception is
-//! an explicit `--upgrade oidc-verifier`, which REPLACES the verifier and
-//! must record its new address). Everything else is an INPUT an operator
-//! edits.
+//! The model is DECLARATIVE (libid-deploy 0.4.0): every canonical contract
+//! lives at a CREATE3-deterministic address, so the `[contracts]` and
+//! `[identity]` address keys are ALWAYS present and pre-filled with the
+//! canonical table — `validate` rejects a canonical key whose value is not
+//! exactly `predict_address(factory, name)`. Whether a declared contract is
+//! deployed is determined from CHAIN STATE (`eth_getCode`) at plan/apply
+//! time, never from config emptiness, and `apply` NEVER rewrites the file.
+//!
+//! Legacy files (`network.legacy_addresses = true`) record a pre-factory
+//! deployment verbatim: the old empty-means-not-deployed convention still
+//! parses and plans there, but `apply` refuses them — the planned fresh
+//! redeploy replaces such stacks with canonical ones.
 
 use std::{
     collections::BTreeMap,
@@ -20,7 +25,13 @@ use anyhow::{
     Context,
     Result,
 };
+use libid_contracts::factory::{
+    predict_address,
+    predict_factory_address,
+};
 use serde::Deserialize;
+
+use crate::names;
 
 /// One parsed network file.
 #[derive(Debug, Clone, Deserialize)]
@@ -32,10 +43,11 @@ pub struct NetworkConfig {
     pub aws: Aws,
     /// Addresses of keys (not contracts) the contracts trust.
     pub accounts: Accounts,
-    /// OUTPUT: the core contract addresses.
+    /// The core contract addresses — DECLARED, pre-filled with the
+    /// canonical table.
     #[serde(default)]
     pub contracts: Contracts,
-    /// OUTPUT: the identity-names stack. Absent section = not wanted.
+    /// The identity-names stack. Absent section = not wanted.
     #[serde(default)]
     pub identity: Option<Identity>,
     /// INPUT: OAuth client ids and bot handles.
@@ -59,6 +71,12 @@ pub struct Network {
     pub chain_id: u64,
     /// JSON-RPC endpoint.
     pub rpc_url: String,
+    /// LEGACY marker: the file records a pre-factory (plain-CREATE)
+    /// deployment verbatim. Canonical-address validation is skipped,
+    /// `plan` keeps the old empty-means-not-deployed reading, and `apply`
+    /// refuses to run — the fresh redeploy replaces such stacks.
+    #[serde(default)]
+    pub legacy_addresses: bool,
 }
 
 /// `[aws]`.
@@ -89,16 +107,29 @@ pub struct Accounts {
     pub oidc_notary: String,
     /// The backend signing identity; the Bank grants it the backend role.
     pub backend: String,
+    /// The OPERATIONAL OWNER the factory should end up with. Empty =
+    /// the deployer (the apply signer). On real networks this is the KMS
+    /// genesis admin — the same identity as the deployer key — so the
+    /// default is exact; on local dev chains it names the anvil #0 wallet
+    /// and the anvil auto-impersonation hands factory ownership to IT.
+    #[serde(default)]
+    pub owner: String,
 }
 
-/// `[contracts]` — OUTPUT keys.
+impl Accounts {
+    /// The declared operational owner, if any (`None` = default to the
+    /// deployer).
+    pub fn owner_address(&self) -> Result<Option<Address>> {
+        opt_address(&self.owner, "accounts.owner")
+    }
+}
+
+/// `[contracts]` — declared canonical addresses.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Contracts {
-    /// The deterministic LibidFactory proxy. Its address is fully
-    /// predictable (the same on every EVM network — see the README), but it
-    /// is recorded here like every other output so the file stays the
-    /// complete record of what is on the chain.
+    /// The deterministic LibidFactory proxy — one canonical CREATE2 address
+    /// on every EVM network.
     #[serde(default)]
     pub factory: String,
     /// The Bank diamond.
@@ -119,15 +150,17 @@ pub struct Contracts {
     /// The XZkVerifier proxy (deployed only when `x_client_id` is set).
     #[serde(default)]
     pub x_zk_verifier: String,
-    /// The GoogleOidcVerifier proxy (deployed only when `google_client_id`
-    /// is set).
+    /// The GoogleOidcVerifier proxy. Declared at its canonical address
+    /// even after an `--upgrade oidc-verifier` REPLACE: the replacement is
+    /// a plain-CREATE deploy recorded ONLY on-chain, in
+    /// `Registry.oidcVerifierOf` — the chain, not this file, is the record.
     #[serde(default)]
     pub google_oidc_verifier: String,
 }
 
-/// `[identity]` — OUTPUT keys. A key PRESENT but empty is a deploy request;
-/// an ABSENT key is "not wanted". `identity_names` and
-/// `github_identity_verifier` are always wanted once the section exists.
+/// `[identity]` — declared canonical addresses. The optional keys signal
+/// wanted-ness by PRESENCE (an absent `x_identity_verifier` means "not
+/// wanted"); a present key must carry the canonical address.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Identity {
@@ -202,7 +235,7 @@ impl Templates {
     }
 }
 
-/// Parse an OUTPUT-style address field: empty = not deployed.
+/// Parse an address field that may be empty (legacy files; optional keys).
 pub fn opt_address(value: &str, label: &str) -> Result<Option<Address>> {
     let value = value.trim();
     if value.is_empty() {
@@ -212,8 +245,8 @@ pub fn opt_address(value: &str, label: &str) -> Result<Option<Address>> {
         .parse()
         .map_err(|e| anyhow!("invalid address for {label}: {e}"))?;
     if addr == Address::ZERO {
-        // A recorded zero address is "not deployed", the same as empty —
-        // nothing legitimate deploys to the zero address.
+        // A recorded zero address carries no information — nothing
+        // legitimate deploys to the zero address.
         return Ok(None);
     }
     Ok(Some(addr))
@@ -237,7 +270,9 @@ impl NetworkConfig {
     }
 
     /// Structural sanity checks — everything that can fail before touching
-    /// the network.
+    /// the network. Canonical files additionally get the address-equality
+    /// check: every declared canonical key must EQUAL
+    /// `predict_address(factory, name)`.
     pub fn validate(&self) -> Result<()> {
         if self.network.name.trim().is_empty() {
             bail!("network.name must not be empty");
@@ -255,6 +290,33 @@ impl NetworkConfig {
         if !self.accounts.oidc_notary.trim().is_empty() {
             required_address(&self.accounts.oidc_notary, "accounts.oidc_notary")?;
         }
+        self.accounts.owner_address()?;
+        for token in &self.tokens {
+            if token.symbol.trim().is_empty() {
+                bail!("a [[tokens]] entry has an empty symbol");
+            }
+            // The zero address is legitimate here: it names the native token.
+            let _: Address = token.address.parse().map_err(|e| {
+                anyhow!("invalid address for token {}: {e}", token.symbol)
+            })?;
+        }
+        if self.aws.region.trim().is_empty() {
+            bail!("aws.region must not be empty");
+        }
+        if self.aws.kms_deployer.trim().is_empty() {
+            bail!("aws.kms_deployer must not be empty");
+        }
+
+        if self.network.legacy_addresses {
+            self.validate_legacy_addresses()
+        } else {
+            self.validate_canonical_addresses()
+        }
+    }
+
+    /// Legacy files: addresses are free-form records of a pre-factory
+    /// deployment; only well-formedness is checked.
+    fn validate_legacy_addresses(&self) -> Result<()> {
         for (label, value) in [
             ("contracts.factory", &self.contracts.factory),
             ("contracts.bank", &self.contracts.bank),
@@ -294,43 +356,103 @@ impl NetworkConfig {
                 }
             }
         }
-        for token in &self.tokens {
-            if token.symbol.trim().is_empty() {
-                bail!("a [[tokens]] entry has an empty symbol");
-            }
-            // The zero address is legitimate here: it names the native token.
-            let _: Address = token.address.parse().map_err(|e| {
-                anyhow!("invalid address for token {}: {e}", token.symbol)
+        Ok(())
+    }
+
+    /// Canonical files: every declared canonical key must EQUAL the
+    /// predicted CREATE3 address for its frozen name; the factory key must
+    /// equal the canonical factory address. Non-canonical addresses
+    /// (tokens, account keys) stay free-form.
+    fn validate_canonical_addresses(&self) -> Result<()> {
+        let artifacts = libid_contracts::Artifacts::embedded();
+        let factory = predict_factory_address(&artifacts)
+            .map_err(|e| anyhow!("predict_factory_address failed: {e}"))?;
+
+        let declared_factory = required_address(
+            &self.contracts.factory,
+            "contracts.factory",
+        )
+        .map_err(|e| {
+            anyhow!("{e} — pre-fill it with the canonical factory address {factory:#x}")
+        })?;
+        if declared_factory != factory {
+            bail!(
+                "contracts.factory declares {declared_factory:#x} but the canonical \
+                 LibidFactory address is {factory:#x} — declared canonical addresses \
+                 must equal their prediction"
+            );
+        }
+
+        for c in names::CANONICAL_CONTRACTS {
+            let label = format!("{}.{}", c.section, c.key);
+            let Some(raw) = self.canonical_raw(c.section, c.key) else {
+                // Absent [identity] section or absent optional key = the
+                // component is not wanted; nothing to check.
+                continue;
+            };
+            let expected = predict_address(factory, c.name);
+            let declared = required_address(raw, &label).map_err(|e| {
+                anyhow!(
+                    "{e} — the declarative schema pre-fills every canonical address; \
+                     set it to {expected:#x} (CREATE3 '{}')",
+                    c.name
+                )
             })?;
+            if declared != expected {
+                bail!(
+                    "{label} declares {declared:#x} but the canonical address of \
+                     CREATE3 '{}' is {expected:#x} — declared canonical addresses \
+                     must equal predict_address(factory, name)",
+                    c.name
+                );
+            }
         }
-        if self.aws.region.trim().is_empty() {
-            bail!("aws.region must not be empty");
-        }
-        if self.aws.kms_deployer.trim().is_empty() {
-            bail!("aws.kms_deployer must not be empty");
+
+        if let Some(identity) = &self.identity {
+            if identity.google_identity_verifier.is_some()
+                && identity.identity_jwks_roots.is_none()
+            {
+                bail!(
+                    "identity.google_identity_verifier is declared but \
+                     identity.identity_jwks_roots is absent — the Google verifier \
+                     trusts the JWKS roots contract, so declare both"
+                );
+            }
         }
         Ok(())
     }
 
-    /// Whether the whole core `[contracts]` section is empty — the state
-    /// that makes `apply` a FRESH DEPLOY and requires
-    /// `--confirm-fresh-deploy`. `contracts.factory` is deliberately NOT
-    /// counted: it is chain infrastructure with a predictable address, not
-    /// a protocol deployment an operator could orphan.
-    pub fn contracts_all_empty(&self) -> Result<bool> {
-        Ok([
-            opt_address(&self.contracts.bank, "contracts.bank")?,
-            opt_address(&self.contracts.registry, "contracts.registry")?,
-            opt_address(&self.contracts.wallet_factory, "contracts.wallet_factory")?,
-            opt_address(&self.contracts.notary, "contracts.notary")?,
-            opt_address(&self.contracts.x_zk_verifier, "contracts.x_zk_verifier")?,
-            opt_address(
-                &self.contracts.google_oidc_verifier,
-                "contracts.google_oidc_verifier",
-            )?,
-        ]
-        .iter()
-        .all(Option::is_none))
+    /// The raw config value for a canonical `(section, key)` pair, treating
+    /// an absent `[identity]` section or absent optional key as "not
+    /// wanted" (`None`).
+    pub fn canonical_raw(&self, section: &str, key: &str) -> Option<&str> {
+        let identity = self.identity.as_ref();
+        match (section, key) {
+            ("contracts", "notary") => Some(self.contracts.notary.as_str()),
+            ("contracts", "wallet_factory") => {
+                Some(self.contracts.wallet_factory.as_str())
+            }
+            ("contracts", "registry") => Some(self.contracts.registry.as_str()),
+            ("contracts", "bank") => Some(self.contracts.bank.as_str()),
+            ("contracts", "x_zk_verifier") => Some(self.contracts.x_zk_verifier.as_str()),
+            ("contracts", "google_oidc_verifier") => {
+                Some(self.contracts.google_oidc_verifier.as_str())
+            }
+            ("identity", "identity_names") => identity.map(|i| i.identity_names.as_str()),
+            ("identity", "github_identity_verifier") => {
+                identity.map(|i| i.github_identity_verifier.as_str())
+            }
+            ("identity", "x_identity_verifier") => {
+                identity.and_then(|i| i.x_identity_verifier.as_deref())
+            }
+            ("identity", "google_identity_verifier") => {
+                identity.and_then(|i| i.google_identity_verifier.as_deref())
+            }
+            ("identity", "identity_jwks_roots") => {
+                identity.and_then(|i| i.identity_jwks_roots.as_deref())
+            }
+            _ => None,
+        }
     }
 
     /// The templates flattened to `(platform, template)` pairs, in file
@@ -346,83 +468,74 @@ impl NetworkConfig {
     }
 }
 
-/// One address to record in the network file.
-#[derive(Debug, Clone)]
-pub struct AddressUpdate {
-    /// Table name: `contracts` or `identity`.
-    pub section: &'static str,
-    /// Key inside the table.
-    pub key: String,
-    /// The deployed address.
-    pub address: Address,
-    /// Overwrite even a non-empty value. Only the OIDC verifier REPLACE
-    /// upgrade sets this — its address genuinely changes.
-    pub force: bool,
-}
-
-/// Record deployed addresses into the network file, preserving comments and
-/// formatting. Only empty/absent keys are filled unless `force` is set.
-/// Returns the keys that changed, as `section.key` strings.
-pub fn record_addresses(path: &Path, updates: &[AddressUpdate]) -> Result<Vec<String>> {
-    if updates.is_empty() {
-        return Ok(Vec::new());
-    }
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let mut doc: toml_edit::DocumentMut = text
-        .parse()
-        .with_context(|| format!("failed to parse {}", path.display()))?;
-
-    let mut changed = Vec::new();
-    for update in updates {
-        if doc.get(update.section).is_none() {
-            doc[update.section] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        let table = doc[update.section]
-            .as_table_mut()
-            .ok_or_else(|| anyhow!("[{}] is not a table", update.section))?;
-        let current = table
-            .get(&update.key)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_owned();
-        let occupied = opt_address(&current, &update.key)?.is_some();
-        if occupied && !update.force {
-            continue;
-        }
-        let new_value = format!("{:#x}", update.address);
-        if current == new_value {
-            continue;
-        }
-        table[&update.key] = toml_edit::value(new_value);
-        changed.push(format!("{}.{}", update.section, update.key));
-    }
-
-    if !changed.is_empty() {
-        std::fs::write(path, doc.to_string())
-            .with_context(|| format!("failed to write {}", path.display()))?;
-    }
-    Ok(changed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn seeded_path() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../networks/eden-testnet.toml")
+    fn networks_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../networks")
     }
 
-    /// The committed Eden file parses, validates, and carries the real
-    /// deployment: every core contract populated, identity absent.
+    /// A minimal CANONICAL file with every address pre-filled from the
+    /// prediction, as a TOML string.
+    fn canonical_toml() -> String {
+        let artifacts = libid_contracts::Artifacts::embedded();
+        let factory = predict_factory_address(&artifacts).unwrap();
+        let addr = |name: &str| format!("{:#x}", predict_address(factory, name));
+        format!(
+            r#"[network]
+name = "canonical-test"
+chain_id = 31337
+rpc_url = "http://localhost:8545"
+
+[aws]
+region = "eu-central-1"
+kms_deployer = "alias/test"
+
+[accounts]
+notary = "0x1111111111111111111111111111111111111111"
+backend = "0x2222222222222222222222222222222222222222"
+owner = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+
+[contracts]
+factory = "{factory:#x}"
+notary = "{notary}"
+bank = "{bank}"
+registry = "{registry}"
+wallet_factory = "{wallet_factory}"
+x_zk_verifier = "{x_zk}"
+google_oidc_verifier = "{oidc}"
+
+[identity]
+identity_names = "{id_names}"
+github_identity_verifier = "{gh}"
+x_identity_verifier = "{x_id}"
+google_identity_verifier = "{g_id}"
+identity_jwks_roots = "{jwks}"
+"#,
+            notary = addr(names::NOTARY),
+            bank = addr(names::BANK),
+            registry = addr(names::REGISTRY),
+            wallet_factory = addr(names::WALLET_FACTORY),
+            x_zk = addr(names::X_ZK_VERIFIER),
+            oidc = addr(names::GOOGLE_OIDC_VERIFIER),
+            id_names = addr(names::IDENTITY_NAMES),
+            gh = addr(names::GITHUB_IDENTITY_VERIFIER),
+            x_id = addr(names::X_IDENTITY_VERIFIER),
+            g_id = addr(names::GOOGLE_IDENTITY_VERIFIER),
+            jwks = addr(names::IDENTITY_JWKS_ROOTS),
+        )
+    }
+
+    /// The committed Eden file parses and validates as a LEGACY record:
+    /// non-canonical addresses, empty-means-not-deployed, identity absent.
     #[test]
-    fn the_seeded_eden_file_parses() {
-        let cfg = NetworkConfig::load(&seeded_path()).expect("eden-testnet.toml loads");
+    fn the_seeded_eden_file_parses_as_legacy() {
+        let cfg = NetworkConfig::load(&networks_dir().join("eden-testnet.toml"))
+            .expect("eden-testnet.toml loads");
         assert_eq!(cfg.network.chain_id, 3735928814);
+        assert!(cfg.network.legacy_addresses);
         assert!(cfg.identity.is_none());
-        assert!(!cfg.contracts_all_empty().unwrap());
         assert_eq!(cfg.tokens.len(), 4);
         // Both platforms carry templates and each template names the bot.
         let pairs = cfg.template_pairs();
@@ -430,109 +543,92 @@ mod tests {
         assert!(pairs.iter().all(|(_, t)| t.contains("@testyakly")));
     }
 
-    /// Recording fills only empty keys, preserves every comment, and leaves
-    /// populated keys alone without `force`.
+    /// The committed mainnet template is FULLY pre-filled and passes the
+    /// canonical-equality validation once its placeholder inputs are set.
     #[test]
-    fn record_addresses_preserves_comments_and_never_clobbers() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("net.toml");
-        let original = "\
-# A load-bearing comment.
-[network]
-name = \"test\" # trailing comment
-chain_id = 1
-rpc_url = \"http://localhost:8545\"
+    fn the_mainnet_example_is_fully_prefilled_and_canonical() {
+        let text = std::fs::read_to_string(networks_dir().join("mainnet.toml.example"))
+            .expect("mainnet.toml.example readable");
+        // The template ships placeholder INPUTs; substitute the minimum an
+        // operator must fill so validation reaches the address checks.
+        let text = text
+            .replace("chain_id = 0", "chain_id = 1")
+            .replace("rpc_url = \"\"", "rpc_url = \"https://example.invalid\"")
+            .replace("region = \"\"", "region = \"eu-central-1\"")
+            .replace("kms_deployer = \"\"", "kms_deployer = \"alias/x\"")
+            .replace(
+                "notary = \"\"",
+                "notary = \"0x1111111111111111111111111111111111111111\"",
+            )
+            .replace(
+                "backend = \"\"",
+                "backend = \"0x2222222222222222222222222222222222222222\"",
+            );
+        let cfg: NetworkConfig = toml::from_str(&text).expect("template parses");
+        assert!(!cfg.network.legacy_addresses);
+        cfg.validate().expect("template validates canonically");
+        // FULLY pre-filled: identity included, every canonical key present.
+        let identity = cfg.identity.as_ref().expect("identity declared");
+        assert!(identity.x_identity_verifier.is_some());
+        assert!(identity.google_identity_verifier.is_some());
+        assert!(identity.identity_jwks_roots.is_some());
+    }
 
-[contracts]
-bank = \"\" # filled by apply
-registry = \"0xd764dbc5e51a042c004c52833f7e2f32b0cc651e\"
-";
-        std::fs::write(&path, original).unwrap();
-
-        let new_addr = Address::repeat_byte(0xab);
-        let changed = record_addresses(
-            &path,
-            &[
-                AddressUpdate {
-                    section: "contracts",
-                    key: "bank".into(),
-                    address: new_addr,
-                    force: false,
-                },
-                AddressUpdate {
-                    section: "contracts",
-                    key: "registry".into(),
-                    address: new_addr,
-                    force: false,
-                },
-                AddressUpdate {
-                    section: "identity",
-                    key: "identity_names".into(),
-                    address: new_addr,
-                    force: false,
-                },
-            ],
-        )
-        .unwrap();
-        assert_eq!(changed, vec!["contracts.bank", "identity.identity_names"]);
-
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("# A load-bearing comment."));
-        assert!(text.contains("# trailing comment"));
-        assert!(text.contains(&format!("bank = \"{new_addr:#x}\"")));
-        // The populated registry survived untouched.
-        assert!(
-            text.contains("registry = \"0xd764dbc5e51a042c004c52833f7e2f32b0cc651e\"")
+    /// A fully pre-filled canonical config validates.
+    #[test]
+    fn canonical_config_validates() {
+        let cfg: NetworkConfig = toml::from_str(&canonical_toml()).unwrap();
+        cfg.validate().expect("canonical config validates");
+        assert_eq!(
+            cfg.accounts.owner_address().unwrap(),
+            Some(
+                "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+                    .parse()
+                    .unwrap()
+            )
         );
-        // The identity section was created for the new key.
-        assert!(text.contains("[identity]"));
     }
 
-    /// `force` is the explicit escape hatch for the OIDC verifier REPLACE.
+    /// A canonical key whose value differs from the prediction is a
+    /// validation ERROR that names the expected address.
     #[test]
-    fn record_addresses_force_overwrites() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("net.toml");
-        std::fs::write(
-            &path,
-            "[contracts]\ngoogle_oidc_verifier = \"0x69cc7c69b39ada71ce908d432868d5ef9a6a6d0e\"\n",
-        )
-        .unwrap();
-        let new_addr = Address::repeat_byte(0xcd);
-        let changed = record_addresses(
-            &path,
-            &[AddressUpdate {
-                section: "contracts",
-                key: "google_oidc_verifier".into(),
-                address: new_addr,
-                force: true,
-            }],
-        )
-        .unwrap();
-        assert_eq!(changed, vec!["contracts.google_oidc_verifier"]);
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains(&format!("{new_addr:#x}")));
+    fn canonical_mismatch_is_an_error_naming_the_expected_address() {
+        let artifacts = libid_contracts::Artifacts::embedded();
+        let factory = predict_factory_address(&artifacts).unwrap();
+        let expected = predict_address(factory, names::BANK);
+        let wrong = "0x00000000000000000000000000000000deadbeef";
+        let text = canonical_toml().replace(&format!("{expected:#x}"), wrong);
+        let cfg: NetworkConfig = toml::from_str(&text).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("contracts.bank"), "got: {err}");
+        assert!(err.contains(&format!("{expected:#x}")), "got: {err}");
     }
 
-    /// A rewrite with nothing to change leaves the file byte-identical.
+    /// The old empty-means-not-deployed convention is DEAD on canonical
+    /// files: an empty canonical key is an error naming the fill-in value.
     #[test]
-    fn record_addresses_is_a_noop_when_populated() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("net.toml");
-        let original =
-            std::fs::read_to_string(seeded_path()).expect("seeded file readable");
-        std::fs::write(&path, &original).unwrap();
-        let changed = record_addresses(
-            &path,
-            &[AddressUpdate {
-                section: "contracts",
-                key: "bank".into(),
-                address: Address::repeat_byte(0xef),
-                force: false,
-            }],
-        )
-        .unwrap();
-        assert!(changed.is_empty());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    fn canonical_empty_key_is_an_error() {
+        let artifacts = libid_contracts::Artifacts::embedded();
+        let factory = predict_factory_address(&artifacts).unwrap();
+        let expected = predict_address(factory, names::REGISTRY);
+        let text = canonical_toml().replace(&format!("{expected:#x}"), "");
+        let cfg: NetworkConfig = toml::from_str(&text).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("contracts.registry"), "got: {err}");
+        assert!(err.contains(&format!("{expected:#x}")), "got: {err}");
+    }
+
+    /// Declaring the Google identity verifier without the JWKS roots is
+    /// rejected: the pair deploys and verifies together.
+    #[test]
+    fn google_identity_without_jwks_roots_is_an_error() {
+        let text = canonical_toml()
+            .lines()
+            .filter(|l| !l.starts_with("identity_jwks_roots"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cfg: NetworkConfig = toml::from_str(&text).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("identity_jwks_roots"), "got: {err}");
     }
 }

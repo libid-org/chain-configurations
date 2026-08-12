@@ -1,15 +1,15 @@
 [package]
 name = "libid-deploy"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.94.1"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/libid-org/chain-configurations"
-description = "Applies per-network desired-state configuration to chains: deploys, upgrades and configures the libid contract stack, then writes the deployed addresses back into the network file."
+description = "Applies per-network declarative configuration to chains: every canonical address is pre-declared (CREATE3-deterministic), deployed-vs-not is read from chain state, and apply converges the chain onto the file without ever rewriting it."
 publish = false
 
 [dependencies]
-libid-contracts = "0.3.0"
+libid-contracts = "0.3.1"
 alloy = { version = "1", features = [
     "contract",
     "providers",
@@ -30,9 +30,6 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-# `apply` rewrites the network file in place; toml_edit preserves the
-# comments and formatting a plain serializer would destroy.
-toml_edit = "0.22"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

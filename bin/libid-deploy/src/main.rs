@@ -51,8 +51,8 @@ enum Command {
         #[arg(long)]
         print_addresses: bool,
     },
-    /// Converge the chain onto the network file, then record the deployed
-    /// addresses back into it.
+    /// Converge the chain onto the network file. The file is declarative
+    /// and never rewritten: everything deploys at its declared address.
     Apply {
         /// Path to the network TOML file.
         #[arg(long)]
@@ -69,8 +69,9 @@ enum Command {
         /// Proceed without the interactive confirmation prompt.
         #[arg(long)]
         yes: bool,
-        /// Required when [contracts] is entirely empty: a fresh deploy
-        /// orphans anything already on the chain.
+        /// Required when the LibidFactory has no code on-chain (a virgin
+        /// network): that first apply publishes the entire declared stack.
+        /// With the factory present, apply converges incrementally.
         #[arg(long)]
         confirm_fresh_deploy: bool,
         /// Dev-chain mode: allow taking factory ownership from the baked
@@ -95,10 +96,15 @@ async fn main() -> Result<()> {
         Command::Validate { network, check_rpc } => {
             let cfg = NetworkConfig::load(&network)?;
             println!(
-                "{} parses and validates (network {}, chain {})",
+                "{} parses and validates (network {}, chain {}, {} addresses)",
                 network.display(),
                 cfg.network.name,
-                cfg.network.chain_id
+                cfg.network.chain_id,
+                if cfg.network.legacy_addresses {
+                    "legacy"
+                } else {
+                    "canonical"
+                }
             );
             if check_rpc {
                 let built = plan::build(&cfg).await?;

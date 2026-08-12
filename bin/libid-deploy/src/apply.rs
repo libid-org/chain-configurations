@@ -1,7 +1,15 @@
-//! Converge a chain onto the network file: deploy whatever is missing (in
-//! dependency order), re-send the idempotent configuration ops, perform any
-//! explicitly requested upgrades, and record the deployed addresses back
-//! into the file.
+//! Converge a chain onto the network file: deploy whatever the CHAIN lacks
+//! (in dependency order), re-send the idempotent configuration ops, and
+//! perform any explicitly requested upgrades.
+//!
+//! DECLARATIVE (0.4.0): the file pre-declares every canonical address
+//! (validated to equal `predict_address(factory, name)` at load), so apply
+//! reads presence from chain state (`eth_getCode` at the declared address /
+//! the factory's `deployedAt` record) and NEVER rewrites the file — after
+//! an apply the config is byte-identical to before it. The one address that
+//! can legitimately diverge from its declaration, a REPLACED
+//! GoogleOidcVerifier, is recorded on-chain only (`Registry.oidcVerifierOf`
+//! is the record). Legacy files (`network.legacy_addresses`) are refused.
 //!
 //! The orchestration order is ported from dyaka's deployers:
 //! `dyaka-auth::deploy::run` (login stack), `dyaka-transfer::deploy`
@@ -96,10 +104,7 @@ use tracing::{
 
 use crate::{
     config::{
-        opt_address,
-        record_addresses,
         required_address,
-        AddressUpdate,
         NetworkConfig,
     },
     names,
@@ -134,7 +139,9 @@ pub enum Upgrade {
     /// the diamond is the storage, the facets are the code.
     Bank,
     /// Redeploy + re-point: the GoogleOidcVerifier is replaced and its
-    /// ADDRESS CHANGES (the config records the new one).
+    /// ADDRESS CHANGES. The new address is recorded on-chain only —
+    /// `Registry.oidcVerifierOf` is the record; the config keeps declaring
+    /// the canonical first-deploy address.
     OidcVerifier,
 }
 
@@ -161,8 +168,9 @@ impl std::str::FromStr for Upgrade {
 pub struct Options {
     /// Components to explicitly upgrade.
     pub upgrades: Vec<Upgrade>,
-    /// Required when the whole `[contracts]` section is empty: a fresh
-    /// deploy orphans anything already on the chain.
+    /// Required when the FACTORY has no code on-chain (a virgin network):
+    /// that first apply publishes the entire declared stack. With the
+    /// factory present, apply converges incrementally without the flag.
     pub confirm_fresh_deploy: bool,
     /// Dev-chain mode: allow taking factory ownership from the baked
     /// genesis admin via impersonation. Impersonation only ever happens
@@ -171,7 +179,9 @@ pub struct Options {
     pub dev: bool,
 }
 
-/// What an apply run did.
+/// What an apply run did. The network file is declarative and NEVER
+/// rewritten, so there is nothing to report about it: every deployed
+/// component landed at exactly the address the file already declares.
 #[derive(Debug, Default)]
 pub struct Summary {
     /// Freshly deployed components, as `(component, address)`.
@@ -179,10 +189,8 @@ pub struct Summary {
     /// Explicitly upgraded components.
     pub upgraded: Vec<String>,
     /// On-chain configuration changes beyond the always-resent idempotent
-    /// ops — today only the Notary signer rotation.
+    /// ops — the Notary signer rotation and factory ownership handovers.
     pub configured: Vec<String>,
-    /// Config keys the rewrite changed (`section.key`).
-    pub recorded: Vec<String>,
 }
 
 impl Summary {
@@ -193,7 +201,8 @@ impl Summary {
         if self.deployed.is_empty() {
             let _ = writeln!(out, "Deployed: none");
         } else {
-            let _ = writeln!(out, "Deployed:");
+            let _ =
+                writeln!(out, "Deployed (all at their declared canonical addresses):");
             for (component, addr) in &self.deployed {
                 let _ = writeln!(out, "  {component} = {addr:#x}");
             }
@@ -206,39 +215,34 @@ impl Summary {
         if !self.configured.is_empty() {
             let _ = writeln!(out, "Configured: {}", self.configured.join(", "));
         }
-        if self.recorded.is_empty() {
-            let _ = writeln!(out, "Config: unchanged");
-        } else {
-            let _ = writeln!(out, "Config updated: {}", self.recorded.join(", "));
-        }
+        let _ = writeln!(out, "Config: declarative — never rewritten");
         out
     }
 }
 
-/// Run the apply: converge the chain, then rewrite the network file.
+/// Run the apply: converge the chain onto the declared state. The file is
+/// never rewritten.
 pub async fn run(
     path: &Path,
     cfg: &NetworkConfig,
     signer: &SignerSource,
     opts: &Options,
 ) -> Result<Summary> {
+    if cfg.network.legacy_addresses {
+        bail!(
+            "{} records a LEGACY (pre-factory) deployment \
+             (network.legacy_addresses = true); apply only supports the canonical \
+             declarative schema. The planned fresh redeploy replaces legacy stacks \
+             — see the file header.",
+            path.display()
+        );
+    }
+
     let rpc_url: url::Url = cfg
         .network
         .rpc_url
         .parse()
         .map_err(|e| anyhow!("invalid RPC URL: {e}"))?;
-
-    if cfg.contracts_all_empty()? && !opts.confirm_fresh_deploy {
-        bail!(
-            "[contracts] in {} is entirely empty, so this would be a FRESH DEPLOY. \
-             That publishes a new set of contracts and abandons anything already \
-             deployed for '{}', including every balance held in it. Re-run with \
-             --confirm-fresh-deploy if the network is genuinely empty; if you meant \
-             to update an existing deployment, restore the addresses instead.",
-            path.display(),
-            cfg.network.name
-        );
-    }
 
     let (wallet, sender) = signer.build_wallet(None).await?;
     info!("applying as {sender:#x} via {}", signer.describe());
@@ -260,22 +264,11 @@ pub async fn run(
     let artifacts = Artifacts::embedded();
     let notary_signer = required_address(&cfg.accounts.notary, "accounts.notary")?;
     let backend = required_address(&cfg.accounts.backend, "accounts.backend")?;
+    // The operational owner the factory should END up with; defaults to
+    // the deployer (on real networks the KMS genesis admin IS the deployer).
+    let operational_owner = cfg.accounts.owner_address()?.unwrap_or(sender);
 
     let mut summary = Summary::default();
-    let mut updates: Vec<AddressUpdate> = Vec::new();
-    let record = |summary: &mut Summary,
-                  updates: &mut Vec<AddressUpdate>,
-                  key: &str,
-                  addr: Address,
-                  force: bool| {
-        summary.deployed.push((format!("contracts.{key}"), addr));
-        updates.push(AddressUpdate {
-            section: "contracts",
-            key: key.to_owned(),
-            address: addr,
-            force,
-        });
-    };
 
     // ── Step 0: the deterministic-deployment substrate ────────────────────
     // The keyless CREATE2 deployer and the LibidFactory are the hard
@@ -286,6 +279,22 @@ pub async fn run(
         .await
         .map_err(|e| anyhow!("failed to read code at the factory address: {e}"))?
         .is_empty();
+
+    // The fresh-deploy guard keys on CHAIN STATE, not config emptiness: a
+    // factory with no code means a virgin network, and this apply would
+    // publish the entire declared stack.
+    if !factory_was_present && !opts.confirm_fresh_deploy {
+        bail!(
+            "the LibidFactory has no code at its canonical address \
+             {predicted_factory:#x} on '{}' — this chain is VIRGIN, so this apply \
+             would be a FRESH DEPLOY of the whole stack declared in {}. Re-run \
+             with --confirm-fresh-deploy if the network is genuinely new; once \
+             the factory exists, apply converges incrementally without the flag.",
+            cfg.network.name,
+            path.display()
+        );
+    }
+
     ensure_create2_deployer(&provider)
         .await
         .context("the canonical CREATE2 deployer is the onboarding gate")?;
@@ -312,44 +321,79 @@ pub async fn run(
     }
     if !factory_was_present {
         info!("LibidFactory installed at its canonical address {libid_factory:#x}");
-        record(&mut summary, &mut updates, "factory", libid_factory, false);
-    } else {
-        // Record it even when it predates this run, so the file is complete.
-        updates.push(AddressUpdate {
-            section: "contracts",
-            key: "factory".into(),
-            address: libid_factory,
-            force: false,
-        });
+        summary
+            .deployed
+            .push(("contracts.factory".into(), libid_factory));
     }
 
-    // The factory's deploy() is owner-gated and the genesis owner is the
-    // baked libID deployer KMS address. On real networks the apply signer
-    // IS that key; on dev chains ownership is impersonation-transferred.
-    ensure_factory_ownership(&provider, libid_factory, sender, opts.dev).await?;
+    // ── Presence: what does the CHAIN have, of what the file declares? ───
+    // Deployed-vs-not is read from chain state at the declared (canonical,
+    // validated) addresses — config emptiness no longer means anything.
+    let notary_contract = required_address(&cfg.contracts.notary, "contracts.notary")?;
+    let wallet_factory_declared =
+        required_address(&cfg.contracts.wallet_factory, "contracts.wallet_factory")?;
+    let registry_declared =
+        required_address(&cfg.contracts.registry, "contracts.registry")?;
+    let bank_declared = required_address(&cfg.contracts.bank, "contracts.bank")?;
+
+    let notary_present = code_present(&provider, notary_contract).await?;
+    let wallet_factory_present = code_present(&provider, wallet_factory_declared).await?;
+    let registry_present = code_present(&provider, registry_declared).await?;
+    let bank_present = code_present(&provider, bank_declared).await?;
+
+    // Does anything need `factory.deploy` (owner-gated)? Only then must the
+    // apply signer own the factory. On real networks the signer IS the KMS
+    // genesis owner; on dev chains ownership is impersonation-transferred.
+    let mut needs_factory_deploy =
+        !(notary_present && wallet_factory_present && registry_present && bank_present);
+    if !cfg.platforms.x_client_id.trim().is_empty() {
+        let declared =
+            required_address(&cfg.contracts.x_zk_verifier, "contracts.x_zk_verifier")?;
+        needs_factory_deploy |= !code_present(&provider, declared).await?;
+    }
+    if !cfg.platforms.google_client_id.trim().is_empty() {
+        let declared = required_address(
+            &cfg.contracts.google_oidc_verifier,
+            "contracts.google_oidc_verifier",
+        )?;
+        needs_factory_deploy |= !code_present(&provider, declared).await?;
+    }
+    // Identity wanted-ness is key presence, read via canonical_raw.
+    for key in [
+        "identity_names",
+        "github_identity_verifier",
+        "x_identity_verifier",
+        "google_identity_verifier",
+        "identity_jwks_roots",
+    ] {
+        if let Some(raw) = cfg.canonical_raw("identity", key) {
+            let declared = required_address(raw, key)?;
+            needs_factory_deploy |= !code_present(&provider, declared).await?;
+        }
+    }
+    if needs_factory_deploy {
+        ensure_factory_ownership(&provider, libid_factory, sender, opts.dev).await?;
+    }
 
     // ── Notary FIRST: everything else takes its proxy at initialize ──────
-    let notary_contract = match opt_address(&cfg.contracts.notary, "contracts.notary")? {
-        Some(addr) => addr,
-        None => {
-            let addr = deploy_named_proxy(
-                &provider,
-                &artifacts,
-                libid_factory,
-                names::NOTARY,
-                "Notary",
-                &Notary::initializeCall {
-                    owner_: sender,
-                    notary_: notary_signer,
-                },
-                sender,
-            )
-            .await?;
-            info!("Notary proxy deployed at {addr:#x} ({})", names::NOTARY);
-            record(&mut summary, &mut updates, "notary", addr, false);
-            addr
-        }
-    };
+    if !notary_present {
+        let addr = deploy_named_proxy(
+            &provider,
+            &artifacts,
+            libid_factory,
+            names::NOTARY,
+            "Notary",
+            &Notary::initializeCall {
+                owner_: sender,
+                notary_: notary_signer,
+            },
+            sender,
+        )
+        .await?;
+        info!("Notary proxy deployed at {addr:#x} ({})", names::NOTARY);
+        debug_assert_eq!(addr, notary_contract);
+        summary.deployed.push(("contracts.notary".into(), addr));
+    }
 
     // Declarative signer rotation: the file says who the notary signer IS;
     // a differing on-chain signer is drift and `setNotary` converges it.
@@ -376,93 +420,89 @@ pub async fn run(
     }
 
     // ── Login stack ──────────────────────────────────────────────────────
-    let factory_existing =
-        opt_address(&cfg.contracts.wallet_factory, "contracts.wallet_factory")?;
-    let registry_existing = opt_address(&cfg.contracts.registry, "contracts.registry")?;
-
-    let factory = match factory_existing {
-        Some(addr) => addr,
-        None => {
-            let wallet_impl = deploy_contract_from(
-                &provider,
-                artifacts.bytecode("WebWallet")?,
-                "WebWallet (impl)",
-                Some(sender),
-            )
-            .await?;
-            info!("WebWallet impl deployed at {wallet_impl:#x}");
-            let addr = deploy_named_proxy(
-                &provider,
-                &artifacts,
-                libid_factory,
-                names::WALLET_FACTORY,
-                "WalletFactory",
-                &WalletFactory::initializeCall {
-                    owner_: sender,
-                    walletImpl_: wallet_impl,
-                    // The registry proxy may not exist yet; it is pointed in
-                    // below once it does.
-                    registry_: registry_existing.unwrap_or(Address::ZERO),
+    let factory = wallet_factory_declared;
+    if !wallet_factory_present {
+        let wallet_impl = deploy_contract_from(
+            &provider,
+            artifacts.bytecode("WebWallet")?,
+            "WebWallet (impl)",
+            Some(sender),
+        )
+        .await?;
+        info!("WebWallet impl deployed at {wallet_impl:#x}");
+        let addr = deploy_named_proxy(
+            &provider,
+            &artifacts,
+            libid_factory,
+            names::WALLET_FACTORY,
+            "WalletFactory",
+            &WalletFactory::initializeCall {
+                owner_: sender,
+                walletImpl_: wallet_impl,
+                // The registry proxy may have no code yet; it is pointed in
+                // below once it does.
+                registry_: if registry_present {
+                    registry_declared
+                } else {
+                    Address::ZERO
                 },
-                sender,
-            )
-            .await?;
-            info!("WalletFactory proxy deployed at {addr:#x}");
-            record(&mut summary, &mut updates, "wallet_factory", addr, false);
-            addr
-        }
-    };
+            },
+            sender,
+        )
+        .await?;
+        info!("WalletFactory proxy deployed at {addr:#x}");
+        debug_assert_eq!(addr, factory);
+        summary
+            .deployed
+            .push(("contracts.wallet_factory".into(), addr));
+    }
 
-    let registry = match registry_existing {
-        Some(addr) => addr,
-        None => {
-            let addr = deploy_named_proxy(
-                &provider,
-                &artifacts,
-                libid_factory,
-                names::REGISTRY,
-                "Registry",
-                &IRegistryAdmin::initializeCall {
-                    _notaryContract: notary_contract,
-                    _backend: backend,
-                    _walletFactory: factory,
-                    _owner: sender,
-                },
-                sender,
-            )
-            .await?;
-            info!("Registry proxy deployed at {addr:#x}");
-            let factory_contract = WalletFactory::new(factory, &provider);
-            send_with_nonce_retry!(
-                factory_contract.setRegistry(addr),
-                "WalletFactory.setRegistry",
-                &provider,
-                sender
-            )?;
-            record(&mut summary, &mut updates, "registry", addr, false);
-            addr
-        }
-    };
+    let registry = registry_declared;
+    if !registry_present {
+        let addr = deploy_named_proxy(
+            &provider,
+            &artifacts,
+            libid_factory,
+            names::REGISTRY,
+            "Registry",
+            &IRegistryAdmin::initializeCall {
+                _notaryContract: notary_contract,
+                _backend: backend,
+                _walletFactory: factory,
+                _owner: sender,
+            },
+            sender,
+        )
+        .await?;
+        info!("Registry proxy deployed at {addr:#x}");
+        debug_assert_eq!(addr, registry);
+        let factory_contract = WalletFactory::new(factory, &provider);
+        send_with_nonce_retry!(
+            factory_contract.setRegistry(addr),
+            "WalletFactory.setRegistry",
+            &provider,
+            sender
+        )?;
+        summary.deployed.push(("contracts.registry".into(), addr));
+    }
 
     // ── Bank diamond ─────────────────────────────────────────────────────
-    let bank = match opt_address(&cfg.contracts.bank, "contracts.bank")? {
-        Some(addr) => addr,
-        None => {
-            let addr = deploy_bank_diamond_via_factory(
-                &provider,
-                &artifacts,
-                libid_factory,
-                sender,
-                notary_contract,
-                backend,
-                registry,
-            )
-            .await?;
-            info!("Bank diamond deployed at {addr:#x}");
-            record(&mut summary, &mut updates, "bank", addr, false);
-            addr
-        }
-    };
+    let bank = bank_declared;
+    if !bank_present {
+        let addr = deploy_bank_diamond_via_factory(
+            &provider,
+            &artifacts,
+            libid_factory,
+            sender,
+            notary_contract,
+            backend,
+            registry,
+        )
+        .await?;
+        info!("Bank diamond deployed at {addr:#x}");
+        debug_assert_eq!(addr, bank);
+        summary.deployed.push(("contracts.bank".into(), addr));
+    }
 
     // ── Verifiers (guarded: deploy only when the Registry slot is zero) ──
     let registry_views = Registry::new(registry, &provider);
@@ -494,17 +534,14 @@ pub async fn run(
                 sender
             )?;
             info!("Registry.setZkVerifier({X_DOMAIN}, {addr:#x}) done");
-            record(&mut summary, &mut updates, "x_zk_verifier", addr, false);
+            summary
+                .deployed
+                .push(("contracts.x_zk_verifier".into(), addr));
         } else {
             // Idempotency guard: a nonzero verifier is never redeployed. A
             // CHANGED x_client_id is NOT applied — the deployed verifier
             // keeps the client id baked in at first deploy.
-            updates.push(AddressUpdate {
-                section: "contracts",
-                key: "x_zk_verifier".into(),
-                address: on_chain,
-                force: false,
-            });
+            info!("XZkVerifier already wired at {on_chain:#x} — nothing to do");
         }
     } else {
         warn!("platforms.x_client_id is empty — skipping the XZkVerifier");
@@ -559,24 +596,19 @@ pub async fn run(
             )?;
             info!("Registry.setOidcVerifier({GOOGLE_DOMAIN}, {addr:#x}) done");
             if on_chain != Address::ZERO {
+                // The replacement's address is recorded ON-CHAIN ONLY: the
+                // Registry pointer is the record, and the config keeps
+                // declaring the canonical first-deploy address.
                 summary
                     .upgraded
-                    .push("google_oidc_verifier (replaced)".into());
+                    .push(format!("google_oidc_verifier (replaced -> {addr:#x})"));
+            } else {
+                summary
+                    .deployed
+                    .push(("contracts.google_oidc_verifier".into(), addr));
             }
-            record(
-                &mut summary,
-                &mut updates,
-                "google_oidc_verifier",
-                addr,
-                upgrade_oidc,
-            );
         } else {
-            updates.push(AddressUpdate {
-                section: "contracts",
-                key: "google_oidc_verifier".into(),
-                address: on_chain,
-                force: false,
-            });
+            info!("GoogleOidcVerifier already wired at {on_chain:#x} — nothing to do");
         }
     } else {
         warn!("platforms.google_client_id is empty — skipping the GoogleOidcVerifier");
@@ -730,16 +762,131 @@ pub async fn run(
             backend,
             identity,
             &mut summary,
-            &mut updates,
         )
         .await?;
     }
 
-    // ── Record what happened back into the file ──────────────────────────
-    summary.recorded = record_addresses(path, &updates)
-        .with_context(|| format!("failed to record addresses into {}", path.display()))?;
+    // ── Factory ownership converges to the declared operational owner ────
+    converge_factory_owner(
+        &provider,
+        libid_factory,
+        sender,
+        operational_owner,
+        &mut summary,
+    )
+    .await?;
 
+    // Nothing is recorded back: the file already declares every canonical
+    // address and the chain records the rest.
     Ok(summary)
+}
+
+/// Whether `addr` has code on-chain — the declarative presence check.
+async fn code_present<P: Provider>(provider: &P, addr: Address) -> Result<bool> {
+    Ok(!provider
+        .get_code_at(addr)
+        .await
+        .map_err(|e| anyhow!("get_code({addr:#x}) failed: {e}"))?
+        .is_empty())
+}
+
+/// Hand the factory over to the declared `[accounts].owner` (default: the
+/// deployer). Ownable2Step: from the sender this INITIATES the handover;
+/// on a dev chain (anvil/hardhat) the acceptance is completed by
+/// impersonating the new owner, so local stacks end fully converged.
+async fn converge_factory_owner<P: Provider>(
+    provider: &P,
+    factory: Address,
+    sender: Address,
+    desired: Address,
+    summary: &mut Summary,
+) -> Result<()> {
+    let contract = LibidFactory::new(factory, provider);
+    let current = contract
+        .owner()
+        .call()
+        .await
+        .map_err(|e| anyhow!("LibidFactory.owner read failed: {e}"))?;
+    if current == desired {
+        return Ok(());
+    }
+    if current != sender {
+        // Nothing this signer can do; say so instead of failing the whole
+        // apply after the chain already converged.
+        warn!(
+            "factory owner is {current:#x}, not the apply signer {sender:#x} — \
+             cannot hand ownership to accounts.owner {desired:#x}"
+        );
+        summary.configured.push(format!(
+            "factory ownership NOT converged: owned by {current:#x}, wanted \
+             {desired:#x}"
+        ));
+        return Ok(());
+    }
+
+    let pending = contract
+        .pendingOwner()
+        .call()
+        .await
+        .map_err(|e| anyhow!("LibidFactory.pendingOwner read failed: {e}"))?;
+    if pending != desired {
+        send_with_nonce_retry!(
+            contract.transferOwnership(desired),
+            "LibidFactory.transferOwnership",
+            provider,
+            sender
+        )?;
+        info!("factory ownership handover initiated: {sender:#x} -> {desired:#x}");
+    }
+
+    let (is_dev, _) = detect_dev_client(provider).await?;
+    if is_dev {
+        // Complete the two-step locally: impersonate the operational owner
+        // (e.g. the anvil #0 wallet) and accept.
+        provider
+            .raw_request::<_, serde_json::Value>(
+                "anvil_setBalance".into(),
+                (desired, "0xde0b6b3a7640000"),
+            )
+            .await
+            .map_err(|e| anyhow!("anvil_setBalance failed: {e}"))?;
+        provider
+            .raw_request::<_, serde_json::Value>(
+                "anvil_impersonateAccount".into(),
+                (desired,),
+            )
+            .await
+            .map_err(|e| anyhow!("anvil_impersonateAccount failed: {e}"))?;
+        let accept = LibidFactory::acceptOwnershipCall {}.abi_encode();
+        provider
+            .raw_request::<_, serde_json::Value>(
+                "eth_sendTransaction".into(),
+                (serde_json::json!({
+                    "from": desired,
+                    "to": factory,
+                    "data": Bytes::from(accept),
+                }),),
+            )
+            .await
+            .map_err(|e| anyhow!("impersonated acceptOwnership failed: {e}"))?;
+        provider
+            .raw_request::<_, serde_json::Value>(
+                "anvil_stopImpersonatingAccount".into(),
+                (desired,),
+            )
+            .await
+            .map_err(|e| anyhow!("anvil_stopImpersonatingAccount failed: {e}"))?;
+        info!("factory ownership converged (dev): {sender:#x} -> {desired:#x}");
+        summary.configured.push(format!(
+            "factory ownership transferred to accounts.owner {desired:#x} (dev)"
+        ));
+    } else {
+        summary.configured.push(format!(
+            "factory ownership handover to accounts.owner {desired:#x} initiated — \
+             pending acceptOwnership by that key"
+        ));
+    }
+    Ok(())
 }
 
 /// Whether the RPC's `web3_clientVersion` reports a dev chain (anvil or
@@ -1177,7 +1324,8 @@ async fn deploy_oidc_verifier<P: Provider>(
 /// Converge the identity-names stack. GitHub needs only the Notary contract
 /// and the backend key and is always wired; X and Google each need a large
 /// Honk circuit verifier and are requested by their key being PRESENT in
-/// the section.
+/// the section. Deployed-vs-not is read from chain state at the declared
+/// canonical addresses.
 #[allow(clippy::too_many_arguments)]
 async fn apply_identity<P: Provider>(
     provider: &P,
@@ -1188,200 +1336,189 @@ async fn apply_identity<P: Provider>(
     backend: Address,
     identity: &crate::config::Identity,
     summary: &mut Summary,
-    updates: &mut Vec<AddressUpdate>,
 ) -> Result<()> {
-    let record = |summary: &mut Summary,
-                  updates: &mut Vec<AddressUpdate>,
-                  key: &str,
-                  addr: Address| {
-        summary.deployed.push((format!("identity.{key}"), addr));
-        updates.push(AddressUpdate {
-            section: "identity",
-            key: key.to_owned(),
-            address: addr,
-            force: false,
-        });
-    };
-
     // The naming contract first: every setPlatform below is a call to it.
-    let names = match opt_address(&identity.identity_names, "identity.identity_names")? {
-        Some(addr) => addr,
-        None => {
-            let addr = deploy_named_proxy(
-                provider,
-                artifacts,
-                libid_factory,
-                names::IDENTITY_NAMES,
-                "IdentityNames",
-                &IdentityNames::initializeCall { owner_: sender },
-                sender,
-            )
-            .await?;
-            info!("IdentityNames deployed at {addr:#x}");
-            record(summary, updates, "identity_names", addr);
-            addr
-        }
+    let names_declared =
+        required_address(&identity.identity_names, "identity.identity_names")?;
+    let names = if code_present(provider, names_declared).await? {
+        names_declared
+    } else {
+        let addr = deploy_named_proxy(
+            provider,
+            artifacts,
+            libid_factory,
+            names::IDENTITY_NAMES,
+            "IdentityNames",
+            &IdentityNames::initializeCall { owner_: sender },
+            sender,
+        )
+        .await?;
+        info!("IdentityNames deployed at {addr:#x}");
+        summary
+            .deployed
+            .push(("identity.identity_names".into(), addr));
+        addr
     };
 
     let mut wired: Vec<(&IdentityPlatform, Address)> = Vec::new();
 
     // GitHub: always wired once the section exists.
-    let github = match opt_address(
+    let github_declared = required_address(
         &identity.github_identity_verifier,
         "identity.github_identity_verifier",
-    )? {
-        Some(addr) => addr,
-        None => {
-            let (endpoint, handle_prefix, id_prefix, id_suffix) = GITHUB_SHAPE;
-            let addr = deploy_named_proxy(
-                provider,
-                artifacts,
-                libid_factory,
-                names::GITHUB_IDENTITY_VERIFIER,
-                "GitHubIdentityVerifier",
-                &GitHubIdentityVerifier::initializeCall {
-                    owner_: sender,
-                    notaryContract_: notary_contract,
-                    backend_: backend,
-                    shape_: GitHubIdentityVerifier::ResponseShape {
-                        endpoint: endpoint.into(),
-                        handlePrefix: handle_prefix.into(),
-                        idPrefix: id_prefix.into(),
-                        idSuffix: id_suffix.into(),
-                    },
+    )?;
+    let github = if code_present(provider, github_declared).await? {
+        github_declared
+    } else {
+        let (endpoint, handle_prefix, id_prefix, id_suffix) = GITHUB_SHAPE;
+        let addr = deploy_named_proxy(
+            provider,
+            artifacts,
+            libid_factory,
+            names::GITHUB_IDENTITY_VERIFIER,
+            "GitHubIdentityVerifier",
+            &GitHubIdentityVerifier::initializeCall {
+                owner_: sender,
+                notaryContract_: notary_contract,
+                backend_: backend,
+                shape_: GitHubIdentityVerifier::ResponseShape {
+                    endpoint: endpoint.into(),
+                    handlePrefix: handle_prefix.into(),
+                    idPrefix: id_prefix.into(),
+                    idSuffix: id_suffix.into(),
                 },
-                sender,
-            )
-            .await?;
-            info!("GitHubIdentityVerifier deployed at {addr:#x}");
-            record(summary, updates, "github_identity_verifier", addr);
-            addr
-        }
+            },
+            sender,
+        )
+        .await?;
+        info!("GitHubIdentityVerifier deployed at {addr:#x}");
+        summary
+            .deployed
+            .push(("identity.github_identity_verifier".into(), addr));
+        addr
     };
     wired.push((&IDENTITY_GITHUB, github));
 
     // X: requested by the key being present.
     if let Some(value) = &identity.x_identity_verifier {
-        let addr = match opt_address(value, "identity.x_identity_verifier")? {
-            Some(addr) => addr,
-            None => {
-                info!(
-                    "deploying XHonkVerifier for identity (exceeds EIP-170; the chain \
-                     must allow big code)"
-                );
-                let honk_bytecode = artifacts
-                    .linked_bytecode(
-                        provider,
-                        "XHonkVerifier",
-                        "XHonkVerifier",
-                        Some(sender),
-                    )
-                    .await?;
-                let honk = deploy_contract_from(
-                    provider,
-                    honk_bytecode,
-                    "XHonkVerifier (identity)",
-                    Some(sender),
-                )
+        let declared = required_address(value, "identity.x_identity_verifier")?;
+        let addr = if code_present(provider, declared).await? {
+            declared
+        } else {
+            info!(
+                "deploying XHonkVerifier for identity (exceeds EIP-170; the chain \
+                 must allow big code)"
+            );
+            let honk_bytecode = artifacts
+                .linked_bytecode(provider, "XHonkVerifier", "XHonkVerifier", Some(sender))
                 .await?;
-                let addr = deploy_named_proxy(
-                    provider,
-                    artifacts,
-                    libid_factory,
-                    names::X_IDENTITY_VERIFIER,
-                    "XIdentityVerifier",
-                    &XIdentityVerifier::initializeCall {
-                        owner_: sender,
-                        notaryContract_: notary_contract,
-                        honkVerifier_: honk,
-                        shape_: XIdentityVerifier::ResponseShape {
-                            platformName: X_DOMAIN.into(),
-                            endpoint: X_ENDPOINT.into(),
-                            handlePrefix: X_HANDLE_PREFIX.into(),
-                            idPrefix: crate::platforms::X_ID_PREFIX.into(),
-                            idSuffix: crate::platforms::X_ID_SUFFIX.into(),
-                        },
+            let honk = deploy_contract_from(
+                provider,
+                honk_bytecode,
+                "XHonkVerifier (identity)",
+                Some(sender),
+            )
+            .await?;
+            let addr = deploy_named_proxy(
+                provider,
+                artifacts,
+                libid_factory,
+                names::X_IDENTITY_VERIFIER,
+                "XIdentityVerifier",
+                &XIdentityVerifier::initializeCall {
+                    owner_: sender,
+                    notaryContract_: notary_contract,
+                    honkVerifier_: honk,
+                    shape_: XIdentityVerifier::ResponseShape {
+                        platformName: X_DOMAIN.into(),
+                        endpoint: X_ENDPOINT.into(),
+                        handlePrefix: X_HANDLE_PREFIX.into(),
+                        idPrefix: crate::platforms::X_ID_PREFIX.into(),
+                        idSuffix: crate::platforms::X_ID_SUFFIX.into(),
                     },
-                    sender,
-                )
-                .await?;
-                info!("XIdentityVerifier deployed at {addr:#x}");
-                record(summary, updates, "x_identity_verifier", addr);
-                addr
-            }
+                },
+                sender,
+            )
+            .await?;
+            info!("XIdentityVerifier deployed at {addr:#x}");
+            summary
+                .deployed
+                .push(("identity.x_identity_verifier".into(), addr));
+            addr
         };
         wired.push((&IDENTITY_X, addr));
     }
 
     // Google: requested by the key being present. Also needs the JWKS
-    // trust list, deployed alongside.
+    // trust list (validate guarantees its key is declared alongside).
     if let Some(value) = &identity.google_identity_verifier {
-        let addr = match opt_address(value, "identity.google_identity_verifier")? {
-            Some(addr) => addr,
-            None => {
-                let roots = match identity
-                    .identity_jwks_roots
-                    .as_deref()
-                    .map(|v| opt_address(v, "identity.identity_jwks_roots"))
-                    .transpose()?
-                    .flatten()
-                {
-                    Some(addr) => addr,
-                    None => {
-                        let roots = deploy_named_proxy(
-                            provider,
-                            artifacts,
-                            libid_factory,
-                            names::IDENTITY_JWKS_ROOTS,
-                            "IdentityJwksRoots",
-                            &IdentityJwksRoots::initializeCall {
-                                owner_: sender,
-                                notaryContract_: notary_contract,
-                            },
-                            sender,
-                        )
-                        .await?;
-                        info!("IdentityJwksRoots deployed at {roots:#x}");
-                        record(summary, updates, "identity_jwks_roots", roots);
-                        roots
-                    }
-                };
-                info!(
-                    "deploying Google HonkVerifier for identity (exceeds EIP-170; the \
-                     chain must allow big code)"
-                );
-                let honk_bytecode = artifacts
-                    .linked_bytecode(provider, "Verifier", "HonkVerifier", Some(sender))
-                    .await?;
-                let honk = deploy_contract_from(
-                    provider,
-                    honk_bytecode,
-                    "HonkVerifier (Google identity)",
-                    Some(sender),
-                )
-                .await?;
-                let addr = deploy_named_proxy(
+        let declared = required_address(value, "identity.google_identity_verifier")?;
+        let addr = if code_present(provider, declared).await? {
+            declared
+        } else {
+            let roots_declared = required_address(
+                identity.identity_jwks_roots.as_deref().unwrap_or(""),
+                "identity.identity_jwks_roots",
+            )?;
+            let roots = if code_present(provider, roots_declared).await? {
+                roots_declared
+            } else {
+                let roots = deploy_named_proxy(
                     provider,
                     artifacts,
                     libid_factory,
-                    names::GOOGLE_IDENTITY_VERIFIER,
-                    "GoogleIdentityVerifier",
-                    &GoogleIdentityVerifier::initializeCall {
+                    names::IDENTITY_JWKS_ROOTS,
+                    "IdentityJwksRoots",
+                    &IdentityJwksRoots::initializeCall {
                         owner_: sender,
-                        honkVerifier_: honk,
-                        jwksRoots_: roots,
+                        notaryContract_: notary_contract,
                     },
                     sender,
                 )
                 .await?;
-                info!("GoogleIdentityVerifier deployed at {addr:#x}");
-                warn!(
-                    "IdentityJwksRoots at {roots:#x} starts EMPTY. Point a JWKS \
-                     rotation listener at it before Google names work."
-                );
-                record(summary, updates, "google_identity_verifier", addr);
-                addr
-            }
+                info!("IdentityJwksRoots deployed at {roots:#x}");
+                summary
+                    .deployed
+                    .push(("identity.identity_jwks_roots".into(), roots));
+                roots
+            };
+            info!(
+                "deploying Google HonkVerifier for identity (exceeds EIP-170; the \
+                 chain must allow big code)"
+            );
+            let honk_bytecode = artifacts
+                .linked_bytecode(provider, "Verifier", "HonkVerifier", Some(sender))
+                .await?;
+            let honk = deploy_contract_from(
+                provider,
+                honk_bytecode,
+                "HonkVerifier (Google identity)",
+                Some(sender),
+            )
+            .await?;
+            let addr = deploy_named_proxy(
+                provider,
+                artifacts,
+                libid_factory,
+                names::GOOGLE_IDENTITY_VERIFIER,
+                "GoogleIdentityVerifier",
+                &GoogleIdentityVerifier::initializeCall {
+                    owner_: sender,
+                    honkVerifier_: honk,
+                    jwksRoots_: roots,
+                },
+                sender,
+            )
+            .await?;
+            info!("GoogleIdentityVerifier deployed at {addr:#x}");
+            warn!(
+                "IdentityJwksRoots at {roots:#x} starts EMPTY. Point a JWKS \
+                 rotation listener at it before Google names work."
+            );
+            summary
+                .deployed
+                .push(("identity.google_identity_verifier".into(), addr));
+            addr
         };
         wired.push((&IDENTITY_GOOGLE, addr));
     }

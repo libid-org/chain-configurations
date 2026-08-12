@@ -19,8 +19,13 @@
 #
 # These addresses also predate the deterministic factory (libid-contracts
 # 0.3.0): they were plain CREATE deploys and do NOT match the canonical
-# name-derived CREATE3 addresses a fresh apply produces. The planned fresh
-# redeploy will move the stack onto the factory-first addresses.
+# name-derived CREATE3 addresses a fresh apply produces. That is why
+# `network.legacy_addresses = true` below: it exempts this file from the
+# canonical-address equality check `validate` enforces on declarative
+# files, keeps the old empty-means-not-deployed reading for `plan`, and
+# makes `apply` refuse outright. The planned fresh redeploy will REPLACE
+# this file with a fully pre-filled declarative one carrying the canonical
+# address table (see networks/mainnet.toml.example for the shape).
 # ============================================================================
 #
 # HOW TO READ THIS FILE
@@ -45,6 +50,8 @@
 name = "eden-testnet"
 chain_id = 3735928814
 rpc_url = "https://ev-reth-eden-testnet.binarybuilders.services:8545"
+# Pre-factory deployment recorded verbatim — see the header.
+legacy_addresses = true
 
 [aws]
 region = "eu-central-1"
