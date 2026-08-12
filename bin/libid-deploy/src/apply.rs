@@ -760,7 +760,6 @@ pub async fn run(
             libid_factory,
             sender,
             notary_contract,
-            backend,
             identity,
             &mut summary,
         )
@@ -1323,9 +1322,14 @@ async fn deploy_oidc_verifier<P: Provider>(
 }
 
 /// Converge the identity-names stack. GitHub needs only the Notary contract
-/// and the backend key and is always wired; X and Google each need a large
-/// Honk circuit verifier and are requested by their key being PRESENT in
-/// the section. Deployed-vs-not is read from chain state at the declared
+/// and is always wired; X and Google each need a large Honk circuit verifier
+/// and are requested by their key being PRESENT in the section.
+///
+/// No backend key reaches any of these. GitHubIdentityVerifier used to take one
+/// and check a countersignature over `(userAddress, walletAddress,
+/// transcriptRoot, timestamp)`; the notary is its only trust root now. The
+/// wallet product's Registry and Bank still take `accounts.backend`, which is
+/// why that field is still required — it is just no longer wired into identity. Deployed-vs-not is read from chain state at the declared
 /// canonical addresses.
 #[allow(clippy::too_many_arguments)]
 async fn apply_identity<P: Provider>(
@@ -1334,7 +1338,6 @@ async fn apply_identity<P: Provider>(
     libid_factory: Address,
     sender: Address,
     notary_contract: Address,
-    backend: Address,
     identity: &crate::config::Identity,
     summary: &mut Summary,
 ) -> Result<()> {
@@ -1381,7 +1384,6 @@ async fn apply_identity<P: Provider>(
             &GitHubIdentityVerifier::initializeCall {
                 owner_: sender,
                 notaryContract_: notary_contract,
-                backend_: backend,
                 shape_: GitHubIdentityVerifier::ResponseShape {
                     endpoint: endpoint.into(),
                     handlePrefix: handle_prefix.into(),
