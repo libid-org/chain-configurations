@@ -527,15 +527,28 @@ identity_jwks_roots = "{jwks}"
         )
     }
 
-    /// The committed Eden file parses and validates as a LEGACY record:
-    /// non-canonical addresses, empty-means-not-deployed, identity absent.
+    /// The committed Eden file is a CANONICAL declarative config now, not the
+    /// legacy record it used to be. `load` runs the full canonical-equality
+    /// check, so if this fails with a named expected address, the committed
+    /// table has drifted from `predict_address` — regenerate it with
+    /// `plan --print-addresses` instead of editing either side by hand.
     #[test]
-    fn the_seeded_eden_file_parses_as_legacy() {
+    fn the_seeded_eden_file_is_canonical_and_requests_identity() {
         let cfg = NetworkConfig::load(&networks_dir().join("eden-testnet.toml"))
             .expect("eden-testnet.toml loads");
         assert_eq!(cfg.network.chain_id, 3735928814);
-        assert!(cfg.network.legacy_addresses);
-        assert!(cfg.identity.is_none());
+        // Not legacy: the file no longer takes the exemption from canonical
+        // address equality, which is also what makes `apply` willing to run it.
+        assert!(!cfg.network.legacy_addresses);
+
+        // The identity stack is requested in full. `identity_jwks_roots` matters
+        // most: it is the on-chain trust list a keeper rotates, and without it
+        // Google names can never be verified.
+        let identity = cfg.identity.as_ref().expect("identity section requested");
+        assert!(identity.x_identity_verifier.is_some());
+        assert!(identity.google_identity_verifier.is_some());
+        assert!(identity.identity_jwks_roots.is_some());
+
         assert_eq!(cfg.tokens.len(), 4);
         // Both platforms carry templates and each template names the bot.
         let pairs = cfg.template_pairs();
