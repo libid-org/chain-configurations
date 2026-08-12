@@ -116,6 +116,7 @@ use crate::{
         IDENTITY_GITHUB,
         IDENTITY_GOOGLE,
         IDENTITY_X,
+        INITIAL_VERSION,
         PLATFORM_CONFIGS,
         WEB_PREFIXES,
         X_DOMAIN,
@@ -1523,22 +1524,42 @@ async fn apply_identity<P: Provider>(
         wired.push((&IDENTITY_GOOGLE, addr));
     }
 
-    // Wire every known platform. Owner-only and idempotent, so re-sending
-    // converges wiring drift too.
+    // Wire every known platform. Two calls since 0.4.0: the keyspace a handle
+    // hashes under, then the verifier for one proof format. Both are owner-only
+    // and idempotent, so re-sending converges wiring drift too.
+    //
+    // Every platform lands on INITIAL_VERSION and becomes its own default,
+    // which reproduces the single-verifier world this replaces. Installing a
+    // second format is a config decision, not a deploy default.
     let names_contract = IdentityNames::new(names, provider);
     for (platform, verifier) in wired {
+        let platform_id = identity_platform_id(platform.domain);
         send_with_nonce_retry!(
-            names_contract.setPlatform(
-                identity_platform_id(platform.domain),
-                verifier,
-                platform.allowance,
-                platform.rules.clone(),
-            ),
+            names_contract.setPlatform(platform_id, platform.rules.clone()),
             format!("IdentityNames.setPlatform({})", platform.label),
             provider,
             sender
         )?;
         info!("IdentityNames.setPlatform({}) done", platform.label);
+
+        send_with_nonce_retry!(
+            names_contract.setVerifier(
+                platform_id,
+                INITIAL_VERSION,
+                verifier,
+                platform.allowance,
+            ),
+            format!(
+                "IdentityNames.setVerifier({}, v{INITIAL_VERSION})",
+                platform.label
+            ),
+            provider,
+            sender
+        )?;
+        info!(
+            "IdentityNames.setVerifier({}, v{INITIAL_VERSION}) done",
+            platform.label
+        );
     }
 
     Ok(())

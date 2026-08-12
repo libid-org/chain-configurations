@@ -26,6 +26,7 @@ use alloy::{
 use libid_contracts::{
     bindings::{
         factory::LibidFactory,
+        identity::IdentityNames,
         login::{
             IRegistryAdmin,
             Registry,
@@ -50,6 +51,11 @@ use libid_deploy::{
     plan::{
         self,
         Status,
+    },
+    platforms::{
+        identity_platform_id,
+        IDENTITY_GITHUB,
+        INITIAL_VERSION,
     },
     signer::SignerSource,
 };
@@ -257,6 +263,47 @@ async fn declarative_apply_cycle_never_touches_the_config() {
         assert!(
             deployed.contains(&component),
             "missing {component}: {deployed:?}"
+        );
+    }
+
+    // The version this deployer installs every platform under has to be the
+    // one the contract calls first. They are two constants in two repositories
+    // and nothing but this check ties them together: a contract that renumbered
+    // would leave every platform wired under a version `bind` never reaches.
+    {
+        let provider =
+            ProviderBuilder::new().connect_http(anvil.endpoint().parse().unwrap());
+        let names_addr: Address = cfg
+            .identity
+            .as_ref()
+            .unwrap()
+            .identity_names
+            .parse()
+            .unwrap();
+        let names = IdentityNames::new(names_addr, &provider);
+        assert_eq!(
+            names.INITIAL_VERSION().call().await.unwrap(),
+            INITIAL_VERSION,
+            "libid-deploy and IdentityNames disagree on the first version"
+        );
+        // And the platform really is wired under it, not merely deployed.
+        let wired = names
+            .verifierOf(
+                identity_platform_id(IDENTITY_GITHUB.domain),
+                INITIAL_VERSION,
+            )
+            .call()
+            .await
+            .unwrap();
+        assert_ne!(wired, Address::ZERO, "GitHub is not wired at v1");
+        assert_eq!(
+            names
+                .latestVersionOf(identity_platform_id(IDENTITY_GITHUB.domain))
+                .call()
+                .await
+                .unwrap(),
+            INITIAL_VERSION,
+            "the first version installed did not become the default"
         );
     }
 

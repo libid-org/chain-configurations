@@ -71,6 +71,13 @@ pub struct IdentityPlatform {
     pub rules: IdentityNames::Rules,
 }
 
+/// The proof version a platform's first verifier is installed under.
+///
+/// Mirrors `IdentityNames.INITIAL_VERSION`, which numbers from one because
+/// zero is that contract's "no verifier" sentinel. The anvil test asserts the
+/// two agree, so a change on the contract side cannot pass silently here.
+pub const INITIAL_VERSION: u32 = 1;
+
 /// X: letters, digits and underscore, notary wall-clock (5 min skew).
 pub const IDENTITY_X: IdentityPlatform = IdentityPlatform {
     label: "X",

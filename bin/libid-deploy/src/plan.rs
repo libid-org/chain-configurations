@@ -52,6 +52,7 @@ use crate::{
         IDENTITY_GITHUB,
         IDENTITY_GOOGLE,
         IDENTITY_X,
+        INITIAL_VERSION,
         PLATFORM_CONFIGS,
         WEB_PREFIXES,
         X_DOMAIN,
@@ -674,7 +675,10 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
                     if let Some(names_addr) = names_live {
                         let names_contract = IdentityNames::new(names_addr, &provider);
                         let wired = names_contract
-                            .verifierOf(identity_platform_id(platform.domain))
+                            .verifierOf(
+                                identity_platform_id(platform.domain),
+                                INITIAL_VERSION,
+                            )
                             .call()
                             .await
                             .map_err(|e| {
