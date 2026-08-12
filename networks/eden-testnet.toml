@@ -1,41 +1,14 @@
 # Eden testnet — desired state for the libid contract stack.
 #
-# ============================================================================
-# FRESH DECLARATIVE DEPLOYMENT (through the factory, libid-contracts 0.4.0)
+# Every address under [contracts] and [identity] is CANONICAL: each entry deploys
+# through LibidFactory via CREATE3 with `salt = keccak256(canonical name)`, so an
+# address depends only on the contract's name — not its bytecode, not its
+# constructor arguments, not which chain it is on. They are identical on every EVM
+# chain, and `validate` enforces that equality offline. Regenerate the table with
+# `libid-deploy plan --print-addresses`, never by hand.
 #
-# This REPLACES the legacy record that used to live here. That file described
-# the pre-factory, pre-Notary deployment made with plain CREATE, carried
-# `legacy_addresses = true`, and `apply` refused it outright.
-#
-# The addresses below are the CANONICAL ones: every entry deploys through
-# LibidFactory via CREATE3 with `salt = keccak256(canonical name)`, so an
-# address depends only on the contract's name — not on its bytecode, not on
-# its constructor arguments, and not on which chain it is. They are therefore
-# identical on every EVM chain, and `validate` enforces that equality offline;
-# regenerate the table with `libid-deploy plan --print-addresses`, never by
-# hand.
-#
-# The legacy stack is NOT touched by this. Those contracts stay deployed and
-# the live dyaka backend keeps talking to them; the two address spaces are
-# disjoint, verified with eth_getCode before this file was written (every
-# canonical address below was EMPTY, the six legacy ones all had code). A
-# fresh apply here is purely additive.
-#
-# RECORD OF THE LEGACY STACK, preserved because this file was its only home:
-#
-#   bank                     0x954a99f1756cf281caa0aa81c12b582fcf7c8d94
-#   registry                 0xd764dbc5e51a042c004c52833f7e2f32b0cc651e
-#   wallet_factory           0xd46181cab629aeda48406b462656513821de6775
-#   x_zk_verifier            0x3f753cde17a261d6a6edf9d6846785d18bdb6efd
-#   google_oidc_verifier     0x69cc7c69b39ada71ce908d432868d5ef9a6a6d0e
-#   notary                   (none — predates the shared Notary contract)
-#   NotaryRegistry (0.1.x)   0xe460b1bf58f48a2ac90889b269d27e145e845a92
-#   accounts.oidc_notary     0x3b02dc7c278125dd3ea686d09335f7cd6604e5f2
-#
-# The first apply of this file needs `confirm_fresh_deploy: true` — the
-# factory is virgin on this chain, and that guard keys on chain state rather
-# than on anything written here.
-# ============================================================================
+# The first apply needs `confirm_fresh_deploy: true` while the factory is not yet
+# deployed here; that guard reads chain state, not this file.
 #
 # HOW TO READ THIS FILE
 #
@@ -54,8 +27,6 @@
 name = "eden-testnet"
 chain_id = 3735928814
 rpc_url = "https://ev-reth-eden-testnet.binarybuilders.services:8545"
-# `legacy_addresses` is deliberately absent. Setting it true would exempt this
-# file from the canonical-address equality check AND make `apply` refuse it.
 
 [aws]
 region = "eu-central-1"
@@ -76,27 +47,16 @@ kms_deployer = "alias/dyaka-testnet-deployer"
 # service instances (dyaka's and the identity product's) sign with this key.
 notary = "0x7a3646e8431a4b0c8bb586a7d26d7da7ae4aa2b5"
 
-# The backend signing identity. ONE value, wired into THREE contracts:
-# Registry.initialize(_backend), the Bank diamond, and
-# GitHubIdentityVerifier.initialize(backend_).
+# The WALLET PRODUCT's backend signing identity (alias/dyaka-testnet-backend),
+# wired into Registry.initialize(_backend) and the Bank diamond. The Bank grants
+# it the backend role, which is the authority to move user funds — so this value
+# matters, and it is the one that cannot be corrected afterwards: the Bank sets
+# its backend once in BankInit and exposes no setter, short of a diamond facet
+# upgrade. Registry does have `setBackend` (onlyOwner).
 #
-# This is dyaka's backend key (alias/dyaka-testnet-backend), and BOTH products
-# countersign with it for now — the identity backend included — so there is no
-# post-deploy step here: the verifier is initialised to trust exactly the key
-# the identity service signs with.
-#
-# Worth knowing if you ever want to separate them. Of the three contracts, the
-# Bank is the one that cannot be changed afterwards: it sets its backend once in
-# BankInit and exposes no setter, so this value is permanently the fund-moving
-# authority on the canonical Bank, short of a diamond facet upgrade. Registry
-# and GitHubIdentityVerifier both have `setBackend` (onlyOwner), and `apply`
-# converges `setNotary` but never `setBackend` — so pointing the identity
-# verifier at a separate countersigner later is one owner call that survives
-# future applies.
-#
-# UPSTREAM: this field conflates two distinct trust roles. Splitting it into
-# `accounts.backend` + `accounts.identity_backend` would let a deployment
-# express the separation declaratively instead of as a follow-up call.
+# Nothing under [identity] reads this — the notary is the identity stack's only
+# trust root and the identity backend holds no key. The field is required for the
+# two wallet contracts above.
 backend = "0xe9b132c2eccca08efaf62d18c301945f38ddc267"
 
 # The operational owner the factory ends up with. Empty = the deployer, which
@@ -113,22 +73,21 @@ wallet_factory = "0x945b8a7a480a2552ec3c61c24d4363c9558107a8"
 x_zk_verifier = "0xf8ddccfebfefdc5cbae308f0aac9a12e275eda5f"
 google_oidc_verifier = "0xef53a51e3a46e5f82248a39ddff0b7b901ab438c"
 
-# OUTPUT: the identity-names stack. Present = wanted, so this whole section
-# being here is what requests it — the legacy file omitted it entirely.
+# OUTPUT: the identity-names stack. A key being PRESENT is what requests it.
 #
-# All five are requested: GitHub needs only the notary and backend keys, while
-# X and Google each need a large Honk circuit verifier, and Google additionally
-# needs the JWKS trust list (declaring `google_identity_verifier` without
-# `identity_jwks_roots` fails validation).
+# All five are requested: GitHub needs only the Notary contract, while X and
+# Google each need a large Honk circuit verifier, and Google additionally needs
+# the JWKS trust list — declaring `google_identity_verifier` without
+# `identity_jwks_roots` fails validation.
 [identity]
 identity_names = "0xd467d48769c26faee36ba6b6fc9228f14aef6dd2"
 github_identity_verifier = "0x936067c1b5d77c67358210e77f664382191d2015"
 x_identity_verifier = "0xda66811e494a918e9ae0e5797206fca04333c055"
 google_identity_verifier = "0x1b9db690ee040ca92d44d1585b3aab625a475c27"
-# Deploys EMPTY. Until a keeper tick lands the first notarized reading of
-# Google's live JWKS, every Google claim reverts with UntrustedModulus(). The
-# deployment repo runs that keeper hourly as a CronJob; the FIRST tick has to
-# be run deliberately, right after this apply.
+# Deploys EMPTY. Until a keeper tick lands a notarized reading of Google's live
+# JWKS, every Google claim reverts with UntrustedModulus(). The deployment repo
+# runs the keeper hourly; the first tick has to be run deliberately, right after
+# this apply.
 identity_jwks_roots = "0x589b56f95d5df5483c79e46e7b20293135c9ebd9"
 
 # INPUT: platform rules — OAuth client ids and the bot handles the on-chain
@@ -137,10 +96,9 @@ identity_jwks_roots = "0x589b56f95d5df5483c79e46e7b20293135c9ebd9"
 # expected JWT audience). Changing a client id after deploy is NOT applied to
 # an already-deployed verifier — see `--upgrade oidc-verifier`.
 #
-# Carried over from the legacy stack. NOTE for when handles.link gets its own
-# Google OAuth client: these ids become the audience the identity verifiers
-# expect too, so either add the new origin's redirect URI to this same Google
-# client, or plan an `--upgrade oidc-verifier`.
+# NOTE for when handles.link gets its own Google OAuth client: these ids are the
+# audience the identity verifiers expect too, so either add the new origin's
+# redirect URI to this same Google client, or plan an `--upgrade oidc-verifier`.
 [platforms]
 x_client_id = "TC1ub1JmTDNDSlJjajUxanlrOXA6MTpjaQ"
 google_client_id = "391814431594-1piqeo3a0g2lmnmpseto3106tde3ja97.apps.googleusercontent.com"
@@ -149,9 +107,6 @@ x_bot_handle = "testyakly"
 
 # INPUT: tokens registered on the Bank. `apply` re-sends registration and
 # tolerates "already registered" errors, so entries are safe to keep.
-#
-# These land on the CANONICAL Bank (0x0607…), not the live one — the live
-# Bank's token list is untouched by this file.
 [[tokens]]
 symbol = "$TIA"
 address = "0x0000000000000000000000000000000000000000" # native
