@@ -1,6 +1,6 @@
 [package]
 name = "libid-deploy"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.94.1"
 license = "MIT OR Apache-2.0"
@@ -9,7 +9,7 @@ description = "Applies per-network desired-state configuration to chains: deploy
 publish = false
 
 [dependencies]
-libid-contracts = "0.2.0"
+libid-contracts = "0.3.0"
 alloy = { version = "1", features = [
     "contract",
     "providers",

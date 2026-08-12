@@ -23,6 +23,73 @@ there is no forge build and no artifact directory at runtime.
 > limit. Target chains must allow big code (Eden does — they are deployed
 > there today). Local rehearsal needs `anvil --disable-code-size-limit`.
 
+## Factory-first deterministic addresses (libid-contracts 0.3.0)
+
+Every top-level (entry) contract deploys THROUGH the deterministic
+`LibidFactory` via CREATE3, with `salt = keccak256(name)` for a fixed
+canonical name. The factory itself lives at one canonical address on every
+EVM network (deployed via the keyless Arachnid CREATE2 deployer with frozen
+init code), so **each entry address is a pure function of its name** — the
+same on every chain, computable before anything is deployed:
+
+```sh
+cargo run -- plan --network networks/mainnet.toml.example --print-addresses
+```
+
+The authoritative name table (`bin/libid-deploy/src/names.rs`). Renaming an
+entry = a NEW address, forever, on every network — names are frozen:
+
+| Config key | Canonical name | Address (every network) |
+|---|---|---|
+| `contracts.factory` | — (CREATE2, frozen init code) | `0xa92244c3f4462aad08bd1a33c3940b9b936321ad` |
+| `contracts.notary` | `libid.Notary` | `0x4bddfe9fb875d03838e5013c338e2dea9dcc2fc5` |
+| `contracts.wallet_factory` | `libid.WalletFactory` | `0x945b8a7a480a2552ec3c61c24d4363c9558107a8` |
+| `contracts.registry` | `libid.Registry` | `0x03c2b8d5f4d5cf7b7f81f876035046e262c4c9c9` |
+| `contracts.bank` | `libid.Bank` | `0x060708036a9ee89c6513346abab0929427bc9b06` |
+| `contracts.x_zk_verifier` | `libid.XZkVerifier` | `0xf8ddccfebfefdc5cbae308f0aac9a12e275eda5f` |
+| `contracts.google_oidc_verifier` | `libid.GoogleOidcVerifier` | `0xef53a51e3a46e5f82248a39ddff0b7b901ab438c` |
+| `identity.identity_names` | `libid.IdentityNames` | `0xd467d48769c26faee36ba6b6fc9228f14aef6dd2` |
+| `identity.github_identity_verifier` | `libid.GitHubIdentityVerifier` | `0x936067c1b5d77c67358210e77f664382191d2015` |
+| `identity.x_identity_verifier` | `libid.XIdentityVerifier` | `0xda66811e494a918e9ae0e5797206fca04333c055` |
+| `identity.google_identity_verifier` | `libid.GoogleIdentityVerifier` | `0x1b9db690ee040ca92d44d1585b3aab625a475c27` |
+| `identity.identity_jwks_roots` | `libid.IdentityJwksRoots` | `0x589b56f95d5df5483c79e46e7b20293135c9ebd9` |
+
+Implementations, Bank facets, and the Honk circuit verifiers stay plain
+CREATE deploys: their addresses are referenced (by a proxy slot, the
+diamond, or the Registry), not canonical, and upgrades replace them
+**without moving any entry address**.
+
+How apply gets there, in order:
+
+1. **Onboarding gate.** The keyless CREATE2 deployer
+   (`0x4e59b4…956C`) must exist or be installable via its presigned
+   pre-EIP-155 transaction (apply funds the one-time signer with exactly
+   0.01 native and broadcasts it). There is deliberately no fallback: a
+   chain that rejects the transaction (EIP-155-only) or ships different
+   CREATE2 semantics **cannot host the stack** and apply hard-errors.
+2. **Factory.** `ensure_factory` deploys the LibidFactory implementation
+   and proxy at their frozen-init-code CREATE2 addresses (idempotent).
+3. **Canary.** The factory must sit at exactly its predicted canonical
+   address; any mismatch means the chain derives CREATE2 addresses
+   non-standardly (zkSync-Era-style) and apply aborts before sending
+   anything else.
+4. **Ownership.** `factory.deploy` is owner-gated (Ownable2Step) and the
+   genesis owner baked into the frozen init code is the libID deployer KMS
+   address — on real networks the apply signer IS that key. On dev chains
+   (anvil/hardhat, detected via `web3_clientVersion`) apply impersonates
+   the genesis admin and transfers factory ownership to the local signer;
+   impersonation is refused on anything that does not look like a dev
+   chain, `--dev` flag or not.
+5. **CREATE3 deploys.** Every entry contract goes through
+   `factory.deploy(name, creationCode)` and is verified to land on
+   `predict_address(factory, name)`.
+
+One exception: `--upgrade oidc-verifier` REPLACES the GoogleOidcVerifier
+with a plain CREATE deployment — the canonical name is single-use and the
+replacement's address is meant to change. After a replace, the live
+(config) address legitimately diverges from the factory's `deployedAt`
+record; `plan` knows and does not warn.
+
 ## Config schema
 
 Every value in a network file is public: addresses, a public RPC, OAuth
@@ -34,7 +101,7 @@ leaves AWS.
 | `[network]` | input | `name`, `chain_id` (apply refuses a mismatch), `rpc_url` |
 | `[aws]` | input | `region`, `kms_deployer` (key id / `alias/...` / ARN; the default signer) |
 | `[accounts]` | input | `notary` (the notary **signer** — see below), `backend` — addresses of **keys**, not contracts. `oidc_notary` is accepted for legacy pre-Notary files but no longer wired anywhere |
-| `[contracts]` | output | `notary` (the Notary **proxy**), `bank`, `registry`, `wallet_factory`, `x_zk_verifier`, `google_oidc_verifier` |
+| `[contracts]` | output | `factory` (the deterministic LibidFactory — predictable, recorded anyway), `notary` (the Notary **proxy**), `bank`, `registry`, `wallet_factory`, `x_zk_verifier`, `google_oidc_verifier` |
 | `[identity]` | output | `identity_names`, `github_identity_verifier`, `x_identity_verifier`, `google_identity_verifier`, `identity_jwks_roots` |
 | `[platforms]` | input | `x_client_id`, `google_client_id`, `github_bot_handle`, `x_bot_handle` |
 | `[[tokens]]` | input | `symbol`, `address` (zero address = native) |
@@ -83,7 +150,10 @@ Output-key semantics:
 # parse + sanity checks (add --check-rpc to also probe the endpoint)
 cargo run -- validate --network networks/eden-testnet.toml
 
-# read-only diff against the chain; --json for machine output
+# read-only diff against the chain; --json for machine output. The plan
+# leads with the onboarding gate (CREATE2 deployer + factory) and quotes
+# the predicted CREATE3 address of everything missing — even on an empty
+# chain. --print-addresses prints the canonical table offline and exits.
 cargo run -- plan --network networks/eden-testnet.toml
 
 # converge; the signer defaults to aws.kms_deployer (needs ambient AWS
@@ -102,7 +172,14 @@ Upgrade components: `registry`, `wallet-factory`, `notary` (UUPS
 `upgradeToAndCall`; the proxy address and its stored signer survive),
 `bank` (diamond facet REPLACE — the diamond is the storage, the facets are
 the code), `oidc-verifier` (redeploy + re-point; new address, recorded in
-the PR).
+the PR). Upgrades never move an entry address — the canonical CREATE3
+addresses are stable across every upgrade except the OIDC REPLACE, whose
+address change is the point.
+
+For anvil rehearsal, `apply --dev` (or just letting apply detect anvil)
+covers the factory-ownership wrinkle: the local signer is not the baked
+genesis admin, so apply impersonates the admin and Ownable2Step-transfers
+factory ownership to the signer. This path is refused on real chains.
 
 ## How the Apply action works
 
@@ -146,7 +223,10 @@ workflow's default `source: release` consumes the newest x86_64 asset.
 - `cargo +nightly fmt` only — stable rustfmt silently ignores the
   nightly-only options in `rustfmt.toml`.
 - `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test` — the integration tests need `anvil` on PATH and cover the
-  critical cycle: empty file → fresh apply → file rewritten → second apply
-  is a no-op.
+- `cargo test` — the integration tests need `anvil` on PATH (spawned bare:
+  `--disable-default-create2-deployer`, proving the install path) and cover
+  the critical cycle — empty file → fresh apply → file rewritten → second
+  apply is a no-op — plus the network-invariance proof: two separate bare
+  anvils converge to IDENTICAL canonical addresses matching the offline
+  prediction.
 - Every commit must be signed off (`git commit -s`); see CONTRIBUTING.md.

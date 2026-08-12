@@ -2,11 +2,18 @@
 # every OUTPUT key empty: the first `apply --confirm-fresh-deploy` run fills
 # them and opens a PR recording what it deployed.
 #
-# This template describes the CURRENT (libid-contracts 0.2.0, Notary-era)
-# schema: the shared Notary contract deploys first and every other contract
-# is wired to its proxy at initialize. networks/eden-testnet.toml is a
+# This template describes the CURRENT (libid-contracts 0.3.0, factory-first)
+# schema: apply first makes sure the keyless CREATE2 deployer and the
+# deterministic LibidFactory exist (a chain that cannot host them cannot
+# host the stack), then deploys every top-level contract THROUGH the factory
+# via CREATE3 under a fixed canonical name — so each entry address is a pure
+# function of its name, identical on every EVM network and computable before
+# anything is deployed (`libid-deploy plan --print-addresses`). The shared
+# Notary contract still deploys first among them and every other contract is
+# wired to its proxy at initialize. networks/eden-testnet.toml is a
 # fully-populated example of the input-vs-output key convention, but note
-# that it records the LEGACY pre-Notary deployment (see its header).
+# that it records the LEGACY pre-Notary, pre-factory deployment (see its
+# header).
 
 [network]
 name = "mainnet"
@@ -33,10 +40,20 @@ backend = ""
 
 # OUTPUT — leave empty. Filled by `libid-deploy apply`.
 #
+# Every address below except `factory` is name-deterministic: it equals
+# predict_address(factory, name) for a fixed canonical name (see the README
+# name table), so the SAME addresses appear on every network. Renaming a
+# canonical name would mean a new address forever — names are frozen.
+#
+# `factory` is the deterministic LibidFactory proxy. Fully predictable (one
+# canonical address on every EVM chain), recorded anyway so this file stays
+# the complete deployment record.
+#
 # `notary` is the Notary PROXY address — the one contract everything else
 # verifies notary attestations through. It deploys FIRST and is wired into
 # every consumer at initialize. Not the signer; that is `accounts.notary`.
 [contracts]
+factory = ""
 notary = ""
 bank = ""
 registry = ""

@@ -95,6 +95,12 @@ pub struct Accounts {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Contracts {
+    /// The deterministic LibidFactory proxy. Its address is fully
+    /// predictable (the same on every EVM network — see the README), but it
+    /// is recorded here like every other output so the file stays the
+    /// complete record of what is on the chain.
+    #[serde(default)]
+    pub factory: String,
     /// The Bank diamond.
     #[serde(default)]
     pub bank: String,
@@ -250,6 +256,7 @@ impl NetworkConfig {
             required_address(&self.accounts.oidc_notary, "accounts.oidc_notary")?;
         }
         for (label, value) in [
+            ("contracts.factory", &self.contracts.factory),
             ("contracts.bank", &self.contracts.bank),
             ("contracts.registry", &self.contracts.registry),
             ("contracts.wallet_factory", &self.contracts.wallet_factory),
@@ -307,7 +314,9 @@ impl NetworkConfig {
 
     /// Whether the whole core `[contracts]` section is empty — the state
     /// that makes `apply` a FRESH DEPLOY and requires
-    /// `--confirm-fresh-deploy`.
+    /// `--confirm-fresh-deploy`. `contracts.factory` is deliberately NOT
+    /// counted: it is chain infrastructure with a predictable address, not
+    /// a protocol deployment an operator could orphan.
     pub fn contracts_all_empty(&self) -> Result<bool> {
         Ok([
             opt_address(&self.contracts.bank, "contracts.bank")?,

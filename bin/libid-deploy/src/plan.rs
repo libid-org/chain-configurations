@@ -1,5 +1,13 @@
 //! Read-only comparison of desired state (the network file) against the
 //! chain. No signer, no transactions — safe to run from anywhere.
+//!
+//! Factory-first (libid-contracts 0.3.0): the FIRST checks are the hard
+//! onboarding gate — the keyless CREATE2 deployer and the deterministic
+//! LibidFactory. Because every canonical contract's address is
+//! `predict_address(factory, name)`, the plan reports the expected address
+//! of every entry contract even on a completely empty chain, and — once the
+//! factory exists — diffs its on-chain `deployedAt` records against the
+//! config to surface drift.
 
 use alloy::{
     primitives::Address,
@@ -12,11 +20,20 @@ use anyhow::{
     anyhow,
     Result,
 };
-use libid_contracts::bindings::{
-    identity::IdentityNames,
-    login::Registry,
-    notary::Notary,
-    transfer::Bank,
+use libid_contracts::{
+    bindings::{
+        factory::LibidFactory,
+        identity::IdentityNames,
+        login::Registry,
+        notary::Notary,
+        transfer::Bank,
+    },
+    factory::{
+        predict_address,
+        predict_factory_address,
+        CREATE2_DEPLOYER,
+    },
+    Artifacts,
 };
 use serde::Serialize;
 
@@ -25,6 +42,7 @@ use crate::{
         opt_address,
         NetworkConfig,
     },
+    names,
     platforms::{
         identity_platform_id,
         GOOGLE_DOMAIN,
@@ -219,6 +237,70 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
         );
     }
 
+    // ── The onboarding gate: CREATE2 deployer + deterministic factory ────
+    // These come FIRST: a chain that cannot host them cannot host the
+    // stack, and every expected address below hangs off the factory.
+    let artifacts = Artifacts::embedded();
+    let predicted_factory = predict_factory_address(&artifacts)
+        .map_err(|e| anyhow!("predict_factory_address failed: {e}"))?;
+    let deployer_code = provider
+        .get_code_at(CREATE2_DEPLOYER)
+        .await
+        .map_err(|e| anyhow!("get_code(create2 deployer) failed: {e}"))?;
+    if deployer_code.is_empty() {
+        b.push(
+            "contracts.create2_deployer",
+            Status::Deploy,
+            format!(
+                "missing — apply installs the keyless deployer at \
+                 {CREATE2_DEPLOYER:#x} via its presigned transaction; a chain \
+                 that rejects it (EIP-155-only) CANNOT host the stack"
+            ),
+        );
+    } else {
+        b.push(
+            "contracts.create2_deployer",
+            Status::Ok,
+            format!("{CREATE2_DEPLOYER:#x}"),
+        );
+    }
+    let factory_code = provider
+        .get_code_at(predicted_factory)
+        .await
+        .map_err(|e| anyhow!("get_code(factory) failed: {e}"))?;
+    let factory_present = !factory_code.is_empty();
+    if factory_present {
+        b.push(
+            "contracts.factory",
+            Status::Ok,
+            format!("{predicted_factory:#x} (canonical)"),
+        );
+    } else {
+        b.push(
+            "contracts.factory",
+            Status::Deploy,
+            format!(
+                "missing — apply deploys it at its canonical address \
+                 {predicted_factory:#x} (CANARY: any other address aborts)"
+            ),
+        );
+    }
+    if let Some(recorded) = opt_address(&cfg.contracts.factory, "contracts.factory")? {
+        if recorded != predicted_factory {
+            b.push(
+                "contracts.factory.record",
+                Status::Warn,
+                format!(
+                    "config records {recorded:#x} but the canonical factory \
+                     address is {predicted_factory:#x}"
+                ),
+            );
+        }
+    }
+    // Every canonical contract's expected address is a pure function of
+    // (factory, name) — quotable before anything is deployed.
+    let expected = |name: &str| predict_address(predicted_factory, name);
+
     // ── Notary (deploys first; everything verifies through it) ───────────
     let cfg_signer = opt_address(&cfg.accounts.notary, "accounts.notary")?;
     let mut notary_addr = None;
@@ -226,8 +308,12 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
         None => b.push(
             "contracts.notary",
             Status::Deploy,
-            "not deployed — apply would deploy it FIRST and wire every other \
-             contract through it",
+            format!(
+                "not deployed — apply would deploy it FIRST at {:#x} \
+                 (CREATE3 '{}') and wire every other contract through it",
+                expected(names::NOTARY),
+                names::NOTARY
+            ),
         ),
         Some(addr) => {
             if check_code(&mut b, &provider, "contracts.notary", addr).await? {
@@ -267,13 +353,21 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
 
     // ── Core contracts ───────────────────────────────────────────────────
     let core = [
-        ("contracts.wallet_factory", &cfg.contracts.wallet_factory),
-        ("contracts.registry", &cfg.contracts.registry),
-        ("contracts.bank", &cfg.contracts.bank),
+        (
+            "contracts.wallet_factory",
+            &cfg.contracts.wallet_factory,
+            names::WALLET_FACTORY,
+        ),
+        (
+            "contracts.registry",
+            &cfg.contracts.registry,
+            names::REGISTRY,
+        ),
+        ("contracts.bank", &cfg.contracts.bank, names::BANK),
     ];
     let mut registry_addr = None;
     let mut bank_addr = None;
-    for (component, value) in core {
+    for (component, value, name) in core {
         match opt_address(value, component)? {
             Some(addr) => {
                 let present = check_code(&mut b, &provider, component, addr).await?;
@@ -289,7 +383,10 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
             None => b.push(
                 component,
                 Status::Deploy,
-                "not deployed — apply would deploy",
+                format!(
+                    "not deployed — apply would deploy at {:#x} (CREATE3 '{name}')",
+                    expected(name)
+                ),
             ),
         }
     }
@@ -327,6 +424,8 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
             cfg_x_verifier,
             !cfg.platforms.x_client_id.trim().is_empty(),
             "platforms.x_client_id is empty",
+            expected(names::X_ZK_VERIFIER),
+            names::X_ZK_VERIFIER,
         );
         if let (Some(notary), false) = (notary_addr, on_chain_x == Address::ZERO) {
             check_notary_wiring(
@@ -354,6 +453,8 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
             cfg_oidc_verifier,
             oidc_wanted,
             "platforms.google_client_id is empty",
+            expected(names::GOOGLE_OIDC_VERIFIER),
+            names::GOOGLE_OIDC_VERIFIER,
         );
         if let (Some(notary), false) = (notary_addr, on_chain_oidc == Address::ZERO) {
             check_notary_wiring(
@@ -479,7 +580,11 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
             None => b.push(
                 "identity.identity_names",
                 Status::Deploy,
-                "not deployed — apply would deploy",
+                format!(
+                    "not deployed — apply would deploy at {:#x} (CREATE3 '{}')",
+                    expected(names::IDENTITY_NAMES),
+                    names::IDENTITY_NAMES
+                ),
             ),
         }
         let wanted: Vec<(
@@ -560,11 +665,20 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
                         }
                     }
                 }
-                None => b.push(
-                    component,
-                    Status::Deploy,
-                    "not deployed — apply would deploy",
-                ),
+                None => {
+                    let key = component
+                        .strip_prefix("identity.")
+                        .expect("identity components are identity.*");
+                    let detail = match names::canonical_name("identity", key) {
+                        Some(name) => format!(
+                            "not deployed — apply would deploy at {:#x} \
+                             (CREATE3 '{name}')",
+                            expected(name)
+                        ),
+                        None => "not deployed — apply would deploy".into(),
+                    };
+                    b.push(component, Status::Deploy, detail);
+                }
             }
         }
     } else {
@@ -575,6 +689,62 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
         );
     }
 
+    // ── Factory records vs config (drift) ────────────────────────────────
+    // The factory's `deployedAt` mapping is the on-chain truth about what
+    // was deployed under each canonical name; a populated config key must
+    // agree with it.
+    if factory_present {
+        let factory = LibidFactory::new(predicted_factory, &provider);
+        for c in names::CANONICAL_CONTRACTS {
+            let recorded = factory
+                .deployedAt(c.name.to_string())
+                .call()
+                .await
+                .map_err(|e| anyhow!("factory deployedAt({}) failed: {e}", c.name))?;
+            if recorded == Address::ZERO {
+                // Never deployed under this name; the per-component items
+                // above already cover it.
+                continue;
+            }
+            let component = format!("factory.record.{}.{}", c.section, c.key);
+            match config_canonical_value(cfg, c.section, c.key)? {
+                Some(addr) if addr == recorded => b.push(
+                    component,
+                    Status::Ok,
+                    format!("'{}' = {recorded:#x}", c.name),
+                ),
+                Some(addr) if c.name == names::GOOGLE_OIDC_VERIFIER => b.push(
+                    component,
+                    Status::Ok,
+                    format!(
+                        "config {addr:#x} diverges from the factory record \
+                         {recorded:#x} — expected after an `--upgrade \
+                         oidc-verifier` REPLACE (the canonical name is \
+                         single-use; the record keeps the first deploy)"
+                    ),
+                ),
+                Some(addr) => b.push(
+                    component,
+                    Status::Warn,
+                    format!(
+                        "config records {addr:#x} but the factory deployed \
+                         '{}' at {recorded:#x}",
+                        c.name
+                    ),
+                ),
+                None => b.push(
+                    component,
+                    Status::Configure,
+                    format!(
+                        "factory deployed '{}' at {recorded:#x} but the config \
+                         is empty — apply would reuse and record it",
+                        c.name
+                    ),
+                ),
+            }
+        }
+    }
+
     Ok(Plan {
         network: cfg.network.name.clone(),
         chain_id_expected: cfg.network.chain_id,
@@ -583,7 +753,47 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
     })
 }
 
+/// The config's recorded address for a canonical `(section, key)` pair,
+/// treating an absent `[identity]` section or absent optional key as
+/// unrecorded.
+fn config_canonical_value(
+    cfg: &NetworkConfig,
+    section: &str,
+    key: &str,
+) -> Result<Option<Address>> {
+    let identity = cfg.identity.as_ref();
+    let raw: Option<&str> = match (section, key) {
+        ("contracts", "notary") => Some(&cfg.contracts.notary),
+        ("contracts", "wallet_factory") => Some(&cfg.contracts.wallet_factory),
+        ("contracts", "registry") => Some(&cfg.contracts.registry),
+        ("contracts", "bank") => Some(&cfg.contracts.bank),
+        ("contracts", "x_zk_verifier") => Some(&cfg.contracts.x_zk_verifier),
+        ("contracts", "google_oidc_verifier") => {
+            Some(&cfg.contracts.google_oidc_verifier)
+        }
+        ("identity", "identity_names") => identity.map(|i| i.identity_names.as_str()),
+        ("identity", "github_identity_verifier") => {
+            identity.map(|i| i.github_identity_verifier.as_str())
+        }
+        ("identity", "x_identity_verifier") => {
+            identity.and_then(|i| i.x_identity_verifier.as_deref())
+        }
+        ("identity", "google_identity_verifier") => {
+            identity.and_then(|i| i.google_identity_verifier.as_deref())
+        }
+        ("identity", "identity_jwks_roots") => {
+            identity.and_then(|i| i.identity_jwks_roots.as_deref())
+        }
+        _ => None,
+    };
+    match raw {
+        Some(value) => opt_address(value, key),
+        None => Ok(None),
+    }
+}
+
 /// Classify a Registry-wired verifier slot.
+#[allow(clippy::too_many_arguments)]
 fn verifier_item(
     b: &mut Builder,
     component: &str,
@@ -591,12 +801,17 @@ fn verifier_item(
     configured: Option<Address>,
     wanted: bool,
     unwanted_reason: &str,
+    expected: Address,
+    name: &str,
 ) {
     match (on_chain == Address::ZERO, configured) {
         (true, None) if wanted => b.push(
             component,
             Status::Deploy,
-            "not deployed — apply would deploy and wire",
+            format!(
+                "not deployed — apply would deploy at {expected:#x} \
+                 (CREATE3 '{name}') and wire"
+            ),
         ),
         (true, None) => b.push(
             component,

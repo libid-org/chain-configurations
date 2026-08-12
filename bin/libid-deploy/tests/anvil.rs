@@ -2,6 +2,13 @@
 //! network file → `apply --confirm-fresh-deploy` → the file is rewritten
 //! with the deployed addresses → a second apply deploys nothing and the
 //! plan is clean. Requires the `anvil` binary on PATH (foundry).
+//!
+//! Every anvil here starts with `--disable-default-create2-deployer`, so
+//! the tests prove the full 0.3.0 bootstrap: keyless deployer install →
+//! factory at its canonical predicted address → dev ownership transfer
+//! (the test signer is not the baked genesis admin; apply must detect
+//! anvil and impersonate) → every entry contract CREATE3-deployed at
+//! `predict_address(factory, name)`.
 
 use std::path::PathBuf;
 
@@ -25,11 +32,16 @@ use libid_contracts::{
         deploy_behind_proxy,
         deploy_contract,
     },
+    factory::{
+        predict_address,
+        predict_factory_address,
+    },
     Artifacts,
 };
 use libid_deploy::{
     apply,
     config::NetworkConfig,
+    names,
     plan::{
         self,
         Status,
@@ -41,11 +53,14 @@ use libid_deploy::{
 const ANVIL_KEY: &str =
     "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
-/// Anvil with the code-size limit off: the generated UltraHonk verifiers
-/// exceed EIP-170, exactly like the real target chains that raise it.
+/// Anvil with the code-size limit off (the generated UltraHonk verifiers
+/// exceed EIP-170, exactly like the real target chains that raise it) and
+/// WITHOUT its predeployed CREATE2 deployer, so apply's install path is
+/// what puts it there.
 fn spawn_anvil() -> AnvilInstance {
     alloy::node_bindings::Anvil::new()
         .arg("--disable-code-size-limit")
+        .arg("--disable-default-create2-deployer")
         .try_spawn()
         .expect("anvil spawns (is foundry on PATH?)")
 }
@@ -105,6 +120,56 @@ address = "0x0000000000000000000000000000000000000000"
     path
 }
 
+/// Every canonical component the full config deploys, as `(config value,
+/// factory name)` pairs read from a converged network file.
+fn canonical_pairs(cfg: &NetworkConfig) -> Vec<(String, &'static str)> {
+    let identity = cfg.identity.as_ref().expect("identity stack deployed");
+    vec![
+        (cfg.contracts.notary.clone(), names::NOTARY),
+        (cfg.contracts.wallet_factory.clone(), names::WALLET_FACTORY),
+        (cfg.contracts.registry.clone(), names::REGISTRY),
+        (cfg.contracts.bank.clone(), names::BANK),
+        (cfg.contracts.x_zk_verifier.clone(), names::X_ZK_VERIFIER),
+        (
+            cfg.contracts.google_oidc_verifier.clone(),
+            names::GOOGLE_OIDC_VERIFIER,
+        ),
+        (identity.identity_names.clone(), names::IDENTITY_NAMES),
+        (
+            identity.github_identity_verifier.clone(),
+            names::GITHUB_IDENTITY_VERIFIER,
+        ),
+        (
+            identity.x_identity_verifier.clone().unwrap_or_default(),
+            names::X_IDENTITY_VERIFIER,
+        ),
+        (
+            identity
+                .google_identity_verifier
+                .clone()
+                .unwrap_or_default(),
+            names::GOOGLE_IDENTITY_VERIFIER,
+        ),
+        (
+            identity.identity_jwks_roots.clone().unwrap_or_default(),
+            names::IDENTITY_JWKS_ROOTS,
+        ),
+    ]
+}
+
+/// Assert every canonical recorded address equals
+/// `predict_address(factory, name)` — the CREATE3 name-determinism proof.
+fn assert_canonical_addresses(cfg: &NetworkConfig, factory: Address) {
+    for (recorded, name) in canonical_pairs(cfg) {
+        let predicted = predict_address(factory, name);
+        assert_eq!(
+            recorded.to_lowercase(),
+            format!("{predicted:#x}"),
+            "{name} must sit at its predicted CREATE3 address"
+        );
+    }
+}
+
 /// The critical test: empty config → fresh apply → config rewritten →
 /// second apply is a no-op and the plan is clean → explicit upgrades work.
 #[tokio::test]
@@ -126,10 +191,12 @@ async fn full_apply_cycle_converges_and_records() {
     let opts = apply::Options {
         upgrades: vec![],
         confirm_fresh_deploy: true,
+        dev: false, // anvil is auto-detected; the flag must not be needed
     };
     let summary = apply::run(&path, &cfg, &signer, &opts).await.unwrap();
     let deployed: Vec<&str> = summary.deployed.iter().map(|(c, _)| c.as_str()).collect();
     for component in [
+        "contracts.factory",
         "contracts.notary",
         "contracts.wallet_factory",
         "contracts.registry",
@@ -161,6 +228,19 @@ async fn full_apply_cycle_converges_and_records() {
         .identity_jwks_roots
         .as_deref()
         .is_some_and(|v| !v.is_empty()));
+
+    // The deterministic guarantees: the factory sits at its canonical
+    // predicted address (it was installed from truly nothing — the CREATE2
+    // deployer was absent too), and every canonical contract sits at
+    // `predict_address(factory, name)`.
+    let artifacts = Artifacts::embedded();
+    let factory_addr = predict_factory_address(&artifacts).unwrap();
+    assert_eq!(
+        cfg.contracts.factory.to_lowercase(),
+        format!("{factory_addr:#x}"),
+        "the recorded factory must be the canonical predicted one"
+    );
+    assert_canonical_addresses(&cfg, factory_addr);
 
     // The plan against the converged chain has nothing to deploy and no
     // warnings.
@@ -246,6 +326,7 @@ async fn full_apply_cycle_converges_and_records() {
             apply::Upgrade::OidcVerifier,
         ],
         confirm_fresh_deploy: false,
+        dev: false,
     };
     let summary = apply::run(&path, &cfg, &signer, &opts).await.unwrap();
     assert!(summary.upgraded.iter().any(|u| u == "registry"));
@@ -275,10 +356,67 @@ async fn full_apply_cycle_converges_and_records() {
         "the stored signer must survive the UUPS upgrade"
     );
 
+    // Upgrades must never move an entry address: every canonical contract
+    // (except the REPLACED OIDC verifier) still sits at its predicted
+    // CREATE3 address.
+    for (recorded, name) in canonical_pairs(&cfg) {
+        if name == names::GOOGLE_OIDC_VERIFIER {
+            continue; // replaced on purpose; asserted to have moved above
+        }
+        assert_eq!(
+            recorded.to_lowercase(),
+            format!("{:#x}", predict_address(factory_addr, name)),
+            "{name} must not move across upgrades"
+        );
+    }
+
     // And the chain is still coherent afterwards.
     let built = plan::build(&cfg).await.unwrap();
     assert!(!built.has_deploys());
     assert!(!built.items.iter().any(|i| i.status == Status::Warn));
+}
+
+/// The network-invariance proof: run the SAME fresh apply against two
+/// completely separate bare anvils (both without even the CREATE2
+/// deployer) and assert the two chains end up with IDENTICAL canonical
+/// addresses — and that both match the offline prediction. This is the
+/// whole point of the factory: address = f(name), not f(chain).
+#[tokio::test]
+async fn fresh_apply_addresses_are_network_invariant() {
+    let artifacts = Artifacts::embedded();
+    let factory_addr = predict_factory_address(&artifacts).unwrap();
+    let mut runs: Vec<Vec<(String, &'static str)>> = Vec::new();
+
+    for run in 0..2 {
+        let anvil = spawn_anvil();
+        let dir = tempfile::tempdir().unwrap();
+        let path = empty_network_file(dir.path(), &anvil.endpoint());
+        let signer = SignerSource::from_spec(ANVIL_KEY).unwrap();
+        let cfg = NetworkConfig::load(&path).unwrap();
+        let opts = apply::Options {
+            upgrades: vec![],
+            confirm_fresh_deploy: true,
+            dev: false,
+        };
+        apply::run(&path, &cfg, &signer, &opts)
+            .await
+            .unwrap_or_else(|e| panic!("fresh apply #{run} failed: {e:#}"));
+
+        let cfg = NetworkConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.contracts.factory.to_lowercase(),
+            format!("{factory_addr:#x}"),
+            "run #{run}: the factory must land at the canonical address"
+        );
+        assert_canonical_addresses(&cfg, factory_addr);
+        runs.push(canonical_pairs(&cfg));
+        drop(anvil);
+    }
+
+    assert_eq!(
+        runs[0], runs[1],
+        "two fresh chains must yield identical canonical addresses"
+    );
 }
 
 /// Plan against a partially-deployed chain: the login stack exists (deployed

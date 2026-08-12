@@ -1,7 +1,7 @@
 # Eden testnet — desired state for the libid contract stack.
 #
 # ============================================================================
-# LEGACY DEPLOYMENT (pre-Notary, libid-contracts 0.1.x)
+# LEGACY DEPLOYMENT (pre-Notary, pre-factory, libid-contracts 0.1.x)
 #
 # This file describes the deployment made BEFORE the shared Notary contract
 # existed: each contract here was initialized with the notary SIGNER address
@@ -14,8 +14,13 @@
 #     until the planned fresh redeploy replaces this stack with one wired
 #     through the Notary contract.
 #
-# Do NOT run `apply` expecting convergence: the 0.2.0 flow cannot retrofit
+# Do NOT run `apply` expecting convergence: the 0.2.0+ flow cannot retrofit
 # a Notary contract into contracts initialized without one.
+#
+# These addresses also predate the deterministic factory (libid-contracts
+# 0.3.0): they were plain CREATE deploys and do NOT match the canonical
+# name-derived CREATE3 addresses a fresh apply produces. The planned fresh
+# redeploy will move the stack onto the factory-first addresses.
 # ============================================================================
 #
 # HOW TO READ THIS FILE

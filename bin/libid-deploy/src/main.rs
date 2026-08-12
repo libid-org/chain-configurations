@@ -45,6 +45,11 @@ enum Command {
         /// Emit the plan as JSON instead of the human rendering.
         #[arg(long)]
         json: bool,
+        /// Print the canonical predicted address table (network-invariant,
+        /// computed offline — works before the chain even exists) and exit
+        /// without contacting the RPC. For config pre-fill.
+        #[arg(long)]
+        print_addresses: bool,
     },
     /// Converge the chain onto the network file, then record the deployed
     /// addresses back into it.
@@ -68,6 +73,11 @@ enum Command {
         /// orphans anything already on the chain.
         #[arg(long)]
         confirm_fresh_deploy: bool,
+        /// Dev-chain mode: allow taking factory ownership from the baked
+        /// genesis admin by impersonation. Only honoured when the RPC's
+        /// web3_clientVersion reports anvil/hardhat; a real chain refuses.
+        #[arg(long)]
+        dev: bool,
     },
 }
 
@@ -105,7 +115,15 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Command::Plan { network, json } => {
+        Command::Plan {
+            network,
+            json,
+            print_addresses,
+        } => {
+            if print_addresses {
+                print!("{}", libid_deploy::names::render_address_table()?);
+                return Ok(());
+            }
             let cfg = NetworkConfig::load(&network)?;
             let built = plan::build(&cfg).await?;
             if json {
@@ -120,6 +138,7 @@ async fn main() -> Result<()> {
             upgrade,
             yes,
             confirm_fresh_deploy,
+            dev,
         } => {
             let cfg = NetworkConfig::load(&network)?;
             let spec = signer.unwrap_or_else(|| cfg.aws.kms_deployer.clone());
@@ -143,6 +162,7 @@ async fn main() -> Result<()> {
             let opts = apply::Options {
                 upgrades: upgrade,
                 confirm_fresh_deploy,
+                dev,
             };
             let summary = apply::run(&network, &cfg, &signer, &opts).await?;
             print!("{}", summary.render());

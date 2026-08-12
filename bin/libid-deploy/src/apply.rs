@@ -9,10 +9,23 @@
 //! identity-names stack, only when `[identity]` is present) — with one
 //! 0.2.0 addition in front: the shared Notary contract deploys FIRST,
 //! because every other contract takes its proxy address at initialize.
+//!
+//! Since libid-contracts 0.3.0 the flow is FACTORY-FIRST: step 0 makes sure
+//! the keyless CREATE2 deployer and the deterministic `LibidFactory` exist
+//! (installing them where missing), verifies the factory sits at exactly
+//! its predicted canonical address (the CANARY — a mismatch means the chain
+//! derives CREATE2 addresses differently and the run aborts), and then
+//! every top-level entry contract deploys THROUGH the factory via CREATE3
+//! under its canonical name from [`crate::names`], so its address is a pure
+//! function of the name — identical on every network. Implementations,
+//! facets, and Honk verifiers stay plain CREATE deploys: their addresses
+//! are referenced, not canonical, and upgrades replace them without moving
+//! any entry address.
 
 use std::path::Path;
 
 use alloy::{
+    network::TransactionBuilder,
     primitives::{
         Address,
         Bytes,
@@ -20,6 +33,11 @@ use alloy::{
     providers::{
         Provider,
         ProviderBuilder,
+    },
+    rpc::types::TransactionRequest,
+    sol_types::{
+        SolCall,
+        SolValue,
     },
 };
 use anyhow::{
@@ -30,6 +48,7 @@ use anyhow::{
 };
 use libid_contracts::{
     bindings::{
+        factory::LibidFactory,
         identity::{
             GitHubIdentityVerifier,
             GoogleIdentityVerifier,
@@ -45,7 +64,11 @@ use libid_contracts::{
         },
         notary::Notary,
         oidc::GoogleOidcVerifier,
-        transfer::Bank,
+        transfer::{
+            Bank,
+            BankInit,
+            IDiamondCut,
+        },
     },
     deploy::{
         deploy_behind_proxy,
@@ -53,8 +76,15 @@ use libid_contracts::{
         upgrade_uups,
     },
     diamond::{
-        deploy_bank_diamond,
+        facet_cut_action,
         replace_bank_facets,
+        BANK_FACETS,
+    },
+    factory::{
+        ensure_create2_deployer,
+        ensure_factory,
+        predict_address,
+        predict_factory_address,
     },
     send_with_nonce_retry,
     Artifacts,
@@ -72,6 +102,7 @@ use crate::{
         AddressUpdate,
         NetworkConfig,
     },
+    names,
     platforms::{
         identity_platform_id,
         IdentityPlatform,
@@ -133,6 +164,11 @@ pub struct Options {
     /// Required when the whole `[contracts]` section is empty: a fresh
     /// deploy orphans anything already on the chain.
     pub confirm_fresh_deploy: bool,
+    /// Dev-chain mode: allow taking factory ownership from the baked
+    /// genesis admin via impersonation. Impersonation only ever happens
+    /// when `web3_clientVersion` ALSO reports anvil/hardhat — this flag on
+    /// a real chain is a hard error, never a fallback.
+    pub dev: bool,
 }
 
 /// What an apply run did.
@@ -241,22 +277,75 @@ pub async fn run(
         });
     };
 
+    // ── Step 0: the deterministic-deployment substrate ────────────────────
+    // The keyless CREATE2 deployer and the LibidFactory are the hard
+    // onboarding gate: a chain that cannot host them cannot host the stack.
+    let predicted_factory = predict_factory_address(&artifacts)?;
+    let factory_was_present = !provider
+        .get_code_at(predicted_factory)
+        .await
+        .map_err(|e| anyhow!("failed to read code at the factory address: {e}"))?
+        .is_empty();
+    ensure_create2_deployer(&provider)
+        .await
+        .context("the canonical CREATE2 deployer is the onboarding gate")?;
+    let libid_factory = ensure_factory(&provider, &artifacts).await?;
+
+    // CANARY: after any install the factory must sit at exactly the
+    // predicted address. A mismatch (or missing code) means the chain does
+    // not derive CREATE2 addresses the standard way — every "deterministic"
+    // address downstream would be wrong, so abort before sending anything.
+    if libid_factory != predicted_factory
+        || provider
+            .get_code_at(predicted_factory)
+            .await
+            .map_err(|e| anyhow!("factory canary code read failed: {e}"))?
+            .is_empty()
+    {
+        bail!(
+            "FACTORY CANARY FAILED: the LibidFactory is not at its canonical \
+             predicted address {predicted_factory:#x} (got {libid_factory:#x}). \
+             This chain does not derive CREATE2 addresses the standard way \
+             (zkSync-Era-style derivation?), so cross-network address parity is \
+             impossible here — refusing to proceed."
+        );
+    }
+    if !factory_was_present {
+        info!("LibidFactory installed at its canonical address {libid_factory:#x}");
+        record(&mut summary, &mut updates, "factory", libid_factory, false);
+    } else {
+        // Record it even when it predates this run, so the file is complete.
+        updates.push(AddressUpdate {
+            section: "contracts",
+            key: "factory".into(),
+            address: libid_factory,
+            force: false,
+        });
+    }
+
+    // The factory's deploy() is owner-gated and the genesis owner is the
+    // baked libID deployer KMS address. On real networks the apply signer
+    // IS that key; on dev chains ownership is impersonation-transferred.
+    ensure_factory_ownership(&provider, libid_factory, sender, opts.dev).await?;
+
     // ── Notary FIRST: everything else takes its proxy at initialize ──────
     let notary_contract = match opt_address(&cfg.contracts.notary, "contracts.notary")? {
         Some(addr) => addr,
         None => {
-            let addr = deploy_behind_proxy(
+            let addr = deploy_named_proxy(
                 &provider,
                 &artifacts,
+                libid_factory,
+                names::NOTARY,
                 "Notary",
                 &Notary::initializeCall {
                     owner_: sender,
                     notary_: notary_signer,
                 },
-                Some(sender),
+                sender,
             )
             .await?;
-            info!("Notary proxy deployed at {addr:#x}");
+            info!("Notary proxy deployed at {addr:#x} ({})", names::NOTARY);
             record(&mut summary, &mut updates, "notary", addr, false);
             addr
         }
@@ -302,9 +391,11 @@ pub async fn run(
             )
             .await?;
             info!("WebWallet impl deployed at {wallet_impl:#x}");
-            let addr = deploy_behind_proxy(
+            let addr = deploy_named_proxy(
                 &provider,
                 &artifacts,
+                libid_factory,
+                names::WALLET_FACTORY,
                 "WalletFactory",
                 &WalletFactory::initializeCall {
                     owner_: sender,
@@ -313,7 +404,7 @@ pub async fn run(
                     // below once it does.
                     registry_: registry_existing.unwrap_or(Address::ZERO),
                 },
-                Some(sender),
+                sender,
             )
             .await?;
             info!("WalletFactory proxy deployed at {addr:#x}");
@@ -325,9 +416,11 @@ pub async fn run(
     let registry = match registry_existing {
         Some(addr) => addr,
         None => {
-            let addr = deploy_behind_proxy(
+            let addr = deploy_named_proxy(
                 &provider,
                 &artifacts,
+                libid_factory,
+                names::REGISTRY,
                 "Registry",
                 &IRegistryAdmin::initializeCall {
                     _notaryContract: notary_contract,
@@ -335,7 +428,7 @@ pub async fn run(
                     _walletFactory: factory,
                     _owner: sender,
                 },
-                Some(sender),
+                sender,
             )
             .await?;
             info!("Registry proxy deployed at {addr:#x}");
@@ -355,9 +448,10 @@ pub async fn run(
     let bank = match opt_address(&cfg.contracts.bank, "contracts.bank")? {
         Some(addr) => addr,
         None => {
-            let addr = deploy_bank_diamond(
+            let addr = deploy_bank_diamond_via_factory(
                 &provider,
                 &artifacts,
+                libid_factory,
                 sender,
                 notary_contract,
                 backend,
@@ -387,6 +481,7 @@ pub async fn run(
             let addr = deploy_x_zk_verifier(
                 &provider,
                 &artifacts,
+                libid_factory,
                 sender,
                 notary_contract,
                 x_client_id,
@@ -438,13 +533,19 @@ pub async fn run(
             if on_chain != Address::ZERO {
                 info!(
                     "replacing GoogleOidcVerifier {on_chain:#x} — the new deployment \
-                     gets a NEW address; the old verifier stays on-chain but nothing \
-                     points at it"
+                     gets a NEW address (plain CREATE: the canonical factory name is \
+                     single-use); the old verifier stays on-chain but nothing points \
+                     at it"
                 );
             }
+            // A REPLACE cannot go through the factory: the canonical name
+            // was consumed by the first deploy, and the address is meant to
+            // change anyway.
+            let via_factory = (on_chain == Address::ZERO).then_some(libid_factory);
             let addr = deploy_oidc_verifier(
                 &provider,
                 &artifacts,
+                via_factory,
                 sender,
                 notary_contract,
                 google_client_id,
@@ -623,6 +724,7 @@ pub async fn run(
         apply_identity(
             &provider,
             &artifacts,
+            libid_factory,
             sender,
             notary_contract,
             backend,
@@ -640,11 +742,330 @@ pub async fn run(
     Ok(summary)
 }
 
+/// Whether the RPC's `web3_clientVersion` reports a dev chain (anvil or
+/// hardhat). Returns the raw version string for error messages.
+async fn detect_dev_client<P: Provider>(provider: &P) -> Result<(bool, String)> {
+    let version: String = provider
+        .raw_request("web3_clientVersion".into(), ())
+        .await
+        .map_err(|e| anyhow!("web3_clientVersion failed: {e}"))?;
+    let lower = version.to_lowercase();
+    let is_dev = lower.contains("anvil") || lower.contains("hardhat");
+    Ok((is_dev, version))
+}
+
+/// Make sure the apply signer owns the factory (its `deploy` is
+/// owner-gated).
+///
+/// - Signer already the owner: nothing to do.
+/// - Signer is the pending owner (an interrupted Ownable2Step handover):
+///   `acceptOwnership`.
+/// - Otherwise, ONLY on a dev chain (anvil/hardhat, confirmed via
+///   `web3_clientVersion` regardless of the `--dev` flag): impersonate the
+///   current owner (the baked genesis admin nobody holds a dev key for) and
+///   Ownable2Step-transfer ownership to the signer. On any other chain this
+///   is a hard error: the apply signer must BE the factory owner — the
+///   libID deployer KMS key.
+async fn ensure_factory_ownership<P: Provider>(
+    provider: &P,
+    factory: Address,
+    sender: Address,
+    dev_requested: bool,
+) -> Result<()> {
+    let contract = LibidFactory::new(factory, provider);
+    let owner = contract
+        .owner()
+        .call()
+        .await
+        .map_err(|e| anyhow!("LibidFactory.owner read failed: {e}"))?;
+    if owner == sender {
+        return Ok(());
+    }
+    let pending = contract
+        .pendingOwner()
+        .call()
+        .await
+        .map_err(|e| anyhow!("LibidFactory.pendingOwner read failed: {e}"))?;
+    if pending == sender {
+        send_with_nonce_retry!(
+            contract.acceptOwnership(),
+            "LibidFactory.acceptOwnership",
+            provider,
+            sender
+        )?;
+        info!("factory ownership accepted: {owner:#x} -> {sender:#x}");
+        return Ok(());
+    }
+
+    let (is_dev, version) = detect_dev_client(provider).await?;
+    if !is_dev {
+        if dev_requested {
+            bail!(
+                "--dev was passed but the RPC client is '{version}', not \
+                 anvil/hardhat — refusing to impersonate the factory owner on \
+                 what looks like a real chain"
+            );
+        }
+        bail!(
+            "the factory at {factory:#x} is owned by {owner:#x} but apply signs \
+             as {sender:#x}. factory.deploy is owner-gated: on real networks the \
+             apply signer must BE the factory owner (the libID deployer KMS \
+             key). Impersonation is only available on dev chains (anvil/hardhat)."
+        );
+    }
+
+    // Dev chain: impersonate the current owner and hand ownership over,
+    // exactly the pattern libid-contracts' own anvil test uses.
+    info!(
+        "dev chain ({version}): impersonating the factory owner {owner:#x} to \
+         transfer ownership to {sender:#x}"
+    );
+    provider
+        .raw_request::<_, serde_json::Value>(
+            "anvil_setBalance".into(),
+            (owner, "0xde0b6b3a7640000"),
+        )
+        .await
+        .map_err(|e| anyhow!("anvil_setBalance failed: {e}"))?;
+    provider
+        .raw_request::<_, serde_json::Value>("anvil_impersonateAccount".into(), (owner,))
+        .await
+        .map_err(|e| anyhow!("anvil_impersonateAccount failed: {e}"))?;
+    let transfer = LibidFactory::transferOwnershipCall { newOwner: sender }.abi_encode();
+    provider
+        .raw_request::<_, serde_json::Value>(
+            "eth_sendTransaction".into(),
+            (serde_json::json!({
+                "from": owner,
+                "to": factory,
+                "data": Bytes::from(transfer),
+            }),),
+        )
+        .await
+        .map_err(|e| anyhow!("impersonated transferOwnership failed: {e}"))?;
+    provider
+        .raw_request::<_, serde_json::Value>(
+            "anvil_stopImpersonatingAccount".into(),
+            (owner,),
+        )
+        .await
+        .map_err(|e| anyhow!("anvil_stopImpersonatingAccount failed: {e}"))?;
+    send_with_nonce_retry!(
+        contract.acceptOwnership(),
+        "LibidFactory.acceptOwnership",
+        provider,
+        sender
+    )?;
+    info!("factory ownership transferred (dev): {owner:#x} -> {sender:#x}");
+    Ok(())
+}
+
+/// CREATE3-deploy `creation_code` under `name` through the factory, with an
+/// explicit chain-fetched nonce (the rest of the apply flow manages nonces
+/// explicitly, so the provider's cached filler cannot be trusted here).
+/// Idempotent: a name the factory already deployed returns its recorded
+/// address without sending anything — that is how a partially-failed apply
+/// converges instead of tripping on the single-use name.
+///
+/// The returned address is verified to equal `predict_address(factory,
+/// name)` — the whole point of the exercise.
+async fn factory_deploy_named<P: Provider>(
+    provider: &P,
+    factory: Address,
+    name: &str,
+    creation_code: Bytes,
+    sender: Address,
+) -> Result<Address> {
+    let contract = LibidFactory::new(factory, provider);
+    let predicted = predict_address(factory, name);
+
+    let existing = contract
+        .deployedAt(name.to_string())
+        .call()
+        .await
+        .map_err(|e| anyhow!("factory deployedAt({name}) read failed: {e}"))?;
+    if existing != Address::ZERO {
+        info!("{name} already deployed by the factory at {existing:#x} — reusing");
+        if existing != predicted {
+            bail!(
+                "factory record for {name} is {existing:#x} but predict says \
+                 {predicted:#x} — the deterministic invariant is broken"
+            );
+        }
+        return Ok(existing);
+    }
+
+    // `deploy` is sent as raw calldata: alloy's `sol!` reserves the `deploy`
+    // method name on generated contract instances.
+    let call = LibidFactory::deployCall {
+        name: name.to_string(),
+        creationCode: creation_code,
+    };
+    let nonce = provider
+        .get_transaction_count(sender)
+        .await
+        .map_err(|e| anyhow!("factory deploy of {name} failed to fetch nonce: {e}"))?;
+    let tx = TransactionRequest::default()
+        .with_to(factory)
+        .with_input(Bytes::from(call.abi_encode()))
+        .with_nonce(nonce);
+    let pending = provider
+        .send_transaction(tx)
+        .await
+        .map_err(|e| anyhow!("factory deploy of {name} send failed: {e}"))?;
+    pending
+        .get_receipt()
+        .await
+        .map_err(|e| anyhow!("factory deploy of {name} confirmation failed: {e}"))?;
+
+    let deployed = contract
+        .deployedAt(name.to_string())
+        .call()
+        .await
+        .map_err(|e| anyhow!("factory deployedAt({name}) re-read failed: {e}"))?;
+    if deployed != predicted {
+        bail!(
+            "factory deployed {name} at {deployed:#x} but predict says \
+             {predicted:#x} — the deterministic invariant is broken"
+        );
+    }
+    Ok(deployed)
+}
+
+/// Deploy `contract`'s implementation via plain CREATE (its address is
+/// referenced, not canonical), then CREATE3-deploy an ERC1967 proxy for it
+/// under `name` through the factory. The named-proxy shape of every UUPS
+/// entry contract since 0.3.0.
+#[allow(clippy::too_many_arguments)]
+async fn deploy_named_proxy<P: Provider, C: SolCall>(
+    provider: &P,
+    artifacts: &Artifacts,
+    factory: Address,
+    name: &str,
+    contract: &str,
+    init_call: &C,
+    sender: Address,
+) -> Result<Address> {
+    // Reuse before paying for an implementation nobody will point at.
+    let record = LibidFactory::new(factory, provider)
+        .deployedAt(name.to_string())
+        .call()
+        .await
+        .map_err(|e| anyhow!("factory deployedAt({name}) read failed: {e}"))?;
+    if record != Address::ZERO {
+        return factory_deploy_named(provider, factory, name, Bytes::new(), sender).await;
+    }
+
+    let implementation = deploy_contract_from(
+        provider,
+        artifacts.bytecode(contract)?,
+        &format!("{contract} (impl)"),
+        Some(sender),
+    )
+    .await?;
+    let mut creation_code = artifacts.bytecode("ERC1967Proxy")?.to_vec();
+    creation_code.extend_from_slice(
+        &(implementation, Bytes::from(init_call.abi_encode())).abi_encode_params(),
+    );
+    factory_deploy_named(provider, factory, name, creation_code.into(), sender).await
+}
+
+/// Deploy a fresh Bank diamond THROUGH the factory under [`names::BANK`].
+///
+/// Same construction as `libid_contracts::diamond::deploy_bank_diamond`,
+/// except the Diamond itself is CREATE3-deployed so its address is
+/// name-derived — CREATE3 makes the constructor args (owner, cut facet)
+/// irrelevant to the address. The facets, `BankInit`, and the follow-up
+/// `diamondCut` are plain: they are code behind the diamond, not entries.
+#[allow(clippy::too_many_arguments)]
+async fn deploy_bank_diamond_via_factory<P: Provider>(
+    provider: &P,
+    artifacts: &Artifacts,
+    factory: Address,
+    owner: Address,
+    notary_contract: Address,
+    backend: Address,
+    registry: Address,
+) -> Result<Address> {
+    // A name already consumed means a previous apply got at least as far as
+    // the diamond constructor; reuse it and let the cut below be the judge.
+    let record = LibidFactory::new(factory, provider)
+        .deployedAt(names::BANK.to_string())
+        .call()
+        .await
+        .map_err(|e| anyhow!("factory deployedAt(libid.Bank) read failed: {e}"))?;
+    if record != Address::ZERO {
+        info!("Bank diamond already deployed by the factory at {record:#x} — reusing");
+        return Ok(record);
+    }
+
+    // DiamondCutFacet — the one facet the Diamond ctor wires in itself.
+    let cut_facet_addr = deploy_contract_from(
+        provider,
+        artifacts.bytecode("DiamondCutFacet")?,
+        "DiamondCutFacet",
+        Some(owner),
+    )
+    .await?;
+
+    // Diamond(address owner, address diamondCutFacet), CREATE3 under the
+    // canonical name.
+    let mut creation_code = artifacts.bytecode("Diamond")?.to_vec();
+    creation_code.extend_from_slice(&(owner, cut_facet_addr).abi_encode_params());
+    let diamond_addr =
+        factory_deploy_named(provider, factory, names::BANK, creation_code.into(), owner)
+            .await?;
+
+    // Remaining facets: deploy each and collect its selectors for one ADD
+    // cut. (DiamondCutFacet is intentionally absent — already cut in.)
+    let mut cut = Vec::with_capacity(BANK_FACETS.len());
+    for &facet in BANK_FACETS {
+        let facet_addr = deploy_contract_from(
+            provider,
+            artifacts.bytecode(facet)?,
+            facet,
+            Some(owner),
+        )
+        .await?;
+        cut.push(IDiamondCut::FacetCut {
+            facetAddress: facet_addr,
+            action: facet_cut_action::ADD,
+            functionSelectors: artifacts.facet_selectors(facet)?,
+        });
+    }
+
+    // One-shot initializer, delegatecalled by diamondCut in diamond storage.
+    let bank_init_addr = deploy_contract_from(
+        provider,
+        artifacts.bytecode("BankInit")?,
+        "BankInit",
+        Some(owner),
+    )
+    .await?;
+    let init_calldata: Bytes = BankInit::initCall {
+        notary: notary_contract,
+        backend,
+        registry,
+    }
+    .abi_encode()
+    .into();
+
+    let diamond = IDiamondCut::new(diamond_addr, provider);
+    send_with_nonce_retry!(
+        diamond.diamondCut(cut.clone(), bank_init_addr, init_calldata.clone()),
+        "Diamond.diamondCut",
+        provider,
+        owner
+    )?;
+    Ok(diamond_addr)
+}
+
 /// Deploy the X ZK login verifier stack (XHonkVerifier + XZkVerifier UUPS
-/// proxy). Does NOT register it on the Registry.
+/// proxy, the latter CREATE3-named). Does NOT register it on the Registry.
 async fn deploy_x_zk_verifier<P: Provider>(
     provider: &P,
     artifacts: &Artifacts,
+    factory: Address,
     sender: Address,
     notary_contract: Address,
     client_id: &str,
@@ -660,9 +1081,11 @@ async fn deploy_x_zk_verifier<P: Provider>(
             .await?;
     info!("XHonkVerifier deployed at {honk:#x}");
 
-    let addr = deploy_behind_proxy(
+    let addr = deploy_named_proxy(
         provider,
         artifacts,
+        factory,
+        names::X_ZK_VERIFIER,
         "XZkVerifier",
         &XZkVerifier::initializeCall {
             _owner: sender,
@@ -673,7 +1096,7 @@ async fn deploy_x_zk_verifier<P: Provider>(
             _handlePrefix: X_HANDLE_PREFIX.into(),
             _platformName: X_DOMAIN.into(),
         },
-        Some(sender),
+        sender,
     )
     .await?;
     info!("XZkVerifier proxy deployed at {addr:#x}");
@@ -683,12 +1106,18 @@ async fn deploy_x_zk_verifier<P: Provider>(
 /// Deploy the Google OIDC verifier stack (HonkVerifier + GoogleOidcVerifier
 /// behind an ERC1967 proxy). Does NOT register it on the Registry.
 ///
+/// `factory`: `Some` deploys the proxy CREATE3-named through the factory
+/// (the first, canonical deployment); `None` is the `--upgrade
+/// oidc-verifier` REPLACE path — plain CREATE, because the canonical name
+/// is single-use and the replacement's address is meant to change.
+///
 /// The proxy is not optional: GoogleOidcVerifier's constructor calls
 /// `_disableInitializers()`, so the bare implementation can never be
 /// initialized.
 async fn deploy_oidc_verifier<P: Provider>(
     provider: &P,
     artifacts: &Artifacts,
+    factory: Option<Address>,
     sender: Address,
     notary_contract: Address,
     initial_aud: &str,
@@ -711,19 +1140,36 @@ async fn deploy_oidc_verifier<P: Provider>(
             .await?;
     info!("OIDC HonkVerifier deployed at {honk:#x}");
 
-    let addr = deploy_behind_proxy(
-        provider,
-        artifacts,
-        "GoogleOidcVerifier",
-        &GoogleOidcVerifier::initializeCall {
-            _verifier: honk,
-            _owner: sender,
-            notaryContract_: notary_contract,
-            initialAud: initial_aud.into(),
-        },
-        Some(sender),
-    )
-    .await?;
+    let init_call = GoogleOidcVerifier::initializeCall {
+        _verifier: honk,
+        _owner: sender,
+        notaryContract_: notary_contract,
+        initialAud: initial_aud.into(),
+    };
+    let addr = match factory {
+        Some(factory) => {
+            deploy_named_proxy(
+                provider,
+                artifacts,
+                factory,
+                names::GOOGLE_OIDC_VERIFIER,
+                "GoogleOidcVerifier",
+                &init_call,
+                sender,
+            )
+            .await?
+        }
+        None => {
+            deploy_behind_proxy(
+                provider,
+                artifacts,
+                "GoogleOidcVerifier",
+                &init_call,
+                Some(sender),
+            )
+            .await?
+        }
+    };
     info!("GoogleOidcVerifier proxy deployed at {addr:#x}");
     Ok(addr)
 }
@@ -736,6 +1182,7 @@ async fn deploy_oidc_verifier<P: Provider>(
 async fn apply_identity<P: Provider>(
     provider: &P,
     artifacts: &Artifacts,
+    libid_factory: Address,
     sender: Address,
     notary_contract: Address,
     backend: Address,
@@ -760,12 +1207,14 @@ async fn apply_identity<P: Provider>(
     let names = match opt_address(&identity.identity_names, "identity.identity_names")? {
         Some(addr) => addr,
         None => {
-            let addr = deploy_behind_proxy(
+            let addr = deploy_named_proxy(
                 provider,
                 artifacts,
+                libid_factory,
+                names::IDENTITY_NAMES,
                 "IdentityNames",
                 &IdentityNames::initializeCall { owner_: sender },
-                Some(sender),
+                sender,
             )
             .await?;
             info!("IdentityNames deployed at {addr:#x}");
@@ -784,9 +1233,11 @@ async fn apply_identity<P: Provider>(
         Some(addr) => addr,
         None => {
             let (endpoint, handle_prefix, id_prefix, id_suffix) = GITHUB_SHAPE;
-            let addr = deploy_behind_proxy(
+            let addr = deploy_named_proxy(
                 provider,
                 artifacts,
+                libid_factory,
+                names::GITHUB_IDENTITY_VERIFIER,
                 "GitHubIdentityVerifier",
                 &GitHubIdentityVerifier::initializeCall {
                     owner_: sender,
@@ -799,7 +1250,7 @@ async fn apply_identity<P: Provider>(
                         idSuffix: id_suffix.into(),
                     },
                 },
-                Some(sender),
+                sender,
             )
             .await?;
             info!("GitHubIdentityVerifier deployed at {addr:#x}");
@@ -833,9 +1284,11 @@ async fn apply_identity<P: Provider>(
                     Some(sender),
                 )
                 .await?;
-                let addr = deploy_behind_proxy(
+                let addr = deploy_named_proxy(
                     provider,
                     artifacts,
+                    libid_factory,
+                    names::X_IDENTITY_VERIFIER,
                     "XIdentityVerifier",
                     &XIdentityVerifier::initializeCall {
                         owner_: sender,
@@ -849,7 +1302,7 @@ async fn apply_identity<P: Provider>(
                             idSuffix: crate::platforms::X_ID_SUFFIX.into(),
                         },
                     },
-                    Some(sender),
+                    sender,
                 )
                 .await?;
                 info!("XIdentityVerifier deployed at {addr:#x}");
@@ -875,15 +1328,17 @@ async fn apply_identity<P: Provider>(
                 {
                     Some(addr) => addr,
                     None => {
-                        let roots = deploy_behind_proxy(
+                        let roots = deploy_named_proxy(
                             provider,
                             artifacts,
+                            libid_factory,
+                            names::IDENTITY_JWKS_ROOTS,
                             "IdentityJwksRoots",
                             &IdentityJwksRoots::initializeCall {
                                 owner_: sender,
                                 notaryContract_: notary_contract,
                             },
-                            Some(sender),
+                            sender,
                         )
                         .await?;
                         info!("IdentityJwksRoots deployed at {roots:#x}");
@@ -905,16 +1360,18 @@ async fn apply_identity<P: Provider>(
                     Some(sender),
                 )
                 .await?;
-                let addr = deploy_behind_proxy(
+                let addr = deploy_named_proxy(
                     provider,
                     artifacts,
+                    libid_factory,
+                    names::GOOGLE_IDENTITY_VERIFIER,
                     "GoogleIdentityVerifier",
                     &GoogleIdentityVerifier::initializeCall {
                         owner_: sender,
                         honkVerifier_: honk,
                         jwksRoots_: roots,
                     },
-                    Some(sender),
+                    sender,
                 )
                 .await?;
                 info!("GoogleIdentityVerifier deployed at {addr:#x}");
