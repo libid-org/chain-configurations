@@ -58,7 +58,7 @@ enum Command {
         #[arg(long)]
         signer: Option<String>,
         /// Comma-separated components to explicitly upgrade:
-        /// registry, wallet-factory, notary-registry, bank, oidc-verifier.
+        /// registry, wallet-factory, notary, bank, oidc-verifier.
         #[arg(long, value_delimiter = ',')]
         upgrade: Vec<apply::Upgrade>,
         /// Proceed without the interactive confirmation prompt.

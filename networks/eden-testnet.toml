@@ -1,5 +1,23 @@
 # Eden testnet — desired state for the libid contract stack.
 #
+# ============================================================================
+# LEGACY DEPLOYMENT (pre-Notary, libid-contracts 0.1.x)
+#
+# This file describes the deployment made BEFORE the shared Notary contract
+# existed: each contract here was initialized with the notary SIGNER address
+# directly, and there is no Notary proxy on this chain. Consequences:
+#
+#   - `plan` reports `contracts.notary` as missing (DEPLOY) — expected.
+#   - Consumer wiring checks (`*.notary_wiring`) WARN: these contracts have
+#     no `notaryContract()` getter. Also expected.
+#   - `validate` still passes; the file stays the record of what is live
+#     until the planned fresh redeploy replaces this stack with one wired
+#     through the Notary contract.
+#
+# Do NOT run `apply` expecting convergence: the 0.2.0 flow cannot retrofit
+# a Notary contract into contracts initialized without one.
+# ============================================================================
+#
 # HOW TO READ THIS FILE
 #
 # Every value here is public: contract addresses, a public RPC, and OAuth
@@ -28,10 +46,12 @@ region = "eu-central-1"
 # The deployer's KMS key. Owns every UUPS proxy and the Bank diamond.
 kms_deployer = "alias/dyaka-testnet-deployer"
 
-# The ADDRESSES OF KEYS, not contracts. Distinct on purpose: the X notary and
-# the JWKS-rotation (OIDC) notary are separate on-chain authorities, so one
-# can rotate without touching the other. `backend` is the backend's own
-# signing identity; the Bank grants it the backend role at construction.
+# The ADDRESSES OF KEYS, not contracts. `notary` is the notary SIGNER — the
+# EOA/KMS identity whose signatures the stack accepts; on a 0.2.0 deployment
+# the Notary CONTRACT (`contracts.notary`) stores it. `oidc_notary` is the
+# legacy separate JWKS-rotation authority this pre-Notary deployment wired
+# into its OIDC verifier; 0.2.0 no longer uses it. `backend` is the backend's
+# own signing identity; the Bank grants it the backend role at construction.
 [accounts]
 notary = "0x7a3646e8431a4b0c8bb586a7d26d7da7ae4aa2b5"
 oidc_notary = "0x3b02dc7c278125dd3ea686d09335f7cd6604e5f2"
@@ -39,14 +59,16 @@ backend = "0xe9b132c2eccca08efaf62d18c301945f38ddc267"
 
 # OUTPUT: deployed contract addresses. Empty/absent = not deployed yet.
 #
-# The NotaryRegistry proxy is not discoverable on-chain — nothing exposes a
-# getter for it. It exists ONLY as an output of the deploy run that created
-# it, so this line is the record. Losing it means apply cannot converge.
+# `notary` is the Notary PROXY — the one contract everything verifies notary
+# attestations through since 0.2.0. Empty here because this legacy stack
+# predates it (see the header). The retired NotaryRegistry proxy of the
+# 0.1.x deployment lived at 0xe460b1bf58f48a2ac90889b269d27e145e845a92;
+# kept as a comment so the record is not lost.
 [contracts]
+notary = ""
 bank = "0x954a99f1756cf281caa0aa81c12b582fcf7c8d94"
 registry = "0xd764dbc5e51a042c004c52833f7e2f32b0cc651e"
 wallet_factory = "0xd46181cab629aeda48406b462656513821de6775"
-notary_registry = "0xe460b1bf58f48a2ac90889b269d27e145e845a92"
 x_zk_verifier = "0x3f753cde17a261d6a6edf9d6846785d18bdb6efd"
 google_oidc_verifier = "0x69cc7c69b39ada71ce908d432868d5ef9a6a6d0e"
 

@@ -2,8 +2,11 @@
 # every OUTPUT key empty: the first `apply --confirm-fresh-deploy` run fills
 # them and opens a PR recording what it deployed.
 #
-# See networks/eden-testnet.toml for a fully-populated example and the
-# input-vs-output key convention.
+# This template describes the CURRENT (libid-contracts 0.2.0, Notary-era)
+# schema: the shared Notary contract deploys first and every other contract
+# is wired to its proxy at initialize. networks/eden-testnet.toml is a
+# fully-populated example of the input-vs-output key convention, but note
+# that it records the LEGACY pre-Notary deployment (see its header).
 
 [network]
 name = "mainnet"
@@ -17,19 +20,27 @@ region = ""
 # ECC_SECG_P256K1 / SIGN_VERIFY and fund its derived address before applying.
 kms_deployer = ""
 
-# Addresses of KEYS (not contracts): the X notary, the JWKS-rotation (OIDC)
-# notary, and the backend signing identity. Derive each from its own KMS key.
+# Addresses of KEYS (not contracts), derived from their own KMS keys.
+#
+# `notary` is the notary SIGNER — the EOA/KMS identity whose attestations
+# the whole stack accepts. The Notary CONTRACT (`contracts.notary` below)
+# stores this address: apply initializes it with this value, and later
+# editing this key makes apply rotate the on-chain signer via `setNotary`
+# (one transaction; every consumer follows the contract).
 [accounts]
 notary = ""
-oidc_notary = ""
 backend = ""
 
 # OUTPUT — leave empty. Filled by `libid-deploy apply`.
+#
+# `notary` is the Notary PROXY address — the one contract everything else
+# verifies notary attestations through. It deploys FIRST and is wired into
+# every consumer at initialize. Not the signer; that is `accounts.notary`.
 [contracts]
+notary = ""
 bank = ""
 registry = ""
 wallet_factory = ""
-notary_registry = ""
 x_zk_verifier = ""
 google_oidc_verifier = ""
 

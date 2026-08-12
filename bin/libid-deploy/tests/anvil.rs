@@ -14,9 +14,12 @@ use alloy::{
     },
 };
 use libid_contracts::{
-    bindings::login::{
-        IRegistryAdmin,
-        WalletFactory,
+    bindings::{
+        login::{
+            IRegistryAdmin,
+            WalletFactory,
+        },
+        notary::Notary,
     },
     deploy::{
         deploy_behind_proxy,
@@ -64,14 +67,13 @@ kms_deployer = "alias/never-used-in-tests"
 
 [accounts]
 notary = "0x1111111111111111111111111111111111111111"
-oidc_notary = "0x3333333333333333333333333333333333333333"
 backend = "0x2222222222222222222222222222222222222222"
 
 [contracts]
+notary = ""
 bank = ""
 registry = ""
 wallet_factory = ""
-notary_registry = ""
 x_zk_verifier = ""
 google_oidc_verifier = ""
 
@@ -128,9 +130,9 @@ async fn full_apply_cycle_converges_and_records() {
     let summary = apply::run(&path, &cfg, &signer, &opts).await.unwrap();
     let deployed: Vec<&str> = summary.deployed.iter().map(|(c, _)| c.as_str()).collect();
     for component in [
+        "contracts.notary",
         "contracts.wallet_factory",
         "contracts.registry",
-        "contracts.notary_registry",
         "contracts.bank",
         "contracts.x_zk_verifier",
         "contracts.google_oidc_verifier",
@@ -185,12 +187,61 @@ async fn full_apply_cycle_converges_and_records() {
     assert!(summary.recorded.is_empty());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 
-    // Explicit upgrades: UUPS for the registry, facet REPLACE for the bank,
+    // Notary signer rotation, declaratively: edit accounts.notary in the
+    // file, the plan diffs Notary.notary() against it, apply setNotary's.
+    let rotated = "0x4444444444444444444444444444444444444444";
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        text.replace("0x1111111111111111111111111111111111111111", rotated),
+    )
+    .unwrap();
+    let cfg = NetworkConfig::load(&path).unwrap();
+    let built = plan::build(&cfg).await.unwrap();
+    let signer_item = built
+        .items
+        .iter()
+        .find(|i| i.component == "contracts.notary.signer")
+        .expect("the plan diffs the notary signer");
+    assert_eq!(
+        signer_item.status,
+        Status::Configure,
+        "a signer mismatch is a planned rotation:\n{}",
+        built.render()
+    );
+    assert!(!built.has_deploys(), "rotation must not redeploy anything");
+
+    let summary = apply::run(&path, &cfg, &signer, &opts).await.unwrap();
+    assert!(summary.deployed.is_empty());
+    assert!(
+        summary
+            .configured
+            .iter()
+            .any(|c| c.contains("notary signer rotated")),
+        "apply must report the rotation: {summary:?}"
+    );
+    let read_provider =
+        ProviderBuilder::new().connect_http(anvil.endpoint().parse().unwrap());
+    let notary_proxy: Address = cfg.contracts.notary.parse().unwrap();
+    let on_chain = Notary::new(notary_proxy, &read_provider)
+        .notary()
+        .call()
+        .await
+        .unwrap();
+    assert_eq!(on_chain, rotated.parse::<Address>().unwrap());
+
+    // A further apply is a no-op again: the signer already matches.
+    let summary = apply::run(&path, &cfg, &signer, &opts).await.unwrap();
+    assert!(summary.configured.is_empty(), "{summary:?}");
+
+    // Explicit upgrades: UUPS for the registry and the Notary (whose state
+    // — the rotated signer — must survive), facet REPLACE for the bank,
     // redeploy+repoint for the OIDC verifier (its address must change).
     let oidc_before = cfg.contracts.google_oidc_verifier.clone();
     let opts = apply::Options {
         upgrades: vec![
             apply::Upgrade::Registry,
+            apply::Upgrade::Notary,
             apply::Upgrade::Bank,
             apply::Upgrade::OidcVerifier,
         ],
@@ -198,6 +249,7 @@ async fn full_apply_cycle_converges_and_records() {
     };
     let summary = apply::run(&path, &cfg, &signer, &opts).await.unwrap();
     assert!(summary.upgraded.iter().any(|u| u == "registry"));
+    assert!(summary.upgraded.iter().any(|u| u == "notary"));
     assert!(summary.upgraded.iter().any(|u| u == "bank"));
     assert!(summary
         .upgraded
@@ -207,6 +259,20 @@ async fn full_apply_cycle_converges_and_records() {
     assert_ne!(
         cfg.contracts.google_oidc_verifier, oidc_before,
         "the OIDC verifier REPLACE must record its new address"
+    );
+
+    // The Notary implementation changed; the proxy (address AND state,
+    // i.e. the rotated signer) did not.
+    assert_eq!(cfg.contracts.notary, format!("{notary_proxy:#x}"));
+    let on_chain = Notary::new(notary_proxy, &read_provider)
+        .notary()
+        .call()
+        .await
+        .unwrap();
+    assert_eq!(
+        on_chain,
+        rotated.parse::<Address>().unwrap(),
+        "the stored signer must survive the UUPS upgrade"
     );
 
     // And the chain is still coherent afterwards.
@@ -230,6 +296,18 @@ async fn plan_reports_missing_and_present_components() {
     let deployer = provider.get_accounts().await.unwrap()[0];
     let artifacts = Artifacts::embedded();
 
+    let notary_contract = deploy_behind_proxy(
+        &provider,
+        &artifacts,
+        "Notary",
+        &Notary::initializeCall {
+            owner_: deployer,
+            notary_: Address::repeat_byte(0x11),
+        },
+        None,
+    )
+    .await
+    .unwrap();
     let wallet_impl = deploy_contract(
         &provider,
         artifacts.bytecode("WebWallet").unwrap(),
@@ -255,7 +333,7 @@ async fn plan_reports_missing_and_present_components() {
         &artifacts,
         "Registry",
         &IRegistryAdmin::initializeCall {
-            _notary: Address::repeat_byte(0x11),
+            _notaryContract: notary_contract,
             _backend: Address::repeat_byte(0x22),
             _walletFactory: factory,
             _owner: deployer,
@@ -284,6 +362,7 @@ notary = "0x1111111111111111111111111111111111111111"
 backend = "0x2222222222222222222222222222222222222222"
 
 [contracts]
+notary = "{notary_contract:#x}"
 registry = "{registry:#x}"
 wallet_factory = "{factory:#x}"
 
@@ -307,13 +386,17 @@ x_client_id = "test-x-client-id"
             })
             .status
     };
+    assert_eq!(status_of("contracts.notary"), Status::Ok);
+    // The stored signer matches accounts.notary: no rotation planned.
+    assert_eq!(status_of("contracts.notary.signer"), Status::Ok);
     assert_eq!(status_of("contracts.registry"), Status::Ok);
+    // The Registry's notaryContract() points at the recorded proxy.
+    assert_eq!(status_of("contracts.registry.notary_wiring"), Status::Ok);
     assert_eq!(status_of("contracts.wallet_factory"), Status::Ok);
     assert_eq!(status_of("contracts.bank"), Status::Deploy);
-    assert_eq!(status_of("contracts.notary_registry"), Status::Deploy);
     // x_client_id is set and nothing is wired: a deploy is pending.
     assert_eq!(status_of("contracts.x_zk_verifier"), Status::Deploy);
-    // No OIDC notary/client id: skipped, not deployed.
+    // No Google client id: skipped, not deployed.
     assert_eq!(status_of("contracts.google_oidc_verifier"), Status::Skipped);
     // Identity section absent: skipped.
     assert_eq!(status_of("identity"), Status::Skipped);

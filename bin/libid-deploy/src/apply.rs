@@ -6,7 +6,9 @@
 //! The orchestration order is ported from dyaka's deployers:
 //! `dyaka-auth::deploy::run` (login stack), `dyaka-transfer::deploy`
 //! (Bank diamond + reconcile), and `dyaka-identity::deploy::run` (the
-//! identity-names stack, only when `[identity]` is present).
+//! identity-names stack, only when `[identity]` is present) — with one
+//! 0.2.0 addition in front: the shared Notary contract deploys FIRST,
+//! because every other contract takes its proxy address at initialize.
 
 use std::path::Path;
 
@@ -37,11 +39,11 @@ use libid_contracts::{
         },
         login::{
             IRegistryAdmin,
-            NotaryRegistry,
             Registry,
             WalletFactory,
             XZkVerifier,
         },
+        notary::Notary,
         oidc::GoogleOidcVerifier,
         transfer::Bank,
     },
@@ -94,8 +96,9 @@ pub enum Upgrade {
     Registry,
     /// UUPS `upgradeToAndCall` on the WalletFactory proxy.
     WalletFactory,
-    /// UUPS `upgradeToAndCall` on the NotaryRegistry proxy.
-    NotaryRegistry,
+    /// UUPS `upgradeToAndCall` on the shared Notary proxy. State (the
+    /// stored notary signer) lives in the proxy and survives the upgrade.
+    Notary,
     /// Diamond facet REPLACE on the Bank — there is no implementation slot;
     /// the diamond is the storage, the facets are the code.
     Bank,
@@ -111,12 +114,12 @@ impl std::str::FromStr for Upgrade {
         match s.trim() {
             "registry" => Ok(Self::Registry),
             "wallet-factory" => Ok(Self::WalletFactory),
-            "notary-registry" => Ok(Self::NotaryRegistry),
+            "notary" => Ok(Self::Notary),
             "bank" => Ok(Self::Bank),
             "oidc-verifier" => Ok(Self::OidcVerifier),
             other => bail!(
                 "unknown upgrade component '{other}' (expected registry, \
-                 wallet-factory, notary-registry, bank, oidc-verifier)"
+                 wallet-factory, notary, bank, oidc-verifier)"
             ),
         }
     }
@@ -139,6 +142,9 @@ pub struct Summary {
     pub deployed: Vec<(String, Address)>,
     /// Explicitly upgraded components.
     pub upgraded: Vec<String>,
+    /// On-chain configuration changes beyond the always-resent idempotent
+    /// ops — today only the Notary signer rotation.
+    pub configured: Vec<String>,
     /// Config keys the rewrite changed (`section.key`).
     pub recorded: Vec<String>,
 }
@@ -160,6 +166,9 @@ impl Summary {
             let _ = writeln!(out, "Upgraded: none");
         } else {
             let _ = writeln!(out, "Upgraded: {}", self.upgraded.join(", "));
+        }
+        if !self.configured.is_empty() {
+            let _ = writeln!(out, "Configured: {}", self.configured.join(", "));
         }
         if self.recorded.is_empty() {
             let _ = writeln!(out, "Config: unchanged");
@@ -213,7 +222,7 @@ pub async fn run(
     }
 
     let artifacts = Artifacts::embedded();
-    let notary = required_address(&cfg.accounts.notary, "accounts.notary")?;
+    let notary_signer = required_address(&cfg.accounts.notary, "accounts.notary")?;
     let backend = required_address(&cfg.accounts.backend, "accounts.backend")?;
 
     let mut summary = Summary::default();
@@ -231,6 +240,51 @@ pub async fn run(
             force,
         });
     };
+
+    // ── Notary FIRST: everything else takes its proxy at initialize ──────
+    let notary_contract = match opt_address(&cfg.contracts.notary, "contracts.notary")? {
+        Some(addr) => addr,
+        None => {
+            let addr = deploy_behind_proxy(
+                &provider,
+                &artifacts,
+                "Notary",
+                &Notary::initializeCall {
+                    owner_: sender,
+                    notary_: notary_signer,
+                },
+                Some(sender),
+            )
+            .await?;
+            info!("Notary proxy deployed at {addr:#x}");
+            record(&mut summary, &mut updates, "notary", addr, false);
+            addr
+        }
+    };
+
+    // Declarative signer rotation: the file says who the notary signer IS;
+    // a differing on-chain signer is drift and `setNotary` converges it.
+    let notary_views = Notary::new(notary_contract, &provider);
+    let on_chain_signer = notary_views
+        .notary()
+        .call()
+        .await
+        .map_err(|e| anyhow!("Notary.notary read failed: {e}"))?;
+    if on_chain_signer != notary_signer {
+        send_with_nonce_retry!(
+            notary_views.setNotary(notary_signer),
+            "Notary.setNotary",
+            &provider,
+            sender
+        )?;
+        info!(
+            "Notary signer rotated: {on_chain_signer:#x} -> {notary_signer:#x} \
+             (one transaction; every consumer follows the Notary contract)"
+        );
+        summary.configured.push(format!(
+            "notary signer rotated {on_chain_signer:#x} -> {notary_signer:#x}"
+        ));
+    }
 
     // ── Login stack ──────────────────────────────────────────────────────
     let factory_existing =
@@ -276,7 +330,7 @@ pub async fn run(
                 &artifacts,
                 "Registry",
                 &IRegistryAdmin::initializeCall {
-                    _notary: notary,
+                    _notaryContract: notary_contract,
                     _backend: backend,
                     _walletFactory: factory,
                     _owner: sender,
@@ -297,27 +351,6 @@ pub async fn run(
         }
     };
 
-    let notary_registry =
-        match opt_address(&cfg.contracts.notary_registry, "contracts.notary_registry")? {
-            Some(addr) => addr,
-            None => {
-                let addr = deploy_behind_proxy(
-                    &provider,
-                    &artifacts,
-                    "NotaryRegistry",
-                    &NotaryRegistry::initializeCall {
-                        owner_: sender,
-                        initialNotary: notary,
-                    },
-                    Some(sender),
-                )
-                .await?;
-                info!("NotaryRegistry proxy deployed at {addr:#x}");
-                record(&mut summary, &mut updates, "notary_registry", addr, false);
-                addr
-            }
-        };
-
     // ── Bank diamond ─────────────────────────────────────────────────────
     let bank = match opt_address(&cfg.contracts.bank, "contracts.bank")? {
         Some(addr) => addr,
@@ -326,7 +359,7 @@ pub async fn run(
                 &provider,
                 &artifacts,
                 sender,
-                notary_registry,
+                notary_contract,
                 backend,
                 registry,
             )
@@ -349,17 +382,13 @@ pub async fn run(
             .await
             .map_err(|e| anyhow!("Registry.zkVerifierOf({X_DOMAIN}) read failed: {e}"))?;
         if on_chain == Address::ZERO {
-            // The XZkVerifier's notary must match the Registry's notary.
-            let registry_notary = registry_views
-                .notary()
-                .call()
-                .await
-                .map_err(|e| anyhow!("Registry.notary read failed: {e}"))?;
+            // The verifier and the Registry share the ONE Notary contract,
+            // so a signer rotation reaches both in a single setNotary.
             let addr = deploy_x_zk_verifier(
                 &provider,
                 &artifacts,
                 sender,
-                registry_notary,
+                notary_contract,
                 x_client_id,
             )
             .await?;
@@ -386,20 +415,18 @@ pub async fn run(
         warn!("platforms.x_client_id is empty — skipping the XZkVerifier");
     }
 
-    let oidc_notary = opt_address(&cfg.accounts.oidc_notary, "accounts.oidc_notary")?;
     let google_client_id = cfg.platforms.google_client_id.trim();
     let upgrade_oidc = opts.upgrades.contains(&Upgrade::OidcVerifier);
-    if upgrade_oidc && (oidc_notary.is_none() || google_client_id.is_empty()) {
+    if upgrade_oidc && google_client_id.is_empty() {
         // An explicit upgrade request that cannot be honoured must not fall
         // through to a silent no-op — that is the exact failure the flag
         // exists to fix.
         bail!(
-            "--upgrade oidc-verifier needs accounts.oidc_notary and \
-             platforms.google_client_id set: the verifier is constructed with the \
-             notary it trusts and the JWT audience it enforces"
+            "--upgrade oidc-verifier needs platforms.google_client_id set: the \
+             verifier is constructed with the JWT audience it enforces"
         );
     }
-    if let (Some(oidc_notary), false) = (oidc_notary, google_client_id.is_empty()) {
+    if !google_client_id.is_empty() {
         let on_chain = registry_views
             .oidcVerifierOf(GOOGLE_DOMAIN.into())
             .call()
@@ -419,7 +446,7 @@ pub async fn run(
                 &provider,
                 &artifacts,
                 sender,
-                oidc_notary,
+                notary_contract,
                 google_client_id,
             )
             .await?;
@@ -451,10 +478,7 @@ pub async fn run(
             });
         }
     } else {
-        warn!(
-            "accounts.oidc_notary or platforms.google_client_id is empty — skipping \
-             the GoogleOidcVerifier"
-        );
+        warn!("platforms.google_client_id is empty — skipping the GoogleOidcVerifier");
     }
 
     // ── Explicit upgrades ────────────────────────────────────────────────
@@ -484,17 +508,17 @@ pub async fn run(
                 .await?;
                 summary.upgraded.push("wallet-factory".into());
             }
-            Upgrade::NotaryRegistry => {
+            Upgrade::Notary => {
                 upgrade_uups(
                     &provider,
                     &artifacts,
-                    notary_registry,
-                    "NotaryRegistry",
+                    notary_contract,
+                    "Notary",
                     Bytes::new(),
                     Some(sender),
                 )
                 .await?;
-                summary.upgraded.push("notary-registry".into());
+                summary.upgraded.push("notary".into());
             }
             Upgrade::Bank => {
                 replace_bank_facets(&provider, &artifacts, bank, Some(sender)).await?;
@@ -600,7 +624,7 @@ pub async fn run(
             &provider,
             &artifacts,
             sender,
-            notary,
+            notary_contract,
             backend,
             identity,
             &mut summary,
@@ -622,7 +646,7 @@ async fn deploy_x_zk_verifier<P: Provider>(
     provider: &P,
     artifacts: &Artifacts,
     sender: Address,
-    notary: Address,
+    notary_contract: Address,
     client_id: &str,
 ) -> Result<Address> {
     // The generated UltraHonk verifiers exceed EIP-170; the target chain
@@ -642,7 +666,7 @@ async fn deploy_x_zk_verifier<P: Provider>(
         "XZkVerifier",
         &XZkVerifier::initializeCall {
             _owner: sender,
-            _notary: notary,
+            _notaryContract: notary_contract,
             _honkVerifier: honk,
             _xClientId: Bytes::from(client_id.as_bytes().to_vec()),
             _endpoint: X_ENDPOINT.into(),
@@ -666,7 +690,7 @@ async fn deploy_oidc_verifier<P: Provider>(
     provider: &P,
     artifacts: &Artifacts,
     sender: Address,
-    oidc_notary: Address,
+    notary_contract: Address,
     initial_aud: &str,
 ) -> Result<Address> {
     // The circuit binds the JWT `aud` and the contract enforces it, so an
@@ -694,7 +718,7 @@ async fn deploy_oidc_verifier<P: Provider>(
         &GoogleOidcVerifier::initializeCall {
             _verifier: honk,
             _owner: sender,
-            initialNotary: oidc_notary,
+            notaryContract_: notary_contract,
             initialAud: initial_aud.into(),
         },
         Some(sender),
@@ -704,15 +728,16 @@ async fn deploy_oidc_verifier<P: Provider>(
     Ok(addr)
 }
 
-/// Converge the identity-names stack. GitHub needs only the two keys and is
-/// always wired; X and Google each need a large Honk circuit verifier and
-/// are requested by their key being PRESENT in the section.
+/// Converge the identity-names stack. GitHub needs only the Notary contract
+/// and the backend key and is always wired; X and Google each need a large
+/// Honk circuit verifier and are requested by their key being PRESENT in
+/// the section.
 #[allow(clippy::too_many_arguments)]
 async fn apply_identity<P: Provider>(
     provider: &P,
     artifacts: &Artifacts,
     sender: Address,
-    notary: Address,
+    notary_contract: Address,
     backend: Address,
     identity: &crate::config::Identity,
     summary: &mut Summary,
@@ -765,7 +790,7 @@ async fn apply_identity<P: Provider>(
                 "GitHubIdentityVerifier",
                 &GitHubIdentityVerifier::initializeCall {
                     owner_: sender,
-                    notary_: notary,
+                    notaryContract_: notary_contract,
                     backend_: backend,
                     shape_: GitHubIdentityVerifier::ResponseShape {
                         endpoint: endpoint.into(),
@@ -814,7 +839,7 @@ async fn apply_identity<P: Provider>(
                     "XIdentityVerifier",
                     &XIdentityVerifier::initializeCall {
                         owner_: sender,
-                        notary_: notary,
+                        notaryContract_: notary_contract,
                         honkVerifier_: honk,
                         shape_: XIdentityVerifier::ResponseShape {
                             platformName: X_DOMAIN.into(),
@@ -856,7 +881,7 @@ async fn apply_identity<P: Provider>(
                             "IdentityJwksRoots",
                             &IdentityJwksRoots::initializeCall {
                                 owner_: sender,
-                                initialNotary: notary,
+                                notaryContract_: notary_contract,
                             },
                             Some(sender),
                         )

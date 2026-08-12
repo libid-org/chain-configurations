@@ -29,7 +29,7 @@ on:
         options: [plan, apply]
         default: plan
       upgrade:
-        description: "Comma list to explicitly upgrade: registry, wallet-factory, notary-registry, bank, oidc-verifier"
+        description: "Comma list to explicitly upgrade: registry, wallet-factory, notary, bank, oidc-verifier"
         type: string
         default: ""
       confirm_fresh_deploy:

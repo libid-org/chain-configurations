@@ -33,12 +33,28 @@ leaves AWS.
 |---|---|---|
 | `[network]` | input | `name`, `chain_id` (apply refuses a mismatch), `rpc_url` |
 | `[aws]` | input | `region`, `kms_deployer` (key id / `alias/...` / ARN; the default signer) |
-| `[accounts]` | input | `notary`, `oidc_notary`, `backend` — addresses of **keys**, not contracts |
-| `[contracts]` | output | `bank`, `registry`, `wallet_factory`, `notary_registry`, `x_zk_verifier`, `google_oidc_verifier` |
+| `[accounts]` | input | `notary` (the notary **signer** — see below), `backend` — addresses of **keys**, not contracts. `oidc_notary` is accepted for legacy pre-Notary files but no longer wired anywhere |
+| `[contracts]` | output | `notary` (the Notary **proxy**), `bank`, `registry`, `wallet_factory`, `x_zk_verifier`, `google_oidc_verifier` |
 | `[identity]` | output | `identity_names`, `github_identity_verifier`, `x_identity_verifier`, `google_identity_verifier`, `identity_jwks_roots` |
 | `[platforms]` | input | `x_client_id`, `google_client_id`, `github_bot_handle`, `x_bot_handle` |
 | `[[tokens]]` | input | `symbol`, `address` (zero address = native) |
 | `[templates]` | input | per-platform comment templates (string or array), keyed by platform domain |
+
+The Notary split (libid-contracts 0.2.0):
+
+- `accounts.notary` is the notary **signer** — the EOA/KMS identity whose
+  attestations the stack accepts. `contracts.notary` is the Notary
+  **contract** (a UUPS proxy) that stores that signer; every other
+  contract takes the proxy address at initialize and verifies through it.
+- On a fresh deploy the Notary deploys **first**
+  (`initialize(owner = deployer, notary = accounts.notary)`) and its proxy
+  is wired into everything else.
+- Rotation is declarative: edit `accounts.notary`, `plan` diffs it against
+  the on-chain `Notary.notary()` and shows the pending rotation, `apply`
+  sends the one `setNotary` — every consumer follows the contract.
+- `plan` also spot-checks consumers' `notaryContract()` wiring; a mismatch
+  (or a pre-Notary contract without the getter) is a WARN that apply does
+  not fix silently.
 
 Output-key semantics:
 
@@ -57,10 +73,9 @@ Output-key semantics:
   listener at it before Google names work.
 - The verifiers are guarded: the X ZK verifier deploys only when
   `x_client_id` is set and the Registry slot is zero; the Google OIDC
-  verifier only when `oidc_notary` and `google_client_id` are set and the
-  slot is zero. A changed client id is **not** applied to an
-  already-deployed verifier — that is what `--upgrade oidc-verifier` is
-  for.
+  verifier only when `google_client_id` is set and the slot is zero. A
+  changed client id is **not** applied to an already-deployed verifier —
+  that is what `--upgrade oidc-verifier` is for.
 
 ## Running locally
 
@@ -83,10 +98,11 @@ key, anything else goes to AWS KMS (region/credentials from the ambient AWS
 environment). An all-hex value of the wrong length is rejected as a mangled
 key rather than shipped to AWS.
 
-Upgrade components: `registry`, `wallet-factory`, `notary-registry` (UUPS
-`upgradeToAndCall`), `bank` (diamond facet REPLACE — the diamond is the
-storage, the facets are the code), `oidc-verifier` (redeploy + re-point;
-new address, recorded in the PR).
+Upgrade components: `registry`, `wallet-factory`, `notary` (UUPS
+`upgradeToAndCall`; the proxy address and its stored signer survive),
+`bank` (diamond facet REPLACE — the diamond is the storage, the facets are
+the code), `oidc-verifier` (redeploy + re-point; new address, recorded in
+the PR).
 
 ## How the Apply action works
 

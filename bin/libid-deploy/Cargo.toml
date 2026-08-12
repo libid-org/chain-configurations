@@ -9,8 +9,7 @@ description = "Applies per-network desired-state configuration to chains: deploy
 publish = false
 
 [dependencies]
-# TODO: switch to crates.io once published
-libid-contracts = "0.1.0"
+libid-contracts = "0.2.0"
 alloy = { version = "1", features = [
     "contract",
     "providers",

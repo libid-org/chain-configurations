@@ -15,6 +15,7 @@ use anyhow::{
 use libid_contracts::bindings::{
     identity::IdentityNames,
     login::Registry,
+    notary::Notary,
     transfer::Bank,
 };
 use serde::Serialize;
@@ -149,6 +150,48 @@ async fn check_code<P: Provider>(
     }
 }
 
+/// Cheap consumer check: does `contract`'s `notaryContract()` point at the
+/// recorded Notary proxy? The selector is shared by every 0.2.0 consumer
+/// (read here through the Registry binding). Unreadable usually means a
+/// pre-Notary (0.1.x) deployment; a mismatch is not something apply fixes
+/// silently — both warn.
+async fn check_notary_wiring<P: Provider>(
+    b: &mut Builder,
+    provider: &P,
+    component: &str,
+    contract: Address,
+    notary: Address,
+) {
+    let component = format!("{component}.notary_wiring");
+    match Registry::new(contract, provider)
+        .notaryContract()
+        .call()
+        .await
+    {
+        Ok(wired) if wired == notary => b.push(
+            component,
+            Status::Ok,
+            format!("notaryContract() = {wired:#x}"),
+        ),
+        Ok(wired) => b.push(
+            component,
+            Status::Warn,
+            format!(
+                "notaryContract() = {wired:#x} but contracts.notary is {notary:#x} — \
+                 apply will not fix this silently"
+            ),
+        ),
+        Err(e) => b.push(
+            component,
+            Status::Warn,
+            format!(
+                "notaryContract() unreadable ({e}) — a pre-Notary (0.1.x) deployment? \
+                 The planned fresh redeploy is the fix"
+            ),
+        ),
+    }
+}
+
 /// Build the plan. Connects read-only; sends nothing.
 pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
     let rpc_url: url::Url = cfg
@@ -176,11 +219,56 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
         );
     }
 
+    // ── Notary (deploys first; everything verifies through it) ───────────
+    let cfg_signer = opt_address(&cfg.accounts.notary, "accounts.notary")?;
+    let mut notary_addr = None;
+    match opt_address(&cfg.contracts.notary, "contracts.notary")? {
+        None => b.push(
+            "contracts.notary",
+            Status::Deploy,
+            "not deployed — apply would deploy it FIRST and wire every other \
+             contract through it",
+        ),
+        Some(addr) => {
+            if check_code(&mut b, &provider, "contracts.notary", addr).await? {
+                notary_addr = Some(addr);
+                // The signer DIFF: the file says who the notary signer is;
+                // an on-chain mismatch is a planned setNotary rotation.
+                let on_chain = Notary::new(addr, &provider)
+                    .notary()
+                    .call()
+                    .await
+                    .map_err(|e| anyhow!("Notary.notary read failed: {e}"))?;
+                match cfg_signer {
+                    Some(signer) if signer == on_chain => b.push(
+                        "contracts.notary.signer",
+                        Status::Ok,
+                        format!("{on_chain:#x}"),
+                    ),
+                    Some(signer) => b.push(
+                        "contracts.notary.signer",
+                        Status::Configure,
+                        format!(
+                            "on-chain {on_chain:#x} but accounts.notary says \
+                             {signer:#x} — apply would setNotary (rotation)"
+                        ),
+                    ),
+                    // validate() rejects an empty accounts.notary, so this
+                    // arm is unreachable through NetworkConfig::load.
+                    None => b.push(
+                        "contracts.notary.signer",
+                        Status::Warn,
+                        "accounts.notary is empty — nothing to diff against",
+                    ),
+                }
+            }
+        }
+    }
+
     // ── Core contracts ───────────────────────────────────────────────────
     let core = [
         ("contracts.wallet_factory", &cfg.contracts.wallet_factory),
         ("contracts.registry", &cfg.contracts.registry),
-        ("contracts.notary_registry", &cfg.contracts.notary_registry),
         ("contracts.bank", &cfg.contracts.bank),
     ];
     let mut registry_addr = None;
@@ -216,6 +304,17 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
     if let Some(registry_addr) = registry_addr {
         let registry = Registry::new(registry_addr, &provider);
 
+        if let Some(notary) = notary_addr {
+            check_notary_wiring(
+                &mut b,
+                &provider,
+                "contracts.registry",
+                registry_addr,
+                notary,
+            )
+            .await;
+        }
+
         let on_chain_x = registry
             .zkVerifierOf(X_DOMAIN.into())
             .call()
@@ -229,6 +328,16 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
             !cfg.platforms.x_client_id.trim().is_empty(),
             "platforms.x_client_id is empty",
         );
+        if let (Some(notary), false) = (notary_addr, on_chain_x == Address::ZERO) {
+            check_notary_wiring(
+                &mut b,
+                &provider,
+                "contracts.x_zk_verifier",
+                on_chain_x,
+                notary,
+            )
+            .await;
+        }
 
         let on_chain_oidc = registry
             .oidcVerifierOf(GOOGLE_DOMAIN.into())
@@ -237,16 +346,25 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
             .map_err(|e| {
                 anyhow!("Registry.oidcVerifierOf({GOOGLE_DOMAIN}) read failed: {e}")
             })?;
-        let oidc_wanted = !cfg.accounts.oidc_notary.trim().is_empty()
-            && !cfg.platforms.google_client_id.trim().is_empty();
+        let oidc_wanted = !cfg.platforms.google_client_id.trim().is_empty();
         verifier_item(
             &mut b,
             "contracts.google_oidc_verifier",
             on_chain_oidc,
             cfg_oidc_verifier,
             oidc_wanted,
-            "accounts.oidc_notary or platforms.google_client_id is empty",
+            "platforms.google_client_id is empty",
         );
+        if let (Some(notary), false) = (notary_addr, on_chain_oidc == Address::ZERO) {
+            check_notary_wiring(
+                &mut b,
+                &provider,
+                "contracts.google_oidc_verifier",
+                on_chain_oidc,
+                notary,
+            )
+            .await;
+        }
 
         // Platform resolve configs: getPlatform exposes only endpoint +
         // handlePrefix, so apply always re-sends (owner-only, idempotent).
@@ -409,7 +527,18 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
             }
             match configured {
                 Some(addr) => {
-                    check_code(&mut b, &provider, component, addr).await?;
+                    let present = check_code(&mut b, &provider, component, addr).await?;
+                    // GitHub and X verify through the Notary contract;
+                    // Google trusts the JWKS roots instead and has no
+                    // notaryContract() getter.
+                    if present && component != "identity.google_identity_verifier" {
+                        if let Some(notary) = notary_addr {
+                            check_notary_wiring(
+                                &mut b, &provider, component, addr, notary,
+                            )
+                            .await;
+                        }
+                    }
                     if let Some(names_addr) = names {
                         let names_contract = IdentityNames::new(names_addr, &provider);
                         let wired = names_contract

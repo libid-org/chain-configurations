@@ -75,10 +75,16 @@ pub struct Aws {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Accounts {
-    /// The X/MPC-TLS notary the verifiers trust.
+    /// The notary SIGNER — the EOA/KMS identity whose signatures the stack
+    /// accepts. The Notary CONTRACT (`contracts.notary`) stores this
+    /// address; apply initializes it with this value and `setNotary`s when
+    /// they drift. Distinct on purpose: this is a key, not a contract.
     pub notary: String,
-    /// The JWKS-rotation notary the OIDC verifier trusts. Empty skips the
-    /// OIDC verifier deploy.
+    /// LEGACY (pre-Notary deployments only): the JWKS-rotation notary that
+    /// was wired directly into the old GoogleOidcVerifier. Since
+    /// libid-contracts 0.2.0 every consumer verifies through the shared
+    /// Notary contract, so this key is no longer wired anywhere. Kept so
+    /// legacy network files still validate.
     #[serde(default)]
     pub oidc_notary: String,
     /// The backend signing identity; the Bank grants it the backend role.
@@ -98,15 +104,17 @@ pub struct Contracts {
     /// The WalletFactory UUPS proxy.
     #[serde(default)]
     pub wallet_factory: String,
-    /// The NotaryRegistry UUPS proxy. Not discoverable on-chain — this
-    /// record is the only copy.
+    /// The Notary UUPS proxy — the ONE contract everything else verifies
+    /// notary attestations through. It stores the notary SIGNER address
+    /// from `accounts.notary`; do not confuse the two. Deployed FIRST on a
+    /// fresh deploy, then wired into every consumer at initialize.
     #[serde(default)]
-    pub notary_registry: String,
+    pub notary: String,
     /// The XZkVerifier proxy (deployed only when `x_client_id` is set).
     #[serde(default)]
     pub x_zk_verifier: String,
-    /// The GoogleOidcVerifier proxy (deployed only when `oidc_notary` and
-    /// `google_client_id` are set).
+    /// The GoogleOidcVerifier proxy (deployed only when `google_client_id`
+    /// is set).
     #[serde(default)]
     pub google_oidc_verifier: String,
 }
@@ -245,7 +253,7 @@ impl NetworkConfig {
             ("contracts.bank", &self.contracts.bank),
             ("contracts.registry", &self.contracts.registry),
             ("contracts.wallet_factory", &self.contracts.wallet_factory),
-            ("contracts.notary_registry", &self.contracts.notary_registry),
+            ("contracts.notary", &self.contracts.notary),
             ("contracts.x_zk_verifier", &self.contracts.x_zk_verifier),
             (
                 "contracts.google_oidc_verifier",
@@ -305,7 +313,7 @@ impl NetworkConfig {
             opt_address(&self.contracts.bank, "contracts.bank")?,
             opt_address(&self.contracts.registry, "contracts.registry")?,
             opt_address(&self.contracts.wallet_factory, "contracts.wallet_factory")?,
-            opt_address(&self.contracts.notary_registry, "contracts.notary_registry")?,
+            opt_address(&self.contracts.notary, "contracts.notary")?,
             opt_address(&self.contracts.x_zk_verifier, "contracts.x_zk_verifier")?,
             opt_address(
                 &self.contracts.google_oidc_verifier,
