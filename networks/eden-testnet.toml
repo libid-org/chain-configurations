@@ -80,26 +80,23 @@ notary = "0x7a3646e8431a4b0c8bb586a7d26d7da7ae4aa2b5"
 # Registry.initialize(_backend), the Bank diamond, and
 # GitHubIdentityVerifier.initialize(backend_).
 #
-# This is dyaka's backend key, chosen deliberately for the contract that
-# CANNOT be changed later: the Bank sets its backend once in BankInit and has
-# no setter, so whatever appears here is permanently the fund-moving authority
-# on the canonical Bank. Getting that wrong would need a diamond facet
-# upgrade; getting the identity verifier wrong needs one owner call.
+# This is dyaka's backend key (alias/dyaka-testnet-backend), and BOTH products
+# countersign with it for now — the identity backend included — so there is no
+# post-deploy step here: the verifier is initialised to trust exactly the key
+# the identity service signs with.
 #
-# So the identity product does NOT use this key. Immediately after the fresh
-# apply, run
-#     GitHubIdentityVerifier.setBackend(<alias/dyaka-testnet-identity-backend>)
-# (onlyOwner, i.e. the deployer above) to point the identity verifier at its
-# own countersigner. That is stable: `apply` converges `setNotary` but never
-# `setBackend`, so re-running it will not undo the change.
+# Worth knowing if you ever want to separate them. Of the three contracts, the
+# Bank is the one that cannot be changed afterwards: it sets its backend once in
+# BankInit and exposes no setter, so this value is permanently the fund-moving
+# authority on the canonical Bank, short of a diamond facet upgrade. Registry
+# and GitHubIdentityVerifier both have `setBackend` (onlyOwner), and `apply`
+# converges `setNotary` but never `setBackend` — so pointing the identity
+# verifier at a separate countersigner later is one owner call that survives
+# future applies.
 #
-# The reason for the separation: the identity service must not hold a key that
-# `Bank.backend()` authorises to move user funds, or a compromise of identity
-# claims becomes a compromise of the wallet product.
-#
-# UPSTREAM: this field conflates two distinct trust roles and should become
-# `accounts.backend` + `accounts.identity_backend`, at which point the
-# post-deploy call above disappears.
+# UPSTREAM: this field conflates two distinct trust roles. Splitting it into
+# `accounts.backend` + `accounts.identity_backend` would let a deployment
+# express the separation declaratively instead of as a follow-up call.
 backend = "0xe9b132c2eccca08efaf62d18c301945f38ddc267"
 
 # The operational owner the factory ends up with. Empty = the deployer, which
