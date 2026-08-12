@@ -111,20 +111,11 @@ a half-applied upgrade is worse than a queued one). The job runs in the
 GitHub **environment named after the network**, so production networks can
 demand reviewers.
 
-## One-time setup
+## Adding a network
 
-1. **AWS**: create the deployer KMS key (`ECC_SECG_P256K1`, `SIGN_VERIFY`)
-   and an IAM role trusted by GitHub's OIDC provider for this repository,
-   with `kms:Sign`, `kms:GetPublicKey`, `kms:DescribeKey` on that key.
-2. **Secrets**: set `AWS_DEPLOYER_ROLE_ARN` (repository or environment
-   secret).
-3. **Environments**: create a GitHub environment per network (e.g.
-   `eden-testnet`, later `mainnet`) and add required reviewers on
-   production ones.
-4. **Fund** the KMS key's derived address with native gas token.
-5. **New network**: copy `networks/mainnet.toml.example`, fill the input
-   keys, add the name to the `network` choice list in `apply.yml`, and run
-   the workflow with `mode: plan` first.
+Copy `networks/mainnet.toml.example`, fill the input keys, add the name to
+the `network` choice list in `apply.yml`, and run the workflow with
+`mode: plan` first.
 
 ## Release process
 

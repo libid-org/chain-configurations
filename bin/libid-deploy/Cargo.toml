@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 # TODO: switch to crates.io once published
-libid-contracts = { git = "https://github.com/libid-org/libid-contracts" }
+libid-contracts = "0.1.0"
 alloy = { version = "1", features = [
     "contract",
     "providers",
