@@ -3284,9 +3284,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libid-contracts"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffd9421bca92ed570be6ed2133664381b36a63986696f7ef1e72c1f965ea272a"
+checksum = "b65fe10a6b20d68419e1f4b0033c73e1459bf03faea41ca80fc349d17c721f2d"
 dependencies = [
  "alloy",
  "include_dir",

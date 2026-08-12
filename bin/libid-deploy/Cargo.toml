@@ -9,7 +9,7 @@ description = "Applies per-network declarative configuration to chains: every ca
 publish = false
 
 [dependencies]
-libid-contracts = "0.4.0"
+libid-contracts = "0.5.0"
 alloy = { version = "1", features = [
     "contract",
     "providers",
