@@ -55,7 +55,7 @@ notary = "0x7a3646e8431a4b0c8bb586a7d26d7da7ae4aa2b5"
 # upgrade. Registry does have `setBackend` (onlyOwner).
 #
 # Nothing under [identity] reads this — the notary is the identity stack's only
-# trust root and the identity backend holds no key. The field is required for the
+# trust root and libid-server-rs holds no key. The field is required for the
 # two wallet contracts above.
 backend = "0xe9b132c2eccca08efaf62d18c301945f38ddc267"
 
