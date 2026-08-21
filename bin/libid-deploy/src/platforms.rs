@@ -1,6 +1,6 @@
 //! The platform tables: what the Registry, the Bank and the IdentityNames
-//! contract are configured with. Ported from dyaka's deployers so a fresh
-//! deployment matches the running system exactly.
+//! contract are configured with. Ported from the original monorepo's
+//! deployers so a fresh deployment matches the running system exactly.
 
 use alloy::primitives::{
     keccak256,
@@ -10,7 +10,8 @@ use libid_contracts::bindings::identity::IdentityNames;
 
 /// Registry resolve configs:
 /// `(domain, endpoint, handlePrefix, idPrefix, idSuffix)`.
-/// Mirrors dyaka's `PLATFORM_CONFIGS` (and the contracts' `Deploy.s.sol`).
+/// Mirrors the original monorepo's `PLATFORM_CONFIGS` (and the contracts'
+/// `Deploy.s.sol`).
 pub const PLATFORM_CONFIGS: &[(&str, &str, &str, &str, &str)] = &[
     (
         "api.x.com",
@@ -62,8 +63,8 @@ pub struct IdentityPlatform {
     /// Human label for logs.
     pub label: &'static str,
     /// keccak256 of this string is the on-chain platform id. These are the
-    /// generated domains from `handles.json` — the historical `dyaka.`
-    /// prefix is load-bearing: every deployed reader keys on it.
+    /// generated domains from `handles.json` — the historical prefix is
+    /// load-bearing: every deployed reader keys on it.
     pub domain: &'static str,
     /// `maxFutureObservation` seconds.
     pub allowance: u64,

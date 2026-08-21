@@ -60,7 +60,8 @@ jobs:
     # every current Debian/Ubuntu consumer has (the libid harness deploy
     # container is bookworm). Host-runner builds don't work here: even on
     # ubuntu-22.04, aws-lc-sys emitted glibc-2.38 __isoc23_* references.
-    # Same environment dyaka builds the identical AWS SDK stack in.
+    # Same environment the original monorepo builds the identical AWS SDK
+    # stack in.
     container: rust:1.97-slim-bookworm
     # The container's default step shell is dash; the scripts are bash.
     defaults:

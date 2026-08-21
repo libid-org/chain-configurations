@@ -2,12 +2,13 @@
 //! rehearsal) or an AWS KMS secp256k1 key (production; the private material
 //! never leaves the HSM).
 //!
-//! The spec is classified by SHAPE — no prefixes, no configuration — porting
-//! dyaka's wallet-pool `SignerSource::from_spec` exactly: a secp256k1
-//! private key is 64 hex chars (optionally `0x`-prefixed), every real KMS
-//! identifier contains a non-hex character (UUID dashes, `alias/`, ARN
-//! colons), and an ALL-HEX value of the wrong length is a mangled private
-//! key rejected here by name rather than shipped to AWS as a bogus key id.
+//! The spec is classified by SHAPE — no prefixes, no configuration —
+//! porting the original monorepo's wallet-pool `SignerSource::from_spec`
+//! exactly: a secp256k1 private key is 64 hex chars (optionally
+//! `0x`-prefixed), every real KMS identifier contains a non-hex character
+//! (UUID dashes, `alias/`, ARN colons), and an ALL-HEX value of the wrong
+//! length is a mangled private key rejected here by name rather than
+//! shipped to AWS as a bogus key id.
 
 use alloy::{
     network::EthereumWallet,

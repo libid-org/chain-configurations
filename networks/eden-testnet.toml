@@ -44,7 +44,8 @@ kms_deployer = "alias/dyaka-testnet-deployer"
 # The notary SIGNER — the identity whose signatures the whole stack accepts.
 # `apply` initializes the Notary CONTRACT with this and `setNotary`s it when
 # they drift, so this one value rotates every consumer at once. Both notary
-# service instances (dyaka's and the identity product's) sign with this key.
+# service instances (the wallet product's and the identity product's) sign
+# with this key.
 notary = "0x7a3646e8431a4b0c8bb586a7d26d7da7ae4aa2b5"
 
 # The WALLET PRODUCT's backend signing identity (alias/dyaka-testnet-backend),
