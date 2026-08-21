@@ -11,12 +11,12 @@
 //! GoogleOidcVerifier, is recorded on-chain only (`Registry.oidcVerifierOf`
 //! is the record). Legacy files (`network.legacy_addresses`) are refused.
 //!
-//! The orchestration order is ported from dyaka's deployers:
-//! `dyaka-auth::deploy::run` (login stack), `dyaka-transfer::deploy`
-//! (Bank diamond + reconcile), and `dyaka-identity::deploy::run` (the
-//! identity-names stack, only when `[identity]` is present) — with one
-//! 0.2.0 addition in front: the shared Notary contract deploys FIRST,
-//! because every other contract takes its proxy address at initialize.
+//! The orchestration order is ported from the original monorepo's
+//! deployers: the login stack first, then the Bank diamond + reconcile,
+//! then the identity-names stack (only when `[identity]` is present) —
+//! with one 0.2.0 addition in front: the shared Notary contract deploys
+//! FIRST, because every other contract takes its proxy address at
+//! initialize.
 //!
 //! Since libid-contracts 0.3.0 the flow is FACTORY-FIRST: step 0 makes sure
 //! the keyless CREATE2 deployer and the deterministic `LibidFactory` exist
