@@ -19,7 +19,13 @@ use libid_identity::{
 };
 use libid_profiles as profiles;
 
-use crate::names;
+use crate::{
+    ceremony::{
+        self,
+        Circuit,
+    },
+    names,
+};
 
 /// The verifier version the launch profile is registered under.
 ///
@@ -70,6 +76,10 @@ pub struct Platform {
     pub canonical_name: &'static str,
     /// The vendored contract the proxy points at.
     pub contract: &'static str,
+    /// The ceremony circuit whose Honk verifier this platform's proofs are
+    /// checked under. X and GitHub share one: their statements are
+    /// byte-identical, so one circuit proves both.
+    pub circuit: Circuit,
 }
 
 /// Widen a generated rule table into the contract's struct. `const` so a
@@ -98,6 +108,7 @@ pub const X: Platform = Platform {
     contracts_key: "x_platform_verifier",
     canonical_name: names::X_PLATFORM_VERIFIER,
     contract: "XPlatformVerifier",
+    circuit: ceremony::BEARER_LINK,
 };
 
 /// GitHub: letters, digits and hyphen.
@@ -113,6 +124,7 @@ pub const GITHUB: Platform = Platform {
     contracts_key: "github_platform_verifier",
     canonical_name: names::GITHUB_PLATFORM_VERIFIER,
     contract: "GitHubPlatformVerifier",
+    circuit: ceremony::BEARER_LINK,
 };
 
 /// Google: an email address, used exactly as proved. The OIDC circuit
@@ -127,6 +139,7 @@ pub const GOOGLE: Platform = Platform {
     contracts_key: "google_platform_verifier",
     canonical_name: names::GOOGLE_PLATFORM_VERIFIER,
     contract: "GooglePlatformVerifier",
+    circuit: ceremony::OIDC_GOOGLE,
 };
 
 /// The closed launch list, in deploy order. A platform outside it has no
@@ -211,6 +224,24 @@ mod tests {
         assert!(by_domain("discord").is_none());
     }
 
+    /// Every launch platform's circuit is one this repository vendors a
+    /// verifier for — a platform pointed at a circuit with no artifact
+    /// could be deployed but never wired.
+    #[test]
+    fn every_platform_verifies_under_a_vendored_circuit() {
+        for platform in LAUNCH {
+            assert!(
+                ceremony::CIRCUITS.contains(&platform.circuit),
+                "{} verifies under an unvendored circuit",
+                platform.label
+            );
+        }
+        // One circuit for both TLSNotary platforms, a separate one for
+        // Google: the statement, not the platform, decides.
+        assert_eq!(X.circuit, GITHUB.circuit);
+        assert_ne!(X.circuit, GOOGLE.circuit);
+    }
+
     /// Every platform's Platform Verifier is a canonical contract with its
     /// own name and its own `[contracts]` key.
     #[test]
@@ -222,7 +253,7 @@ mod tests {
                 "{} is not in the canonical table",
                 platform.label
             );
-            assert!(crate::ceremony::creation_code(platform.contract).is_ok());
+            assert!(ceremony::creation_code(platform.contract).is_ok());
         }
     }
 }

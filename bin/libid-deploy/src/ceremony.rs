@@ -1,34 +1,43 @@
-//! The Platform Verifiers: the contracts that decode one platform's
-//! ceremony payload, verify its proof and authenticate its attestations.
+//! The ceremony contracts this repository compiles itself: the Platform
+//! Verifiers that decode one platform's ceremony payload and authenticate
+//! its attestations, and the bb-generated UltraHonk verifiers their proofs
+//! are checked under.
 //!
 //! # Why the artifacts live here
 //!
 //! `libid-contracts` embeds compiled bytecode only for the contracts its
 //! `COVERED` list names, and the Platform Verifiers are not among them —
-//! its own `script/Deploy.s.sol` registers none either. This repository
-//! deploys them, so it compiles them from the same tag its `libid-contracts`
-//! dependency comes from and embeds the result:
-//! `scripts/vendor-platform-verifiers.sh` writes `artifacts/`, and the tag
-//! it builds is derived from `Cargo.toml` rather than restated, so vendored
-//! bytecode and typed bindings cannot come from different releases.
+//! its own `script/Deploy.s.sol` registers none either. Nor does anything
+//! upstream ship a Honk verifier: one derives from a circuit's
+//! verification key, which `libid-circuits` publishes as a release asset.
+//! `scripts/vendor-artifacts.sh` builds all of them — the Platform
+//! Verifiers from the `libid-contracts` tag `Cargo.toml` pins, the Honk
+//! verifiers from the `libid-circuits` release `circuits-manifest.json`
+//! pins — and writes `artifacts/`. Both tags are derived from their pin
+//! rather than restated, so vendored bytecode and typed bindings cannot
+//! come from different releases.
 //!
 //! # The circuit verifier
 //!
-//! `PlatformVerifierBase._setTrustRoots` pins the bb-generated UltraHonk
-//! verifier the platform's proofs are checked under, BY ADDRESS AND BY CODE
-//! HASH: it reads `address(honkVerifier_).codehash` and refuses a value
-//! that does not match the hash the caller named, and refuses the empty and
-//! zero hashes outright. A bb verifier embeds its verification key as code
-//! constants and exposes no getter, so the code hash is the only handle on
-//! which circuit a deployed verifier answers for.
+//! `PlatformVerifierBase._setTrustRoots` pins the verifier a platform's
+//! proofs are checked under BY ADDRESS AND BY CODE HASH: it reads
+//! `address(honkVerifier_).codehash` and refuses a value that does not
+//! match the hash the caller named, and refuses the empty and zero hashes
+//! outright. A bb verifier embeds its verification key as code constants
+//! and exposes no getter, so the code hash is the only handle on which
+//! circuit a deployed verifier answers for.
 //!
-//! Consequently this tool cannot invent one. The operator declares the
-//! address in `[ceremony.<platform>].circuit_verifier`, apply reads the
-//! code there and hashes it, and a platform with no declaration gets no
-//! Platform Verifier — it owns its keyspace and verifies nothing, which is
-//! exactly what the chain reports.
+//! Apply therefore deploys the verifier itself and reads the hash back off
+//! the chain. The verifier goes through the factory under
+//! [`Circuit::factory_name`] — a CREATE3 name carrying the circuit and the
+//! pinned circuits version — so its address is a pure function of which
+//! artifact it is: a converged chain is recognised without a redeploy, and
+//! a circuits release is a new name, a new address and a `setTrustRoots`.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::OnceLock,
+};
 
 use alloy::{
     hex,
@@ -164,16 +173,119 @@ mod google_inner {
 
 pub use google_inner::GooglePlatformVerifier;
 
-/// The vendored artifacts, embedded at compile time. Named individually
-/// rather than pulled from a directory: a missing one must be a compile
-/// error, not a runtime surprise on a chain that has already been half
-/// converged.
-const ARTIFACTS: &[(&str, &str)] = &[
+/// Bindings for a bb-generated UltraHonk verifier: the one call a Platform
+/// Verifier makes of it, and the error a wrong-length proof raises.
+///
+/// That error carries the circuit's `logN`, which is the only thing a
+/// deployed verifier says about itself — it has no getter for its
+/// verification key — so it is how a test tells a real verifier from a
+/// contract that merely has code.
+#[allow(unused_attributes)]
+mod honk_inner {
+    use alloy::sol;
+
+    sol! {
+        #[sol(rpc)]
+        interface HonkVerifier {
+            error ProofLengthWrongWithLogN(
+                uint256 logN,
+                uint256 actualLength,
+                uint256 expectedLength
+            );
+
+            function verify(bytes calldata proof, bytes32[] calldata publicInputs)
+                external
+                view
+                returns (bool);
+        }
+    }
+}
+
+pub use honk_inner::HonkVerifier;
+
+/// The `libid-circuits` release manifest, committed verbatim as the pin.
+/// It carries the version, the toolchain the assets were built by and a
+/// sha256 per file, so the version the factory names are derived from is
+/// the same document the vendor script verifies its downloads against.
+const CIRCUITS_MANIFEST: &str = include_str!("../circuits-manifest.json");
+
+/// One ceremony circuit's bb-generated UltraHonk verifier.
+///
+/// There are two, not three: `oidc-google` proves the Google JWT, and
+/// `bearer-link` ties a token exchange to an identity for X and GitHub
+/// alike, because their statements are byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Circuit {
+    /// The circuit's directory in the `libid-circuits` release — also the
+    /// tarball's name and the middle of the factory name below.
+    pub name: &'static str,
+    /// The vendored contract, and the `.sol` file holding it. bb always
+    /// emits `HonkVerifier`; the vendor script renames it so two verifiers
+    /// can live in one project and one artifact path names one circuit.
+    pub contract: &'static str,
+}
+
+impl Circuit {
+    /// The CREATE3 name this circuit's verifier deploys under.
+    ///
+    /// Deliberately NOT in [`crate::names`]: the canonical table is the
+    /// set of entry contracts a network file declares, and these are
+    /// referenced by the Platform Verifier that pins them instead. The
+    /// version is part of the name because a Honk verifier IS its
+    /// verification key — a new circuits release is a different contract,
+    /// so it must be a different address rather than a silent replacement.
+    pub fn factory_name(&self) -> Result<String> {
+        Ok(format!(
+            "libid.circuits.{}.{}",
+            self.name,
+            circuits_version()?
+        ))
+    }
+}
+
+/// The token-exchange circuit, shared by X and GitHub.
+pub const BEARER_LINK: Circuit = Circuit {
+    name: "bearer-link",
+    contract: "BearerLinkHonkVerifier",
+};
+
+/// Google's OIDC circuit.
+pub const OIDC_GOOGLE: Circuit = Circuit {
+    name: "oidc-google",
+    contract: "OidcGoogleHonkVerifier",
+};
+
+/// Every circuit the launch platforms verify under.
+pub const CIRCUITS: &[Circuit] = &[BEARER_LINK, OIDC_GOOGLE];
+
+fn manifest() -> Result<&'static serde_json::Value> {
+    static PARSED: OnceLock<Option<serde_json::Value>> = OnceLock::new();
+    PARSED
+        .get_or_init(|| serde_json::from_str(CIRCUITS_MANIFEST).ok())
+        .as_ref()
+        .ok_or_else(|| anyhow!("circuits-manifest.json is not valid JSON"))
+}
+
+/// The pinned `libid-circuits` release the vendored Honk verifiers were
+/// generated from.
+pub fn circuits_version() -> Result<&'static str> {
+    manifest()?["version"]
+        .as_str()
+        .ok_or_else(|| anyhow!("circuits-manifest.json has no version"))
+}
+
+/// The vendored artifacts, embedded at compile time as
+/// `(<file>, <contract>, json)`. Named individually rather than pulled
+/// from a directory: a missing one must be a compile error, not a runtime
+/// surprise on a chain that has already been half converged.
+const ARTIFACTS: &[(&str, &str, &str)] = &[
     (
+        "XPlatformVerifier",
         "XPlatformVerifier",
         include_str!("../artifacts/XPlatformVerifier.sol/XPlatformVerifier.json"),
     ),
     (
+        "GitHubPlatformVerifier",
         "GitHubPlatformVerifier",
         include_str!(
             "../artifacts/GitHubPlatformVerifier.sol/GitHubPlatformVerifier.json"
@@ -181,51 +293,121 @@ const ARTIFACTS: &[(&str, &str)] = &[
     ),
     (
         "GooglePlatformVerifier",
+        "GooglePlatformVerifier",
         include_str!(
             "../artifacts/GooglePlatformVerifier.sol/GooglePlatformVerifier.json"
         ),
     ),
+    (
+        "BearerLinkHonkVerifier",
+        "BearerLinkHonkVerifier",
+        include_str!(
+            "../artifacts/BearerLinkHonkVerifier.sol/BearerLinkHonkVerifier.json"
+        ),
+    ),
+    (
+        "BearerLinkHonkVerifier",
+        "RelationsLib",
+        include_str!("../artifacts/BearerLinkHonkVerifier.sol/RelationsLib.json"),
+    ),
+    (
+        "BearerLinkHonkVerifier",
+        "ZKTranscriptLib",
+        include_str!("../artifacts/BearerLinkHonkVerifier.sol/ZKTranscriptLib.json"),
+    ),
+    (
+        "OidcGoogleHonkVerifier",
+        "OidcGoogleHonkVerifier",
+        include_str!(
+            "../artifacts/OidcGoogleHonkVerifier.sol/OidcGoogleHonkVerifier.json"
+        ),
+    ),
+    (
+        "OidcGoogleHonkVerifier",
+        "RelationsLib",
+        include_str!("../artifacts/OidcGoogleHonkVerifier.sol/RelationsLib.json"),
+    ),
+    (
+        "OidcGoogleHonkVerifier",
+        "ZKTranscriptLib",
+        include_str!("../artifacts/OidcGoogleHonkVerifier.sol/ZKTranscriptLib.json"),
+    ),
 ];
 
-fn artifact(contract: &str) -> Result<serde_json::Value> {
+fn artifact(file: &str, contract: &str) -> Result<serde_json::Value> {
     let raw = ARTIFACTS
         .iter()
-        .find(|(name, _)| *name == contract)
-        .map(|(_, raw)| *raw)
-        .ok_or_else(|| anyhow!("no vendored artifact for {contract}"))?;
-    serde_json::from_str(raw)
-        .map_err(|e| anyhow!("vendored artifact for {contract} is not valid JSON: {e}"))
+        .find(|(f, c, _)| *f == file && *c == contract)
+        .map(|(_, _, raw)| *raw)
+        .ok_or_else(|| anyhow!("no vendored artifact for {file}.sol:{contract}"))?;
+    serde_json::from_str(raw).map_err(|e| {
+        anyhow!("the vendored artifact for {file}.sol:{contract} is not valid JSON: {e}")
+    })
 }
 
-/// The creation bytecode of a Platform Verifier implementation.
-pub fn creation_code(contract: &str) -> Result<Bytes> {
-    let json = artifact(contract)?;
+/// The raw `bytecode.object` hex (no `0x`), link placeholders intact.
+pub fn creation_code_hex(contract: &str) -> Result<String> {
+    bytecode_hex(contract, contract)
+}
+
+fn bytecode_hex(file: &str, contract: &str) -> Result<String> {
+    let json = artifact(file, contract)?;
     let raw = json["bytecode"]["object"]
         .as_str()
-        .ok_or_else(|| anyhow!("no bytecode.object in the {contract} artifact"))?;
+        .ok_or_else(|| anyhow!("no bytecode.object in {file}.sol:{contract}"))?;
     let raw = raw.strip_prefix("0x").unwrap_or(raw);
+    if raw.is_empty() {
+        bail!("the vendored {file}.sol:{contract} artifact has empty bytecode");
+    }
+    Ok(raw.to_owned())
+}
+
+/// The artifact's `bytecode.linkReferences`: `"<path>.sol" -> { "<Lib>":
+/// [{start, length}] }`, empty when the contract links nothing.
+pub fn link_references(
+    contract: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let json = artifact(contract, contract)?;
+    Ok(json["bytecode"]["linkReferences"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default())
+}
+
+fn decode(file: &str, contract: &str) -> Result<Bytes> {
+    let raw = bytecode_hex(file, contract)?;
     if raw.contains("__$") {
-        // Nothing here links a library today. If one ever does, it must be
-        // deployed and substituted before this bytecode means anything —
-        // silently deploying the placeholder would produce a verifier that
-        // reverts on every call.
-        bail!("{contract} has unresolved link references; the vendor script must follow them");
+        // Deploying the placeholder would produce a contract that reverts
+        // on every call that reaches the library.
+        bail!(
+            "{file}.sol:{contract} has unresolved link references; deploy it through \
+             the linking path"
+        );
     }
-    let bytes = hex::decode(raw)
+    let bytes = hex::decode(&raw)
         .map_err(|e| anyhow!("invalid bytecode hex for {contract}: {e}"))?;
-    if bytes.is_empty() {
-        bail!("the vendored {contract} artifact has empty bytecode");
-    }
     Ok(Bytes::from(bytes))
+}
+
+/// The creation bytecode of a contract whose `.sol` file shares its name
+/// and which links no library.
+pub fn creation_code(contract: &str) -> Result<Bytes> {
+    decode(contract, contract)
+}
+
+/// The creation bytecode of a library vendored beside `file` — the shape
+/// `bytecode.linkReferences` names them in.
+pub fn library_creation_code(file: &str, library: &str) -> Result<Bytes> {
+    decode(file, library)
 }
 
 /// The artifact's `methodIdentifiers`: `"sig(args)" -> 4-byte selector`
 /// (8 hex chars, no `0x`).
 pub fn method_identifiers(contract: &str) -> Result<BTreeMap<String, String>> {
-    let json = artifact(contract)?;
+    let json = artifact(contract, contract)?;
     let methods = json["methodIdentifiers"]
         .as_object()
-        .ok_or_else(|| anyhow!("no methodIdentifiers in the {contract} artifact"))?;
+        .ok_or_else(|| anyhow!("no methodIdentifiers in {contract}.sol:{contract}"))?;
     methods
         .iter()
         .map(|(sig, value)| {
@@ -246,10 +428,13 @@ mod tests {
     /// Every vendored artifact decodes to real creation code.
     #[test]
     fn every_vendored_artifact_carries_bytecode() {
-        for (contract, _) in ARTIFACTS {
-            let code =
-                creation_code(contract).unwrap_or_else(|e| panic!("{contract}: {e}"));
-            assert!(code.len() > 1_000, "{contract} bytecode looks truncated");
+        for (file, contract, _) in ARTIFACTS {
+            let code = bytecode_hex(file, contract)
+                .unwrap_or_else(|e| panic!("{file}.sol:{contract}: {e}"));
+            assert!(
+                code.len() > 2_000,
+                "{file}.sol:{contract} bytecode looks truncated"
+            );
         }
     }
 
@@ -314,5 +499,79 @@ mod tests {
         );
         let methods = method_identifiers("GooglePlatformVerifier").unwrap();
         assert!(!methods.contains_key(TlsPlatformVerifier::initializeCall::SIGNATURE));
+    }
+
+    /// The only thing a Platform Verifier asks of its circuit verifier is
+    /// `IHonkVerifier.verify`. An artifact without that selector would be
+    /// wired in and revert at the first user's proof.
+    #[test]
+    fn every_circuit_verifier_answers_the_interface_it_is_wired_into() {
+        for circuit in CIRCUITS {
+            let methods = method_identifiers(circuit.contract)
+                .unwrap_or_else(|e| panic!("{}: {e}", circuit.name));
+            assert!(
+                methods.contains_key("verify(bytes,bytes32[])"),
+                "{} exposes no verify(bytes,bytes32[])",
+                circuit.name
+            );
+        }
+    }
+
+    /// A bb verifier links two libraries, and every library it names is
+    /// vendored beside it — an artifact missing one could only deploy with
+    /// its placeholder left in, which reverts on every proof.
+    #[test]
+    fn every_linked_library_is_vendored_beside_its_verifier() {
+        for circuit in CIRCUITS {
+            let refs = link_references(circuit.contract)
+                .unwrap_or_else(|e| panic!("{}: {e}", circuit.name));
+            let mut seen = 0;
+            for (path, libs) in &refs {
+                let stem = std::path::Path::new(path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_else(|| {
+                        panic!("{}: bad library path {path}", circuit.name)
+                    });
+                assert_eq!(stem, circuit.contract);
+                for lib in libs.as_object().into_iter().flatten().map(|(name, _)| name) {
+                    library_creation_code(stem, lib)
+                        .unwrap_or_else(|e| panic!("{}.{lib}: {e}", circuit.name));
+                    seen += 1;
+                }
+            }
+            assert!(
+                seen > 0,
+                "{} links nothing — did the build inline?",
+                circuit.name
+            );
+        }
+    }
+
+    /// The two circuits are distinct artifacts under distinct names; a
+    /// shared one would wire both platforms to one verification key.
+    #[test]
+    fn each_circuit_has_its_own_artifact_and_factory_name() {
+        assert_ne!(BEARER_LINK.contract, OIDC_GOOGLE.contract);
+        assert_ne!(
+            creation_code_hex(BEARER_LINK.contract).unwrap(),
+            creation_code_hex(OIDC_GOOGLE.contract).unwrap()
+        );
+        let version = circuits_version().expect("the pin parses");
+        for circuit in CIRCUITS {
+            let name = circuit.factory_name().unwrap();
+            assert!(
+                name.starts_with("libid.circuits."),
+                "{name} is not namespaced"
+            );
+            assert!(
+                name.ends_with(version),
+                "{name} does not carry the pinned version"
+            );
+        }
+        assert_ne!(
+            BEARER_LINK.factory_name().unwrap(),
+            OIDC_GOOGLE.factory_name().unwrap()
+        );
     }
 }
