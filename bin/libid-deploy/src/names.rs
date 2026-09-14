@@ -1,124 +1,90 @@
 //! The authoritative canonical-name table.
 //!
-//! Since libid-contracts 0.3.0 every top-level (entry) contract is deployed
-//! through the deterministic `LibidFactory` via CREATE3 with
-//! `salt = keccak256(name)`, so its address is a pure function of the name:
-//! the same on every EVM network, computable before anything is deployed.
+//! Every top-level (entry) contract is deployed through the deterministic
+//! `LibidFactory` via CREATE3 with `salt = keccak256(name)`, so its address
+//! is a pure function of the name: the same on every EVM network,
+//! computable before anything is deployed.
 //!
 //! CRITICAL: renaming an entry here = a NEW address, forever, on every
 //! network. Names are append-only; a name already deployed on any real
-//! network must never change. Implementations, facets, and the Honk circuit
-//! verifiers are NOT in this table on purpose — they deploy via plain
-//! CREATE, their addresses are referenced (by a proxy slot or the Registry)
-//! rather than canonical, and upgrades replace them without moving any
-//! entry address.
+//! network must never change.
+//!
+//! Two kinds of contract are deliberately NOT in this table. Proxy
+//! implementations deploy via plain CREATE: their addresses are referenced
+//! by a proxy slot, and an upgrade replaces one without moving any entry
+//! address. The ceremony circuits' Honk verifiers do go through the
+//! factory — see [`crate::ceremony::Circuit::factory_name`] — but under a
+//! name carrying the circuits version rather than a frozen one, because a
+//! Honk verifier IS its verification key: a new circuits release must be a
+//! new address, not a silent replacement. Neither kind is declared in a
+//! network file.
 
 use libid_contracts::factory::predict_address;
 
 /// One canonical (factory-deployed) contract.
 #[derive(Debug, Clone, Copy)]
 pub struct CanonicalContract {
-    /// Network-file table the address is recorded in: `contracts` or
-    /// `identity`.
-    pub section: &'static str,
-    /// Key inside that table.
+    /// Key inside the network file's `[contracts]` table.
     pub key: &'static str,
     /// The factory name — the ONLY input to the address.
     pub name: &'static str,
 }
 
-/// The Notary proxy — deploys first; everything verifies through it.
-pub const NOTARY: &str = "libid.Notary";
-/// The Registry UUPS proxy.
-pub const REGISTRY: &str = "libid.Registry";
-/// The WalletFactory UUPS proxy.
-pub const WALLET_FACTORY: &str = "libid.WalletFactory";
-/// The XZkVerifier UUPS proxy.
-pub const X_ZK_VERIFIER: &str = "libid.XZkVerifier";
-/// The GoogleOidcVerifier proxy. NOTE: `--upgrade oidc-verifier` REPLACES
-/// this contract with a plain-CREATE deployment (the name is single-use),
-/// so after a replace the live address legitimately diverges from the
-/// canonical one; the factory's record keeps pointing at the first deploy.
-pub const GOOGLE_OIDC_VERIFIER: &str = "libid.GoogleOidcVerifier";
-/// The Bank diamond. CREATE3 makes its constructor args (owner, cut facet)
-/// irrelevant to the address.
-pub const BANK: &str = "libid.Bank";
-/// The IdentityNames proxy.
+/// The Notary Service proxy — deploys first; every notarized session is
+/// authenticated through it.
+pub const NOTARY_SERVICE: &str = "libid.NotaryService";
+/// The Proof Verifier proxy: the Supported Version Set the naming system
+/// dispatches claims through.
+pub const CEREMONY_PROOF_VERIFIER: &str = "libid.CeremonyProofVerifier";
+/// The IdentityNames proxy — the contract consumers resolve against.
 pub const IDENTITY_NAMES: &str = "libid.IdentityNames";
-/// The GitHubIdentityVerifier proxy.
-pub const GITHUB_IDENTITY_VERIFIER: &str = "libid.GitHubIdentityVerifier";
-/// The XIdentityVerifier proxy.
-pub const X_IDENTITY_VERIFIER: &str = "libid.XIdentityVerifier";
-/// The GoogleIdentityVerifier proxy.
-pub const GOOGLE_IDENTITY_VERIFIER: &str = "libid.GoogleIdentityVerifier";
-/// The IdentityJwksRoots proxy.
-pub const IDENTITY_JWKS_ROOTS: &str = "libid.IdentityJwksRoots";
+/// The Google JWT root list proxy, read by the Google Platform Verifier.
+pub const GOOGLE_JWT_ROOTS: &str = "libid.GoogleJwtRoots";
+/// The `x/v1` Platform Verifier proxy.
+pub const X_PLATFORM_VERIFIER: &str = "libid.XPlatformVerifier";
+/// The `github/v1` Platform Verifier proxy.
+pub const GITHUB_PLATFORM_VERIFIER: &str = "libid.GitHubPlatformVerifier";
+/// The `google/v1` Platform Verifier proxy.
+pub const GOOGLE_PLATFORM_VERIFIER: &str = "libid.GooglePlatformVerifier";
 
 /// Every canonical contract, in deploy order.
 pub const CANONICAL_CONTRACTS: &[CanonicalContract] = &[
     CanonicalContract {
-        section: "contracts",
-        key: "notary",
-        name: NOTARY,
+        key: "notary_service",
+        name: NOTARY_SERVICE,
     },
     CanonicalContract {
-        section: "contracts",
-        key: "wallet_factory",
-        name: WALLET_FACTORY,
+        key: "ceremony_proof_verifier",
+        name: CEREMONY_PROOF_VERIFIER,
     },
     CanonicalContract {
-        section: "contracts",
-        key: "registry",
-        name: REGISTRY,
-    },
-    CanonicalContract {
-        section: "contracts",
-        key: "bank",
-        name: BANK,
-    },
-    CanonicalContract {
-        section: "contracts",
-        key: "x_zk_verifier",
-        name: X_ZK_VERIFIER,
-    },
-    CanonicalContract {
-        section: "contracts",
-        key: "google_oidc_verifier",
-        name: GOOGLE_OIDC_VERIFIER,
-    },
-    CanonicalContract {
-        section: "identity",
         key: "identity_names",
         name: IDENTITY_NAMES,
     },
     CanonicalContract {
-        section: "identity",
-        key: "github_identity_verifier",
-        name: GITHUB_IDENTITY_VERIFIER,
+        key: "google_jwt_roots",
+        name: GOOGLE_JWT_ROOTS,
     },
     CanonicalContract {
-        section: "identity",
-        key: "x_identity_verifier",
-        name: X_IDENTITY_VERIFIER,
+        key: "x_platform_verifier",
+        name: X_PLATFORM_VERIFIER,
     },
     CanonicalContract {
-        section: "identity",
-        key: "google_identity_verifier",
-        name: GOOGLE_IDENTITY_VERIFIER,
+        key: "github_platform_verifier",
+        name: GITHUB_PLATFORM_VERIFIER,
     },
     CanonicalContract {
-        section: "identity",
-        key: "identity_jwks_roots",
-        name: IDENTITY_JWKS_ROOTS,
+        key: "google_platform_verifier",
+        name: GOOGLE_PLATFORM_VERIFIER,
     },
 ];
 
-/// The canonical name for a `section`/`key` pair, if the component is
+/// The canonical name for a `[contracts]` key, if the component is
 /// factory-deployed.
-pub fn canonical_name(section: &str, key: &str) -> Option<&'static str> {
+pub fn canonical_name(key: &str) -> Option<&'static str> {
     CANONICAL_CONTRACTS
         .iter()
-        .find(|c| c.section == section && c.key == key)
+        .find(|c| c.key == key)
         .map(|c| c.name)
 }
 
@@ -141,22 +107,61 @@ pub fn render_address_table() -> anyhow::Result<String> {
     );
     let _ = writeln!(
         out,
-        "  {:<34} {:<30} {CREATE2_DEPLOYER:#x}",
+        "  {:<34} {:<34} {CREATE2_DEPLOYER:#x}",
         "create2_deployer", "(keyless, Arachnid)"
     );
     let _ = writeln!(
         out,
-        "  {:<34} {:<30} {factory:#x}",
+        "  {:<34} {:<34} {factory:#x}",
         "contracts.factory", "(CREATE2, frozen init code)"
     );
     for c in CANONICAL_CONTRACTS {
         let addr = predict_address(factory, c.name);
         let _ = writeln!(
             out,
-            "  {:<34} {:<30} {addr:#x}",
-            format!("{}.{}", c.section, c.key),
+            "  {:<34} {:<34} {addr:#x}",
+            format!("contracts.{}", c.key),
             c.name
         );
     }
+    // Not declared in any network file, but deployed through the same
+    // factory and just as network-invariant: an operator reading this table
+    // is reading every address apply will land on.
+    for circuit in crate::ceremony::CIRCUITS {
+        let name = circuit.factory_name()?;
+        let addr = predict_address(factory, &name);
+        let _ = writeln!(
+            out,
+            "  {:<34} {:<34} {addr:#x}",
+            format!("circuits.{}", circuit.name),
+            name
+        );
+    }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Names are the sole input to an address, so a duplicate key or a
+    /// duplicate name would silently point two components at one contract.
+    #[test]
+    fn the_table_has_no_duplicate_keys_or_names() {
+        for (i, a) in CANONICAL_CONTRACTS.iter().enumerate() {
+            for b in &CANONICAL_CONTRACTS[i + 1..] {
+                assert_ne!(a.key, b.key, "duplicate key {}", a.key);
+                assert_ne!(a.name, b.name, "duplicate name {}", a.name);
+            }
+        }
+    }
+
+    /// Every canonical name carries the `libid.` prefix every deployed
+    /// reader keys on.
+    #[test]
+    fn every_canonical_name_is_namespaced() {
+        for c in CANONICAL_CONTRACTS {
+            assert!(c.name.starts_with("libid."), "{} is not namespaced", c.name);
+        }
+    }
 }

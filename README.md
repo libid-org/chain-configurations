@@ -1,10 +1,10 @@
 # chain-configurations
 
-Desired-state configuration for the libid contract stack, one file per
+Desired-state configuration for the libid identity stack, one file per
 network, plus the `libid-deploy` binary and the GitHub Actions that apply a
 file to its chain with an AWS KMS signer.
 
-The model is DECLARATIVE (0.4.0):
+The model is DECLARATIVE:
 
 1. `networks/<name>.toml` declares what should exist on a chain — including
    **every address, pre-filled up front**. Canonical contracts live at
@@ -14,8 +14,7 @@ The model is DECLARATIVE (0.4.0):
    name)`, naming the expected value.
 2. Deployed-vs-not is determined from **chain state** (`eth_getCode` at the
    declared address / the factory's `deployedAt` record) — never from
-   config emptiness. The old "empty = not deployed" convention is dead on
-   declarative files.
+   config emptiness.
 3. `libid-deploy plan` compares the declarations with the chain, read-only:
    each component is "declared + present" (ok) or "declared + missing"
    (DEPLOY — apply would put it at exactly the declared address). A wrong
@@ -27,15 +26,128 @@ The model is DECLARATIVE (0.4.0):
    therefore use identical config data regardless of which chain (or how
    little of the stack) exists yet.
 
-All contract bytecode is embedded in the binary via the
-[`libid-contracts`](https://github.com/libid-org/libid-contracts) crate —
-there is no forge build and no artifact directory at runtime.
+Contract bytecode is embedded in the binary: the core stack via the
+[`libid-contracts`](https://github.com/libid-org/libid-contracts) crate,
+the Platform Verifiers and the ceremony circuits' Honk verifiers from
+`bin/libid-deploy/artifacts/`, generated at build time (see below). There
+is no forge build, no bb and no artifact directory at runtime. The platform
+tables come from `libid-identity` and `libid-profiles`, generated from the
+same sources the contracts are, so nothing here restates a value the chain
+also holds.
 
-> The generated UltraHonk circuit verifiers exceed the EIP-170 code-size
-> limit. Target chains must allow big code (Eden does — they are deployed
-> there today). Local rehearsal needs `anvil --disable-code-size-limit`.
+## The stack
 
-## Factory-first deterministic addresses (libid-contracts 0.3.0)
+Four UUPS proxies, in dependency order — the order
+`libid-contracts`' own `script/Deploy.s.sol` uses:
+
+1. **NotaryService** — the ONE place a notary attestation is
+   authenticated. It derives the digest from the attested bytes itself and
+   charges the Notary Fee. Deployed first so its proxy address can be
+   wired into every consumer's `initialize`.
+2. **CeremonyProofVerifier** — the Supported Version Set: which Platform
+   Verifier answers for a `(platformId, verifierVersion)` pair. Without it
+   the naming system's `proofVerifier` reads zero and every resolver
+   reverts.
+3. **IdentityNames** — the naming system, pointed at the Proof Verifier
+   and given a keyspace per platform (`x`, `github`, `google`). The
+   normalization rules come from `libid-identity`'s generated table.
+4. **GoogleJwtRoots** — the Google signing keys the `google/v1` Platform
+   Verifier trusts, verified through the Notary Service like any other
+   notarized session. It deploys **EMPTY**: point a keeper at it before
+   Google names work, or every Google claim reverts `UntrustedModulus`.
+
+Then two steps `Deploy.s.sol` does not have:
+
+5. **A Honk verifier per ceremony circuit** — the bb-generated UltraHonk
+   verifier each platform's proofs are checked under, deployed through the
+   factory under a CREATE3 name carrying the pinned circuits version.
+6. **A Platform Verifier per platform** — `XPlatformVerifier`,
+   `GitHubPlatformVerifier`, `GooglePlatformVerifier` — deployed behind its
+   own CREATE3 proxy, pinned to its circuit's verifier by address and code
+   hash, and registered into the Supported Version Set with
+   `CeremonyProofVerifier.setVerifier(platformId, 1, verifier)`. Until that
+   registration lands, a platform owns a keyspace and can verify nothing:
+   `claim` reverts `UnknownVersion` and every resolver reverts
+   `UnknownPlatform`.
+
+## The ceremony contracts
+
+### Where the bytecode comes from
+
+`libid-contracts` embeds compiled bytecode only for the contracts its
+`COVERED` list names, and the Platform Verifiers are not among them — its
+own `script/Deploy.s.sol` registers none either. Nor does anything upstream
+ship a Honk verifier: one derives from a circuit's verification key, which
+[`libid-circuits`](https://github.com/libid-org/libid-circuits) publishes
+as a release asset. `scripts/vendor-artifacts.sh` builds all of them into
+`bin/libid-deploy/artifacts/` from two committed pins:
+
+- the Platform Verifiers, from the `libid-contracts` tag `Cargo.toml` pins;
+- the Honk verifiers, from the `libid-circuits` release
+  `bin/libid-deploy/circuits-manifest.json` pins — that file is the
+  release's own manifest, committed verbatim, so the version the script
+  fetches and the sha256 it checks each asset against are one document. The
+  script runs `bb write_solidity_verifier` on the released `vk` (at the bb
+  version the manifest names), applies the two rewrites `libid-circuits`'
+  `scripts/gen-verifier.sh` applies, and compiles the result under the same
+  `foundry.toml` the Platform Verifiers build with.
+
+Both pins are **derived, never restated**, so vendored bytecode and typed
+bindings cannot come from different releases. Unit tests check every bound
+selector against the artifact's `methodIdentifiers`, that each circuit
+verifier exposes the `verify(bytes,bytes32[])` its Platform Verifier calls,
+and that both libraries a bb verifier links are vendored beside it.
+
+The directory is gitignored: CI regenerates it before every cargo step,
+and a local build runs the script first (see
+[Development](#development)). Generate, and regenerate after moving
+either pin:
+
+```sh
+scripts/vendor-artifacts.sh                            # both pins as committed
+scripts/vendor-artifacts.sh --contracts ../libid-contracts
+scripts/vendor-artifacts.sh --circuits 0.4.0           # move the circuits pin
+```
+
+`--circuits` rewrites `circuits-manifest.json`; commit that, it is the
+pin. The build is deterministic (`solc` pinned to 0.8.33, `via_ir`,
+`bytecode_hash = "none"`, and a `vk` taken from the release rather than a
+local circuit build), so every run from the same pins produces the same
+bytes on any machine, and two runs that differ mean the sources moved,
+not the build. Each CI run's summary lists the sha256 of every file the
+binary embedded.
+
+### How the circuit verifier is wired
+
+`PlatformVerifierBase._setTrustRoots` pins the verifier a platform's proofs
+are checked under **by address and by code hash**: it reads
+`address(honkVerifier_).codehash` and refuses a value that does not match
+the hash the caller named, refusing the zero and empty hashes outright. A
+bb verifier embeds its verification key as code constants and exposes no
+getter, so the code hash is the only handle on which circuit a deployed
+verifier answers for.
+
+So apply deploys the verifier and reads the hash back off the chain. There
+are two circuits, not three: `oidc-google` proves the Google JWT, and
+`bearer-link` ties a token exchange to an identity for X and GitHub alike,
+because their statements are byte-identical — so both TLSNotary platforms
+pin one deployed verifier.
+
+Each one deploys through the factory under
+`libid.circuits.<circuit>.<version>`, so its address is a pure function of
+which artifact it is. That is what makes apply idempotent here: a second
+run finds code at the same address and sends nothing. It is also the
+rotation path — a circuits release is a new name, a new address and a
+`setTrustRoots`, while the Platform Verifier proxy and its registration do
+not move. A verifier links `RelationsLib` and `ZKTranscriptLib` (their
+functions are `external`), which apply deploys and substitutes in, once per
+run however many verifiers reference them.
+
+Both verifiers are about 18 KiB of runtime code, comfortably under the
+EIP-170 limit of 24576; the anvil tests run the default code-size limit, so
+their passing is the proof.
+
+## Factory-first deterministic addresses
 
 Every top-level (entry) contract deploys THROUGH the deterministic
 `LibidFactory` via CREATE3, with `salt = keccak256(name)` for a fixed
@@ -54,22 +166,26 @@ entry = a NEW address, forever, on every network — names are frozen:
 | Config key | Canonical name | Address (every network) |
 |---|---|---|
 | `contracts.factory` | — (CREATE2, frozen init code) | `0xa92244c3f4462aad08bd1a33c3940b9b936321ad` |
-| `contracts.notary` | `libid.Notary` | `0x4bddfe9fb875d03838e5013c338e2dea9dcc2fc5` |
-| `contracts.wallet_factory` | `libid.WalletFactory` | `0x945b8a7a480a2552ec3c61c24d4363c9558107a8` |
-| `contracts.registry` | `libid.Registry` | `0x03c2b8d5f4d5cf7b7f81f876035046e262c4c9c9` |
-| `contracts.bank` | `libid.Bank` | `0x060708036a9ee89c6513346abab0929427bc9b06` |
-| `contracts.x_zk_verifier` | `libid.XZkVerifier` | `0xf8ddccfebfefdc5cbae308f0aac9a12e275eda5f` |
-| `contracts.google_oidc_verifier` | `libid.GoogleOidcVerifier` | `0xef53a51e3a46e5f82248a39ddff0b7b901ab438c` |
-| `identity.identity_names` | `libid.IdentityNames` | `0xd467d48769c26faee36ba6b6fc9228f14aef6dd2` |
-| `identity.github_identity_verifier` | `libid.GitHubIdentityVerifier` | `0x936067c1b5d77c67358210e77f664382191d2015` |
-| `identity.x_identity_verifier` | `libid.XIdentityVerifier` | `0xda66811e494a918e9ae0e5797206fca04333c055` |
-| `identity.google_identity_verifier` | `libid.GoogleIdentityVerifier` | `0x1b9db690ee040ca92d44d1585b3aab625a475c27` |
-| `identity.identity_jwks_roots` | `libid.IdentityJwksRoots` | `0x589b56f95d5df5483c79e46e7b20293135c9ebd9` |
+| `contracts.notary_service` | `libid.NotaryService` | `0xbb5871167b0128939cab6850877981421e8dcbf5` |
+| `contracts.ceremony_proof_verifier` | `libid.CeremonyProofVerifier` | `0x76bdc18f21c2db0ff796c7cc50348528b2899275` |
+| `contracts.identity_names` | `libid.IdentityNames` | `0xd467d48769c26faee36ba6b6fc9228f14aef6dd2` |
+| `contracts.google_jwt_roots` | `libid.GoogleJwtRoots` | `0xb7a2ce28e71dbb9c877d2b5a48de33b5f0e6838d` |
+| `contracts.x_platform_verifier` | `libid.XPlatformVerifier` | `0xcfc880f62f2744dc000687edf47a98b585d9eb35` |
+| `contracts.github_platform_verifier` | `libid.GitHubPlatformVerifier` | `0xac878389da7a1b58826182da0d8b4cae5e6e4178` |
+| `contracts.google_platform_verifier` | `libid.GooglePlatformVerifier` | `0xf3d537022362d187715b28bc547f8b2532e6d0cf` |
 
-Implementations, Bank facets, and the Honk circuit verifiers stay plain
-CREATE deploys: their addresses are referenced (by a proxy slot, the
-diamond, or the Registry), not canonical, and upgrades replace them
-**without moving any entry address**.
+The circuit verifiers go through the same factory but are not in that
+table and not in any network file: their names carry the circuits pin, so
+they move when it does. At `libid-circuits` 0.3.0 they are
+
+| Component | Name | Address (every network) |
+|---|---|---|
+| `circuits.bearer-link` | `libid.circuits.bearer-link.0.3.0` | `0x21c26fde6a3b481982edd755e535bbfb6e661879` |
+| `circuits.oidc-google` | `libid.circuits.oidc-google.0.3.0` | `0xfe6de589f4b15a652450c1088cfbbaee26c72ba6` |
+
+Implementations stay plain CREATE deploys: their addresses are referenced
+by a proxy slot, not canonical, and upgrades replace them **without moving
+any entry address**.
 
 How apply gets there, in order:
 
@@ -96,30 +212,22 @@ How apply gets there, in order:
    `factory.deploy(name, creationCode)` and is verified to land on
    `predict_address(factory, name)`.
 
-One exception: `--upgrade oidc-verifier` REPLACES the GoogleOidcVerifier
-with a plain CREATE deployment — the canonical name is single-use and the
-replacement's address is meant to change. The new address is recorded
-**on-chain only**: `Registry.oidcVerifierOf` is the record, and the config
-keeps declaring the canonical first-deploy address (the file is never
-rewritten). `plan` knows the pattern and reports the divergence as ok, not
-a warning.
-
 ## Config schema
 
-Every value in a network file is public: addresses, a public RPC, OAuth
-*client ids*. The only secret in the flow is the KMS key, which never
-leaves AWS.
+Every value in a network file is public: addresses and a public RPC. The
+only secret in the flow is the KMS key, which never leaves AWS.
 
 | Section | Kind | Contents |
 |---|---|---|
-| `[network]` | input | `name`, `chain_id` (apply refuses a mismatch), `rpc_url`, `legacy_addresses` (marks a pre-factory record — see below) |
+| `[network]` | input | `name`, `chain_id` (apply refuses a mismatch, whichever endpoint answers), `rpc_url` (the endpoint the file's own environment reaches; `--rpc-url` names another without touching the file) |
 | `[aws]` | input | `region`, `kms_deployer` (key id / `alias/...` / ARN; the default signer) |
-| `[accounts]` | input | `notary` (the notary **signer** — see below), `backend`, `owner` (the operational owner the factory ends up with; empty = the deployer) — addresses of **keys**, not contracts. `oidc_notary` is accepted for legacy pre-Notary files but no longer wired anywhere |
-| `[contracts]` | declared | `factory` (the deterministic LibidFactory), `notary` (the Notary **proxy**), `bank`, `registry`, `wallet_factory`, `x_zk_verifier`, `google_oidc_verifier` — always present, pre-filled with the canonical table, validated against the prediction |
-| `[identity]` | declared | `identity_names`, `github_identity_verifier`, `x_identity_verifier`, `google_identity_verifier`, `identity_jwks_roots` — same rules; the optional keys signal wanted-ness by presence |
-| `[platforms]` | input | `x_client_id`, `google_client_id`, `github_bot_handle`, `x_bot_handle` |
-| `[[tokens]]` | input | `symbol`, `address` (zero address = native; token addresses are non-canonical and stay free-form) |
-| `[templates]` | input | per-platform comment templates (string or array), keyed by platform domain |
+| `[accounts]` | input | `notary` (the notary **signer** — see below), `owner` (the operational owner the factory ends up with; empty = the deployer) — addresses of **keys**, not contracts |
+| `[notary_service]` | input | `fee_wei` — what one attestation verification costs, as a decimal string |
+| `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_names`, `google_jwt_roots`, `x_platform_verifier`, `github_platform_verifier`, `google_platform_verifier` — always present, pre-filled with the canonical table, validated against the prediction |
+
+The circuit verifiers are not in the file. They are a property of the
+binary's circuits pin, not of a network, and their addresses derive from it
+the same way the canonical table derives from its names.
 
 The `[accounts].owner` flow: the factory's genesis owner is the libID
 deployer KMS address baked into its frozen init code. `apply` needs factory
@@ -132,21 +240,21 @@ key must `acceptOwnership` itself). Local dev configs set
 completes the handover by impersonation, so the stack ends fully owned by
 the declared operational owner.
 
-The Notary split (libid-contracts 0.2.0):
+The notary split:
 
-- `accounts.notary` is the notary **signer** — the EOA/KMS identity whose
-  attestations the stack accepts. `contracts.notary` is the Notary
-  **contract** (a UUPS proxy) that stores that signer; every other
-  contract takes the proxy address at initialize and verifies through it.
-- On a fresh deploy the Notary deploys **first**
-  (`initialize(owner = deployer, notary = accounts.notary)`) and its proxy
-  is wired into everything else.
-- Rotation is declarative: edit `accounts.notary`, `plan` diffs it against
-  the on-chain `Notary.notary()` and shows the pending rotation, `apply`
-  sends the one `setNotary` — every consumer follows the contract.
-- `plan` also spot-checks consumers' `notaryContract()` wiring; a mismatch
-  (or a pre-Notary contract without the getter) is a WARN that apply does
-  not fix silently.
+- `accounts.notary` is the notary **signer** — the identity whose
+  attestations the stack accepts. `contracts.notary_service` is the Notary
+  Service **contract** (a UUPS proxy) that holds the trusted key set; every
+  other contract takes the proxy address at initialize and verifies
+  through it.
+- On a fresh deploy the Notary Service deploys **first**
+  (`initialize(owner = deployer, notary = accounts.notary, fee =
+  notary_service.fee_wei)`) and its proxy is wired into everything else.
+- Rotation is half declarative: `plan` shows whether the declared signer is
+  trusted, `apply` sends the one `setNotary` that adds it. Dropping the
+  outgoing key is a separate governance call on purpose — the service holds
+  a SET so a rotation can overlap, and which key to stop trusting is not
+  something the file can say.
 
 Declared-address semantics:
 
@@ -160,23 +268,10 @@ Declared-address semantics:
   is required exactly when the FACTORY has no code on-chain (a virgin
   network — that first apply publishes the entire declared stack). With
   the factory present, apply converges incrementally without the flag.
-- `[identity]` absent = the identity-names stack is not wanted. Once the
-  section exists, `identity_names` and `github_identity_verifier` are
-  always converged; `x_identity_verifier` / `google_identity_verifier` are
-  requested by their key being *present* (carrying the canonical address).
-  Google requires `identity_jwks_roots` declared alongside; the roots
-  contract starts EMPTY — point a JWKS rotation listener at it before
-  Google names work.
-- The verifiers are guarded: the X ZK verifier deploys only when
-  `x_client_id` is set and the Registry slot is zero; the Google OIDC
-  verifier only when `google_client_id` is set and the slot is zero. A
-  changed client id is **not** applied to an already-deployed verifier —
-  that is what `--upgrade oidc-verifier` is for.
-- **Legacy files** (`network.legacy_addresses = true`, today only
-  `networks/eden-testnet.toml`) record a pre-factory deployment verbatim:
-  the canonical equality check is skipped, `plan` keeps the old
-  empty-means-not-deployed reading, and `apply` refuses to run — the
-  planned fresh redeploy replaces such stacks.
+- The three keyspaces are **re-sent every run**. `IdentityNames` exposes no
+  getter for a platform's rules, so writing them is the only way to
+  converge on what the generated table says; the call is owner-only and
+  idempotent.
 
 ## Running locally
 
@@ -193,7 +288,7 @@ cargo run -- plan --network networks/eden-testnet.toml
 # converge; the signer defaults to aws.kms_deployer (needs ambient AWS
 # credentials), or pass a local key for anvil rehearsal
 cargo run -- apply --network networks/eden-testnet.toml \
-  --signer <64-hex-key-or-kms-id> [--upgrade bank,registry] [--yes] \
+  --signer <64-hex-key-or-kms-id> [--upgrade identity-names] [--yes] \
   [--confirm-fresh-deploy]
 ```
 
@@ -202,14 +297,21 @@ key, anything else goes to AWS KMS (region/credentials from the ambient AWS
 environment). An all-hex value of the wrong length is rejected as a mangled
 key rather than shipped to AWS.
 
-Upgrade components: `registry`, `wallet-factory`, `notary` (UUPS
-`upgradeToAndCall`; the proxy address and its stored signer survive),
-`bank` (diamond facet REPLACE — the diamond is the storage, the facets are
-the code), `oidc-verifier` (redeploy + re-point; the new address is
-recorded on-chain in `Registry.oidcVerifierOf`, not in the file). Upgrades
-never move an entry address — the canonical CREATE3 addresses are stable
-across every upgrade except the OIDC REPLACE, whose address change is the
-point.
+Every command that contacts a chain takes `--rpc-url <URL>`. A network
+file names the endpoint its own environment reaches (`network.rpc_url`);
+the flag is for a caller somewhere else — the host outside a compose
+network, a CI job with a bare anvil — and it wins outright, the file being
+the default. Only the transport moves: the declared chain id is still
+enforced against whatever answers, every address is still the file's, and
+the file is still never rewritten. A value that does not parse or does not
+answer is an error, never a fallback to the file. `plan --print-addresses`
+is offline and rejects the flag.
+
+Upgrade components: `notary-service`, `proof-verifier`, `identity-names`,
+`google-jwt-roots`, `x-platform-verifier`, `github-platform-verifier`,
+`google-platform-verifier`. Each is a UUPS `upgradeToAndCall`: the entry
+address, its storage and its owner all survive, so an upgrade never moves a
+canonical address and never disturbs a registration.
 
 For anvil rehearsal, `apply --dev` (or just letting apply detect anvil)
 covers the factory-ownership wrinkle: the local signer is not the baked
@@ -244,25 +346,71 @@ a half-applied upgrade is worse than a queued one). The job runs in the
 GitHub **environment named after the network**, so production networks can
 demand reviewers.
 
+## Local development chain
+
+`networks/local-dev.toml` is the stack on a throwaway anvil: chain 31337,
+anvil account #0 as deployer and operational owner, anvil account #1 as the
+notary signer, and a **non-zero** Notary Fee — a local stack that meters at
+no charge lets a client attaching the wrong value pass, and `WrongValue` is
+then first seen where it costs something. The deployer spec in the file is
+anvil's own published test key: `--signer` specs are classified by shape,
+so 64 hex characters is a local key and no AWS call happens.
+
+Its `rpc_url` is the compose service name, `http://anvil:8545`, which only
+resolves inside that network. From anywhere else — the host, a CI job that
+started `anvil --host 127.0.0.1 --port 8545` — the file is consumed as it
+is and `--rpc-url` names the endpoint:
+
+```sh
+# inside the compose network
+docker compose up -d anvil
+libid-deploy apply --network networks/local-dev.toml --yes \
+  --confirm-fresh-deploy --dev
+
+# from the host, or a CI runner with a bare anvil
+anvil --host 127.0.0.1 --port 8545 &
+libid-deploy apply --network networks/local-dev.toml \
+  --rpc-url http://127.0.0.1:8545 --yes --confirm-fresh-deploy --dev
+```
+
+Integration tests apply the committed file, unmodified, against a real
+anvil through `--rpc-url`, so it cannot rot into something that only
+parses, and prove the flag moves nothing but the transport: the same
+addresses land, the file's chain id is enforced against the override, and
+an override that does not answer fails instead of falling back to the file.
+
 ## Adding a network
 
 Copy `networks/mainnet.toml.example` — it ships FULLY pre-filled with the
 canonical address table, which is valid on every EVM network — fill the
-input keys (chain, RPC, AWS, accounts, platforms, tokens, templates), add
-the name to the `network` choice list in `apply.yml`, and run the workflow
-with `mode: plan` first. The first apply on a virgin network needs
+input keys (chain, RPC, AWS, accounts, Notary Fee), add the name to the
+`network` choice list in `apply.yml`, and run the workflow with `mode:
+plan` first. The first apply on a virgin network needs
 `confirm_fresh_deploy`.
 
 ## Release process
 
-Publish a GitHub Release (tag `vX.Y.Z`). `release.yml` re-runs the CI
-checks, then builds `libid-deploy` for `x86_64-unknown-linux-gnu` and
-`aarch64-unknown-linux-gnu` (natively, on arm64 runners) and uploads
-`libid-deploy-<version>-<target>.tar.gz` as release assets. The apply
-workflow's default `source: release` consumes the newest x86_64 asset.
+Publish a GitHub Release (tag `vX.Y.Z`). `release.yml` generates the
+embedded artifacts once from the pins, uncached, re-runs the CI checks on
+exactly those bytes, then builds `libid-deploy` for
+`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` (natively, on
+arm64 runners) and uploads `libid-deploy-<version>-<target>.tar.gz` as
+release assets. The apply workflow's default `source: release` consumes
+the newest x86_64 asset.
 
 ## Development
 
+- The crate embeds artifacts that are generated, not committed. Before the
+  first cargo command, and again whenever either pin moves:
+
+  ```sh
+  scripts/vendor-artifacts.sh
+  ```
+
+  It needs `jq`, `curl`, `shasum`, `forge`, and `bb` at exactly the version
+  `bin/libid-deploy/circuits-manifest.json` names (`bbup --version <that
+  version>`); any other bb is refused. Without the artifacts every cargo
+  command fails at `include_str!`, naming the missing file.
 - `cargo +nightly fmt` only — stable rustfmt silently ignores the
   nightly-only options in `rustfmt.toml`.
 - `cargo clippy --all-targets --all-features -- -D warnings`
@@ -271,6 +419,13 @@ workflow's default `source: release` consumes the newest x86_64 asset.
   the critical declarative cycle — pre-filled file → fresh apply on a
   virgin anvil lands everything AT the declared addresses → second apply is
   a no-op without any flag → the file is BYTE-IDENTICAL throughout — plus
-  the network-invariance proof: two separate bare anvils converge onto the
-  same declared canonical addresses.
+  drift repair, the Platform Verifier deploy/register/rotate path, the
+  network-invariance proof: two separate bare anvils converge onto the same
+  declared canonical addresses, and the `--rpc-url` contract: the committed
+  local-dev file, unmodified, converges an anvil the file does not name,
+  while a wrong chain id or a dead override is refused. The circuit
+  verifier those tests pin is a
+  stand-in contract: what a deploy requires of one is that it HAS code
+  whose hash matches, so the wiring is exercised exactly while nothing
+  pretends to verify a real proof.
 - Every commit must be signed off (`git commit -s`); see CONTRIBUTING.md.

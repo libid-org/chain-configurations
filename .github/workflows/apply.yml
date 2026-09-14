@@ -3,9 +3,9 @@ name: Apply
 # Apply a network's desired-state file to its chain, signing with an AWS KMS
 # key.
 #
-# WHY KMS AND NOT A GITHUB SECRET: the deployer owns every UUPS proxy and
-# the Bank diamond. A leaked deployer key means an attacker can upgrade them
-# to arbitrary code and drain them. A KMS key cannot be exported — CI calls
+# WHY KMS AND NOT A GITHUB SECRET: the deployer owns every UUPS proxy in
+# the stack. A leaked deployer key means an attacker can upgrade them to
+# arbitrary code. A KMS key cannot be exported — CI calls
 # kms:Sign and gets a signature back — so a compromised runner can sign
 # while the job runs but cannot walk away with the key. Revocation is an IAM
 # change, not a redeploy.
@@ -23,9 +23,9 @@ on:
       network:
         description: "Network file under networks/ (add new networks to this list)"
         type: choice
-        # eden-testnet is a canonical declarative file now, so both plan and
-        # apply work on it. Its FIRST apply needs confirm_fresh_deploy: the
-        # factory is virgin on that chain.
+        # eden-testnet's FIRST apply needs confirm_fresh_deploy: the
+        # factory is virgin on that chain. local-dev is deliberately absent:
+        # it has no KMS key and its chain exists only inside a CI run.
         options: [eden-testnet]
         default: eden-testnet
       mode:
@@ -34,7 +34,7 @@ on:
         options: [plan, apply]
         default: plan
       upgrade:
-        description: "Comma list to explicitly upgrade: registry, wallet-factory, notary, bank, oidc-verifier"
+        description: "Comma list to explicitly upgrade: notary-service, proof-verifier, identity-names, google-jwt-roots, x-platform-verifier, github-platform-verifier, google-platform-verifier"
         type: string
         default: ""
       confirm_fresh_deploy:
@@ -57,6 +57,9 @@ concurrency:
 permissions:
   contents: read # checkout only — apply never writes the network file back
   id-token: write # required to mint the OIDC token AWS exchanges for a role
+
+env:
+  FOUNDRY_VERSION: v1.7.1
 
 jobs:
   apply:
@@ -109,6 +112,13 @@ jobs:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: inputs.source == 'branch'
+      # The embedded artifacts are generated, never committed, and this
+      # binary sends transactions: regenerate from the pins, uncached. Also
+      # installs foundry, so the `cast` step below is release-only.
+      - uses: ./.github/actions/vendor-artifacts
+        if: inputs.source == 'branch'
+        with:
+          foundry-version: ${{ env.FOUNDRY_VERSION }}
       - name: Build libid-deploy from this branch
         if: inputs.source == 'branch'
         run: |
@@ -125,9 +135,11 @@ jobs:
           aws-region: ${{ steps.cfg.outputs.aws_region }}
 
       # `cast` derives the deployer address from the KMS public key below.
+      # A branch build installed foundry while vendoring its artifacts.
       - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        if: inputs.source == 'release'
         with:
-          version: v1.7.1
+          version: ${{ env.FOUNDRY_VERSION }}
 
       # Proves the role can actually sign with this key, and prints the
       # address that will own the contracts. Doing this BEFORE any
