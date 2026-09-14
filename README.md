@@ -124,11 +124,11 @@ into every verifier it generates. The copies compile to identical
 bytecode, and apply deploys each distinct bytecode **once** — through the
 CREATE2 deployer under an empty salt, so a library's address is a function
 of its code (`libid_contracts::deploy::library_address`): the same on
-every chain, found rather than deployed again on a re-run, and shared by
-every verifier that links it. A fresh chain pays for two libraries and two
-verifiers, not six contracts. Because a verifier's runtime code carries
-those addresses, its code hash — the one the Platform Verifiers pin — is
-network-invariant too.
+every chain, found rather than deployed again on a re-run or by a later
+circuit, and shared by every verifier that links it. A fresh chain pays
+for two libraries and two verifiers. Because a verifier's runtime code
+carries those addresses, its code hash — the one the Platform Verifiers
+pin — is network-invariant too.
 
 Both verifiers are about 18 KiB of runtime code, comfortably under the
 EIP-170 limit of 24576; the anvil tests run the default code-size limit, so
