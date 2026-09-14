@@ -8,10 +8,7 @@
 //! deployed is determined from CHAIN STATE (`eth_getCode`) at plan/apply
 //! time, never from config emptiness, and `apply` NEVER rewrites the file.
 
-use std::{
-    collections::BTreeMap,
-    path::Path,
-};
+use std::path::Path;
 
 use alloy::primitives::{
     Address,
@@ -29,10 +26,7 @@ use libid_contracts::factory::{
 };
 use serde::Deserialize;
 
-use crate::{
-    names,
-    platforms,
-};
+use crate::names;
 
 /// One parsed network file.
 #[derive(Debug, Clone, Deserialize)]
@@ -49,10 +43,6 @@ pub struct NetworkConfig {
     /// The canonical contract addresses — DECLARED, pre-filled with the
     /// canonical table.
     pub contracts: Contracts,
-    /// INPUT: the ceremony circuit verifier each platform's proofs are
-    /// made under. A platform absent here gets no Platform Verifier.
-    #[serde(default)]
-    pub ceremony: BTreeMap<String, Ceremony>,
 }
 
 /// `[network]`.
@@ -168,29 +158,6 @@ impl Contracts {
     }
 }
 
-/// One `[ceremony.<platform>]` entry: what that platform's Platform
-/// Verifier is wired to.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Ceremony {
-    /// The bb-generated UltraHonk verifier for this platform's ceremony
-    /// circuit, already deployed on this chain. The Platform Verifier pins
-    /// it by ADDRESS and by CODE HASH, so apply reads the code at this
-    /// address and hashes it — a wrong address is refused on chain rather
-    /// than found at the first user's proof.
-    pub circuit_verifier: String,
-}
-
-impl Ceremony {
-    /// The declared circuit verifier address.
-    pub fn circuit_verifier_address(&self, platform: &str) -> Result<Address> {
-        required_address(
-            &self.circuit_verifier,
-            &format!("ceremony.{platform}.circuit_verifier"),
-        )
-    }
-}
-
 /// Parse an address field that may be empty (optional keys).
 pub fn opt_address(value: &str, label: &str) -> Result<Option<Address>> {
     let value = value.trim();
@@ -249,20 +216,6 @@ impl NetworkConfig {
         if self.aws.kms_deployer.trim().is_empty() {
             bail!("aws.kms_deployer must not be empty");
         }
-        for (key, ceremony) in &self.ceremony {
-            if platforms::by_domain(key).is_none() {
-                bail!(
-                    "[ceremony.{key}] names no launch platform — the launch list \
-                     is {}",
-                    platforms::LAUNCH
-                        .iter()
-                        .map(|p| p.domain)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            ceremony.circuit_verifier_address(key)?;
-        }
         self.validate_canonical_addresses()
     }
 
@@ -313,14 +266,6 @@ impl NetworkConfig {
             }
         }
         Ok(())
-    }
-
-    /// The `[ceremony]` entry for a launch platform, if the file declares
-    /// one. Absent = that platform's Platform Verifier is not wanted: it
-    /// owns its keyspace and verifies nothing, which is what the chain
-    /// reports.
-    pub fn ceremony_for(&self, platform: &platforms::Platform) -> Option<&Ceremony> {
-        self.ceremony.get(platform.domain)
     }
 }
 
@@ -428,7 +373,6 @@ google_platform_verifier = "{google}"
             )
         );
         assert_eq!(cfg.notary_service.fee().unwrap(), U256::from(1000));
-        assert!(cfg.ceremony.is_empty());
     }
 
     /// A canonical key whose value differs from the prediction is a

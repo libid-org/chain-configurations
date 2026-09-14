@@ -24,13 +24,18 @@
 //! naming system dispatches claims through, the naming system itself with
 //! a keyspace per platform, and the Google JWT root list that pays the
 //! Notary Service for each rotation. Then one step that script does not
-//! have: a Platform Verifier per platform whose ceremony circuit verifier
-//! the file declares, registered into the Supported Version Set — without
-//! which a platform owns a keyspace and can verify nothing.
+//! have: the ceremony circuits' Honk verifiers, and a Platform Verifier
+//! per platform pinned to one of them and registered into the Supported
+//! Version Set — without which a platform owns a keyspace and can verify
+//! nothing.
 
-use std::path::Path;
+use std::{
+    collections::BTreeMap,
+    path::Path,
+};
 
 use alloy::{
+    hex,
     network::TransactionBuilder,
     primitives::{
         keccak256,
@@ -81,7 +86,10 @@ use tracing::{
 };
 
 use crate::{
-    ceremony,
+    ceremony::{
+        self,
+        Circuit,
+    },
     config::{
         required_address,
         NetworkConfig,
@@ -364,10 +372,14 @@ pub async fn run(
         && identity_names_present
         && jwt_roots_present);
     for platform in platforms::LAUNCH {
-        if cfg.ceremony_for(platform).is_some() {
-            let declared = declared_verifier(cfg, platform)?;
-            needs_factory_deploy |= !code_present(&provider, declared).await?;
-        }
+        let declared = declared_verifier(cfg, platform)?;
+        needs_factory_deploy |= !code_present(&provider, declared).await?;
+    }
+    // The circuit verifiers deploy through the factory too, under a name
+    // carrying the pinned circuits version.
+    for circuit in ceremony::CIRCUITS {
+        let predicted = predict_address(libid_factory, &circuit.factory_name()?);
+        needs_factory_deploy |= !code_present(&provider, predicted).await?;
     }
     if needs_factory_deploy {
         ensure_factory_ownership(&provider, libid_factory, sender, opts.dev).await?;
@@ -570,7 +582,8 @@ pub async fn run(
             .push(format!("jwt roots -> notary service {notary_service:#x}"));
     }
 
-    // ── 5. A Platform Verifier per declared platform ─────────────────────
+    // ── 5. A Platform Verifier per platform, on its circuit's verifier ───
+    let mut circuits = CircuitCache::default();
     for platform in platforms::LAUNCH {
         apply_platform_verifier(
             &provider,
@@ -582,6 +595,7 @@ pub async fn run(
             notary_service,
             proof_verifier,
             jwt_roots,
+            &mut circuits,
             &mut summary,
         )
         .await?;
@@ -972,42 +986,152 @@ fn declared_verifier(cfg: &NetworkConfig, platform: &Platform) -> Result<Address
     required_address(raw, &format!("contracts.{key}"))
 }
 
-/// The code hash of the declared ceremony circuit verifier.
+/// What this run has already put on the chain for the ceremony circuits.
 ///
-/// Read from the chain rather than taken from the file: the Platform
-/// Verifier compares the hash it is handed against `address.codehash` and
-/// refuses a mismatch, so a hash carried in config could only ever agree
-/// with the chain or make the deploy revert. What the file must get right
-/// is the ADDRESS — and an address with no code is caught here, by name,
-/// instead of as a `WrongVerifierArtifact` revert.
-async fn circuit_codehash<P: Provider>(
-    provider: &P,
-    platform: &Platform,
-    circuit: Address,
-) -> Result<B256> {
-    let code = provider
-        .get_code_at(circuit)
-        .await
-        .map_err(|e| anyhow!("get_code({circuit:#x}) failed: {e}"))?;
-    if code.is_empty() {
-        bail!(
-            "ceremony.{}.circuit_verifier declares {circuit:#x}, which has NO CODE on \
-             this chain. The Platform Verifier pins its circuit verifier by code hash, \
-             so deploy the bb-generated UltraHonk verifier for the {} ceremony circuit \
-             first and declare its address here.",
-            platform.domain,
-            platform.label
-        );
-    }
-    Ok(keccak256(&code))
+/// Two platforms share `bearer-link` and both circuits link the same two
+/// libraries, so without this a single apply would deploy the same code
+/// several times and wire the platforms to different copies of it.
+#[derive(Debug, Default)]
+struct CircuitCache {
+    /// Circuit name -> its verifier's address and on-chain code hash.
+    verifiers: BTreeMap<&'static str, (Address, B256)>,
+    /// Library creation code -> where this run deployed it.
+    libraries: BTreeMap<Bytes, Address>,
 }
 
-/// Deploy, wire and register one platform's Platform Verifier.
+/// The circuit verifier for `circuit`: deployed if the chain lacks it, and
+/// its code hash read back off the chain either way.
 ///
-/// A platform with no `[ceremony]` declaration is left alone: it owns its
-/// keyspace and verifies nothing, and that is a state the chain reports
-/// honestly. Inventing a circuit verifier to fill the gap would register a
-/// contract that answers for a statement nobody proved.
+/// The verifier goes through the factory under
+/// [`Circuit::factory_name`], so its address is a pure function of which
+/// artifact it is. That is what makes this idempotent: a second apply
+/// finds code at the same address and sends nothing, and a circuits
+/// release is a different name, a different address and a rotation rather
+/// than a silent replacement.
+///
+/// The code hash is READ, never computed: a bb verifier links two
+/// libraries, so its runtime code carries their addresses, and the hash
+/// the Platform Verifier checks is the one the chain holds.
+async fn ensure_circuit_verifier<P: Provider>(
+    provider: &P,
+    factory: Address,
+    sender: Address,
+    circuit: &Circuit,
+    cache: &mut CircuitCache,
+    summary: &mut Summary,
+) -> Result<(Address, B256)> {
+    if let Some(known) = cache.verifiers.get(circuit.name) {
+        return Ok(*known);
+    }
+    let name = circuit.factory_name()?;
+    let address = predict_address(factory, &name);
+    if !code_present(provider, address).await? {
+        let creation_code =
+            link_creation_code(provider, circuit.contract, sender, &mut cache.libraries)
+                .await?;
+        let deployed =
+            factory_deploy_named(provider, factory, &name, creation_code, sender).await?;
+        info!(
+            "{} circuit verifier deployed at {deployed:#x} ({name})",
+            circuit.name
+        );
+        debug_assert_eq!(deployed, address);
+        summary
+            .deployed
+            .push((format!("circuits.{}", circuit.name), deployed));
+    }
+
+    let code = provider
+        .get_code_at(address)
+        .await
+        .map_err(|e| anyhow!("get_code({address:#x}) failed: {e}"))?;
+    if code.is_empty() {
+        bail!(
+            "the {} circuit verifier has no code at {address:#x} after deploy — the \
+             Platform Verifier pins it by code hash and would refuse it",
+            circuit.name
+        );
+    }
+    let codehash = keccak256(&code);
+    cache.verifiers.insert(circuit.name, (address, codehash));
+    Ok((address, codehash))
+}
+
+/// The creation bytecode of `contract`, with every library it links
+/// deployed (once per distinct library, across the whole run) and its
+/// address substituted into the placeholder slots.
+///
+/// The bb verifiers hold `external` library functions, so `RelationsLib`
+/// and `ZKTranscriptLib` are real deployed contracts rather than inlined
+/// code; the placeholder left in would revert on every proof.
+async fn link_creation_code<P: Provider>(
+    provider: &P,
+    contract: &str,
+    sender: Address,
+    cache: &mut BTreeMap<Bytes, Address>,
+) -> Result<Bytes> {
+    let mut code = ceremony::creation_code_hex(contract)?;
+    for (path, libs) in ceremony::link_references(contract)? {
+        let file = Path::new(&path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow!("{contract} names a bad library path {path}"))?;
+        for (library, refs) in libs.as_object().into_iter().flatten() {
+            // A library that linked one of its own would need the same
+            // treatment; none does, so this stays a flat resolve rather
+            // than a recursion nothing exercises.
+            let library_code = ceremony::library_creation_code(file, library)?;
+            let address = match cache.get(&library_code) {
+                Some(address) => *address,
+                None => {
+                    let address = deploy_contract_from(
+                        provider,
+                        library_code.clone(),
+                        &format!("{library} (library)"),
+                        Some(sender),
+                    )
+                    .await?;
+                    cache.insert(library_code, address);
+                    address
+                }
+            };
+            let address_hex = hex::encode(address.as_slice());
+            for r in refs.as_array().into_iter().flatten() {
+                let start = r["start"]
+                    .as_u64()
+                    .and_then(|v| usize::try_from(v).ok())
+                    .ok_or_else(|| anyhow!("bad linkReference start for {library}"))?;
+                let length = r["length"]
+                    .as_u64()
+                    .and_then(|v| usize::try_from(v).ok())
+                    .ok_or_else(|| {
+                    anyhow!("bad linkReference length for {library}")
+                })?;
+                // Byte offsets -> hex-character offsets.
+                let end = start
+                    .checked_add(length)
+                    .and_then(|v| v.checked_mul(2))
+                    .ok_or_else(|| anyhow!("linkReference overflow for {library}"))?;
+                let begin = start
+                    .checked_mul(2)
+                    .ok_or_else(|| anyhow!("linkReference overflow for {library}"))?;
+                if end > code.len() || address_hex.len() != end - begin {
+                    bail!("linkReference for {library} does not fit {contract}");
+                }
+                code.replace_range(begin..end, &address_hex);
+            }
+        }
+    }
+    if code.contains("__$") {
+        bail!("{contract} still has unresolved link references after linking");
+    }
+    let bytes = hex::decode(&code)
+        .map_err(|e| anyhow!("invalid bytecode hex after linking {contract}: {e}"))?;
+    Ok(Bytes::from(bytes))
+}
+
+/// Deploy, wire and register one platform's Platform Verifier, on the
+/// verifier for the ceremony circuit its proofs are made under.
 #[allow(clippy::too_many_arguments)]
 async fn apply_platform_verifier<P: Provider>(
     provider: &P,
@@ -1019,19 +1143,19 @@ async fn apply_platform_verifier<P: Provider>(
     notary_service: Address,
     proof_verifier: Address,
     jwt_roots: Address,
+    circuits: &mut CircuitCache,
     summary: &mut Summary,
 ) -> Result<()> {
-    let Some(declaration) = cfg.ceremony_for(platform) else {
-        info!(
-            "{}: no [ceremony.{}] — no Platform Verifier deployed; the platform owns \
-             its keyspace and can verify nothing",
-            platform.label, platform.domain
-        );
-        return Ok(());
-    };
     let proxy = declared_verifier(cfg, platform)?;
-    let circuit = declaration.circuit_verifier_address(platform.domain)?;
-    let codehash = circuit_codehash(provider, platform, circuit).await?;
+    let (circuit, codehash) = ensure_circuit_verifier(
+        provider,
+        factory,
+        sender,
+        &platform.circuit,
+        circuits,
+        summary,
+    )
+    .await?;
 
     if !code_present(provider, proxy).await? {
         let implementation_code = ceremony::creation_code(platform.contract)?;
@@ -1107,10 +1231,10 @@ async fn apply_platform_verifier<P: Provider>(
     register_verifier(provider, platform, proof_verifier, proxy, sender, summary).await
 }
 
-/// Point a Platform Verifier at the declared circuit verifier when the two
-/// have drifted. Editing `circuit_verifier` and re-applying IS the rotation
-/// path: a new circuit release is a new artifact, and the verifier must be
-/// told which one it answers for.
+/// Point a Platform Verifier at its circuit's verifier when the two have
+/// drifted. Moving the circuits pin and re-applying IS the rotation path:
+/// a new circuits release is a new artifact under a new factory name, and
+/// the verifier must be told which one it answers for.
 ///
 /// The reads and the write go through the TLSNotary binding for both kinds
 /// — this surface is `PlatformVerifierBase`'s, identical in every Platform

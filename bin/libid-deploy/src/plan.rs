@@ -9,10 +9,13 @@
 //! Once the factory exists the plan also diffs its on-chain `deployedAt`
 //! records against the config to surface drift.
 
+use std::collections::BTreeMap;
+
 use alloy::{
     primitives::{
         keccak256,
         Address,
+        B256,
     },
     providers::{
         Provider,
@@ -313,13 +316,52 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
         plan_jwt_roots(&mut b, &provider, jwt_roots, notary_service).await;
     }
 
+    // ── The ceremony circuit verifiers ───────────────────────────────────
+    // apply deploys these through the factory under a name carrying the
+    // pinned circuits version, so the address is a pure function of which
+    // artifact it is — known here before the chain has anything on it.
+    let mut circuits: BTreeMap<&str, (Address, Option<B256>)> = BTreeMap::new();
+    for circuit in ceremony::CIRCUITS {
+        let name = circuit.factory_name()?;
+        let address = predict_address(declared_factory, &name);
+        let code = provider
+            .get_code_at(address)
+            .await
+            .map_err(|e| anyhow!("get_code({name}) failed: {e}"))?;
+        let component = format!("circuits.{}", circuit.name);
+        let hash = if code.is_empty() {
+            b.push(
+                &component,
+                Status::Deploy,
+                format!(
+                    "declared at {address:#x} — no code on-chain; apply would deploy \
+                     '{name}' there"
+                ),
+            );
+            None
+        } else {
+            let hash = keccak256(&code);
+            b.push(
+                &component,
+                Status::Ok,
+                format!("{address:#x} (codehash {hash:#x}, '{name}')"),
+            );
+            Some(hash)
+        };
+        circuits.insert(circuit.name, (address, hash));
+    }
+
     // ── The Platform Verifiers ───────────────────────────────────────────
     for platform in platforms::LAUNCH {
+        let circuit = *circuits
+            .get(platform.circuit.name)
+            .ok_or_else(|| anyhow!("{} has no circuit plan", platform.label))?;
         plan_platform_verifier(
             &mut b,
             &provider,
             cfg,
             platform,
+            circuit,
             proof_verifier,
             proof_verifier_present,
         )
@@ -479,32 +521,24 @@ async fn plan_jwt_roots<P: Provider>(
     }
 }
 
-/// One platform's Platform Verifier: whether it is declared at all,
-/// whether the circuit verifier it would pin exists, and whether it is
+/// One platform's Platform Verifier: whether it exists, whether it pins
+/// the circuit verifier its circuit resolves to, and whether it is
 /// registered in the Supported Version Set.
+///
+/// `circuit` is that verifier's address and — once it has code — the hash
+/// the Platform Verifier must be holding.
 async fn plan_platform_verifier<P: Provider>(
     b: &mut Builder,
     provider: &P,
     cfg: &NetworkConfig,
     platform: &Platform,
+    circuit: (Address, Option<B256>),
     proof_verifier: Address,
     proof_verifier_present: bool,
 ) -> Result<()> {
     let component = format!("contracts.{}", platform.contracts_key);
     let registration = format!("ceremony.{}.registration", platform.domain);
-    let Some(declaration) = cfg.ceremony_for(platform) else {
-        b.push(
-            &component,
-            Status::Skipped,
-            format!(
-                "no [ceremony.{}] — the platform owns its keyspace and verifies \
-                 nothing",
-                platform.domain
-            ),
-        );
-        b.push(&registration, Status::Skipped, "no verifier to register");
-        return Ok(());
-    };
+    let (circuit_address, circuit_hash) = circuit;
 
     let proxy = required_address(
         cfg.contracts.raw(platform.contracts_key).ok_or_else(|| {
@@ -512,51 +546,29 @@ async fn plan_platform_verifier<P: Provider>(
         })?,
         &component,
     )?;
-    let circuit = declaration.circuit_verifier_address(platform.domain)?;
-    let circuit_code = provider
-        .get_code_at(circuit)
-        .await
-        .map_err(|e| anyhow!("get_code({circuit:#x}) failed: {e}"))?;
-    if circuit_code.is_empty() {
-        // apply hard-errors on this rather than deploying a verifier that
-        // pins nothing, so the plan says so before anyone runs it.
-        b.push(
-            format!("ceremony.{}.circuit_verifier", platform.domain),
-            Status::Warn,
-            format!(
-                "{circuit:#x} has NO CODE — apply would refuse: a Platform Verifier \
-                 pins its circuit verifier by code hash"
-            ),
-        );
-    } else {
-        b.push(
-            format!("ceremony.{}.circuit_verifier", platform.domain),
-            Status::Ok,
-            format!("{circuit:#x} (codehash {:#x})", keccak256(&circuit_code)),
-        );
-    }
 
     let present = check_code(b, provider, &component, proxy).await?;
-    if present && !circuit_code.is_empty() {
+    if present {
         let verifier = ceremony::TlsPlatformVerifier::new(proxy, provider);
         let wired = verifier.honkVerifier().call().await;
         let wired_hash = verifier.honkVerifierCodehash().call().await;
         match (wired, wired_hash) {
             (Ok(addr), Ok(hash))
-                if addr == circuit && hash == keccak256(&circuit_code) =>
+                if addr == circuit_address && Some(hash) == circuit_hash =>
             {
                 b.push(
                     format!("{component}.trust_roots"),
                     Status::Ok,
-                    format!("pins {addr:#x}"),
+                    format!("pins {addr:#x} ({})", platform.circuit.name),
                 );
             }
             (Ok(addr), Ok(_)) => b.push(
                 format!("{component}.trust_roots"),
                 Status::Configure,
                 format!(
-                    "pins {addr:#x}, file declares {circuit:#x} — apply sends \
-                     setTrustRoots"
+                    "pins {addr:#x}, the pinned {} verifier is {circuit_address:#x} — \
+                     apply sends setTrustRoots",
+                    platform.circuit.name
                 ),
             ),
             _ => b.push(

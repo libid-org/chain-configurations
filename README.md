@@ -28,8 +28,9 @@ The model is DECLARATIVE:
 
 Contract bytecode is embedded in the binary: the core stack via the
 [`libid-contracts`](https://github.com/libid-org/libid-contracts) crate,
-the Platform Verifiers from `bin/libid-deploy/artifacts/` (see below).
-There is no forge build and no artifact directory at runtime. The platform
+the Platform Verifiers and the ceremony circuits' Honk verifiers from
+`bin/libid-deploy/artifacts/` (see below). There is no forge build, no bb
+and no artifact directory at runtime. The platform
 tables come from `libid-identity` and `libid-profiles`, generated from the
 same sources the contracts are, so nothing here restates a value the chain
 also holds.
@@ -55,78 +56,90 @@ Four UUPS proxies, in dependency order — the order
    notarized session. It deploys **EMPTY**: point a keeper at it before
    Google names work, or every Google claim reverts `UntrustedModulus`.
 
-Then one step `Deploy.s.sol` does not have:
+Then two steps `Deploy.s.sol` does not have:
 
-5. **A Platform Verifier per platform** — `XPlatformVerifier`,
+5. **A Honk verifier per ceremony circuit** — the bb-generated UltraHonk
+   verifier each platform's proofs are checked under, deployed through the
+   factory under a CREATE3 name carrying the pinned circuits version.
+6. **A Platform Verifier per platform** — `XPlatformVerifier`,
    `GitHubPlatformVerifier`, `GooglePlatformVerifier` — deployed behind its
-   own CREATE3 proxy and registered into the Supported Version Set with
+   own CREATE3 proxy, pinned to its circuit's verifier by address and code
+   hash, and registered into the Supported Version Set with
    `CeremonyProofVerifier.setVerifier(platformId, 1, verifier)`. Until that
    registration lands, a platform owns a keyspace and can verify nothing:
    `claim` reverts `UnknownVersion` and every resolver reverts
    `UnknownPlatform`.
 
-## The Platform Verifiers
+## The ceremony contracts
 
 ### Where the bytecode comes from
 
 `libid-contracts` embeds compiled bytecode only for the contracts its
 `COVERED` list names, and the Platform Verifiers are not among them — its
-own `script/Deploy.s.sol` registers none either. This repository deploys
-them, so `scripts/vendor-platform-verifiers.sh` compiles them from the same
-tag the `libid-contracts` dependency comes from and commits the pruned
-artifacts under `bin/libid-deploy/artifacts/`. The tag is **derived from
-`Cargo.toml`**, never restated, so vendored bytecode and typed bindings
-cannot come from different releases; a unit test additionally checks every
-bound selector against the artifact's `methodIdentifiers`.
+own `script/Deploy.s.sol` registers none either. Nor does anything upstream
+ship a Honk verifier: one derives from a circuit's verification key, which
+[`libid-circuits`](https://github.com/libid-org/libid-circuits) publishes
+as a release asset. `scripts/vendor-artifacts.sh` builds all of them and
+commits the pruned artifacts under `bin/libid-deploy/artifacts/`:
 
-Regenerate after moving the dependency:
+- the Platform Verifiers, from the `libid-contracts` tag `Cargo.toml` pins;
+- the Honk verifiers, from the `libid-circuits` release
+  `bin/libid-deploy/circuits-manifest.json` pins — that file is the
+  release's own manifest, committed verbatim, so the version the script
+  fetches and the sha256 it checks each asset against are one document. The
+  script runs `bb write_solidity_verifier` on the released `vk` (at the bb
+  version the manifest names), applies the two rewrites `libid-circuits`'
+  `scripts/gen-verifier.sh` applies, and compiles the result under the same
+  `foundry.toml` the Platform Verifiers build with.
+
+Both pins are **derived, never restated**, so vendored bytecode and typed
+bindings cannot come from different releases. Unit tests check every bound
+selector against the artifact's `methodIdentifiers`, that each circuit
+verifier exposes the `verify(bytes,bytes32[])` its Platform Verifier calls,
+and that both libraries a bb verifier links are vendored beside it.
+
+Regenerate after moving either pin:
 
 ```sh
-scripts/vendor-platform-verifiers.sh                      # clones the pinned tag
-scripts/vendor-platform-verifiers.sh --contracts ../libid-contracts
+scripts/vendor-artifacts.sh                            # both pins as committed
+scripts/vendor-artifacts.sh --contracts ../libid-contracts
+scripts/vendor-artifacts.sh --circuits 0.4.0           # move the circuits pin
 ```
 
 The build is deterministic (`solc` pinned to 0.8.33, `via_ir`,
-`bytecode_hash = "none"`), so a regenerated artifact that differs from the
+`bytecode_hash = "none"`, and a `vk` taken from the release rather than a
+local circuit build), so a regenerated artifact that differs from the
 committed one means the sources moved, not the build.
 
-### What this tool cannot supply: the circuit verifier
+### How the circuit verifier is wired
 
-`PlatformVerifierBase._setTrustRoots` pins the bb-generated UltraHonk
-verifier a platform's proofs are checked under **by address and by code
-hash**: it reads `address(honkVerifier_).codehash` and refuses a value that
-does not match the hash the caller named, refusing the zero and empty
-hashes outright. A bb verifier embeds its verification key as code
-constants and exposes no getter, so the code hash is the only handle on
-which circuit a deployed verifier answers for.
+`PlatformVerifierBase._setTrustRoots` pins the verifier a platform's proofs
+are checked under **by address and by code hash**: it reads
+`address(honkVerifier_).codehash` and refuses a value that does not match
+the hash the caller named, refusing the zero and empty hashes outright. A
+bb verifier embeds its verification key as code constants and exposes no
+getter, so the code hash is the only handle on which circuit a deployed
+verifier answers for.
 
-Nothing can invent one. The operator declares the address:
+So apply deploys the verifier and reads the hash back off the chain. There
+are two circuits, not three: `oidc-google` proves the Google JWT, and
+`bearer-link` ties a token exchange to an identity for X and GitHub alike,
+because their statements are byte-identical — so both TLSNotary platforms
+pin one deployed verifier.
 
-```toml
-[ceremony.x]
-circuit_verifier = "0x…"
-```
+Each one deploys through the factory under
+`libid.circuits.<circuit>.<version>`, so its address is a pure function of
+which artifact it is. That is what makes apply idempotent here: a second
+run finds code at the same address and sends nothing. It is also the
+rotation path — a circuits release is a new name, a new address and a
+`setTrustRoots`, while the Platform Verifier proxy and its registration do
+not move. A verifier links `RelationsLib` and `ZKTranscriptLib` (their
+functions are `external`), which apply deploys and substitutes in, once per
+run however many verifiers reference them.
 
-and apply reads the code there, hashes it, and passes the hash — so a wrong
-address fails at deploy rather than at the first user's proof. Editing the
-address and re-applying is the rotation path (`setTrustRoots`); the proxy
-does not move, so the registration survives.
-
-A platform with no `[ceremony]` section gets no Platform Verifier. That is
-a state the chain reports honestly through `verifiesPlatform`, and the plan
-prints it as `skipped` with the reason. Nothing is substituted to fill the
-gap: a verifier registered against a circuit nobody proved would accept
-proofs of a statement nobody made.
-
-**The ceremony circuits are not released yet.** `libid-circuits` v0.3.0
-ships the *login* circuits (`jwt_email`, `dyaka-noir-token`), which prove
-different statements; the ceremony ones (`bearer-link`, serving X and
-GitHub, and `oidc-google`) exist only on that repository's unmerged
-`feat/ceremony-circuits` branch — no release, no verification key, no
-generated Solidity verifier. Until such a release exists and
-`libid-contracts` reproduces a verifier from it, `[ceremony]` stays
-commented out in the committed network files and no Platform Verifier is
-deployed.
+Both verifiers are about 18 KiB of runtime code, comfortably under the
+EIP-170 limit of 24576; the anvil tests run the default code-size limit, so
+their passing is the proof.
 
 ## Factory-first deterministic addresses
 
@@ -154,6 +167,15 @@ entry = a NEW address, forever, on every network — names are frozen:
 | `contracts.x_platform_verifier` | `libid.XPlatformVerifier` | `0xcfc880f62f2744dc000687edf47a98b585d9eb35` |
 | `contracts.github_platform_verifier` | `libid.GitHubPlatformVerifier` | `0xac878389da7a1b58826182da0d8b4cae5e6e4178` |
 | `contracts.google_platform_verifier` | `libid.GooglePlatformVerifier` | `0xf3d537022362d187715b28bc547f8b2532e6d0cf` |
+
+The circuit verifiers go through the same factory but are not in that
+table and not in any network file: their names carry the circuits pin, so
+they move when it does. At `libid-circuits` 0.3.0 they are
+
+| Component | Name | Address (every network) |
+|---|---|---|
+| `circuits.bearer-link` | `libid.circuits.bearer-link.0.3.0` | `0x21c26fde6a3b481982edd755e535bbfb6e661879` |
+| `circuits.oidc-google` | `libid.circuits.oidc-google.0.3.0` | `0xfe6de589f4b15a652450c1088cfbbaee26c72ba6` |
 
 Implementations stay plain CREATE deploys: their addresses are referenced
 by a proxy slot, not canonical, and upgrades replace them **without moving
@@ -196,7 +218,10 @@ only secret in the flow is the KMS key, which never leaves AWS.
 | `[accounts]` | input | `notary` (the notary **signer** — see below), `owner` (the operational owner the factory ends up with; empty = the deployer) — addresses of **keys**, not contracts |
 | `[notary_service]` | input | `fee_wei` — what one attestation verification costs, as a decimal string |
 | `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_names`, `google_jwt_roots`, `x_platform_verifier`, `github_platform_verifier`, `google_platform_verifier` — always present, pre-filled with the canonical table, validated against the prediction |
-| `[ceremony.<platform>]` | input | `circuit_verifier` — the deployed UltraHonk verifier for that platform's ceremony circuit. Absent = no Platform Verifier for that platform |
+
+The circuit verifiers are not in the file. They are a property of the
+binary's circuits pin, not of a network, and their addresses derive from it
+the same way the canonical table derives from its names.
 
 The `[accounts].owner` flow: the factory's genesis owner is the libID
 deployer KMS address baked into its frozen init code. `apply` needs factory
@@ -241,10 +266,6 @@ Declared-address semantics:
   getter for a platform's rules, so writing them is the only way to
   converge on what the generated table says; the call is owner-only and
   idempotent.
-- A `[ceremony]` key that names no launch platform, or a
-  `circuit_verifier` that is empty or zero, is a validation error. A
-  declared address with **no code on-chain** is a plan WARN and an apply
-  hard error, by name.
 
 ## Running locally
 
@@ -333,8 +354,7 @@ cannot rot into something that only parses.
 
 Copy `networks/mainnet.toml.example` — it ships FULLY pre-filled with the
 canonical address table, which is valid on every EVM network — fill the
-input keys (chain, RPC, AWS, accounts, Notary Fee, and `[ceremony]` once
-the circuit verifiers exist on that chain), add the name to the
+input keys (chain, RPC, AWS, accounts, Notary Fee), add the name to the
 `network` choice list in `apply.yml`, and run the workflow with `mode:
 plan` first. The first apply on a virgin network needs
 `confirm_fresh_deploy`.
