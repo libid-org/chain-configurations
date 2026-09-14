@@ -164,7 +164,10 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-latest
           - target: x86_64-apple-darwin
-            runner: macos-13
+            # macos-15-intel, not macos-13: GitHub retired the macos-13
+            # image, and a job naming a retired label is never scheduled --
+            # the asset would go missing with nothing failing to say so.
+            runner: macos-15-intel
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
