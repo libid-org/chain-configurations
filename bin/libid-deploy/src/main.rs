@@ -64,8 +64,10 @@ enum Command {
         signer: Option<String>,
         /// Comma-separated components to explicitly upgrade:
         /// notary-service, proof-verifier, identity-names,
-        /// google-jwt-roots. Each is a UUPS proxy; the entry address, its
-        /// storage and its owner all survive.
+        /// google-jwt-roots, x-platform-verifier,
+        /// github-platform-verifier, google-platform-verifier. Each is a
+        /// UUPS proxy; the entry address, its storage and its owner all
+        /// survive.
         #[arg(long, value_delimiter = ',')]
         upgrade: Vec<apply::Upgrade>,
         /// Proceed without the interactive confirmation prompt.

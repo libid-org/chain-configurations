@@ -8,7 +8,10 @@
 //! deployed is determined from CHAIN STATE (`eth_getCode`) at plan/apply
 //! time, never from config emptiness, and `apply` NEVER rewrites the file.
 
-use std::path::Path;
+use std::{
+    collections::BTreeMap,
+    path::Path,
+};
 
 use alloy::primitives::{
     Address,
@@ -26,7 +29,10 @@ use libid_contracts::factory::{
 };
 use serde::Deserialize;
 
-use crate::names;
+use crate::{
+    names,
+    platforms,
+};
 
 /// One parsed network file.
 #[derive(Debug, Clone, Deserialize)]
@@ -43,6 +49,10 @@ pub struct NetworkConfig {
     /// The canonical contract addresses — DECLARED, pre-filled with the
     /// canonical table.
     pub contracts: Contracts,
+    /// INPUT: the ceremony circuit verifier each platform's proofs are
+    /// made under. A platform absent here gets no Platform Verifier.
+    #[serde(default)]
+    pub ceremony: BTreeMap<String, Ceremony>,
 }
 
 /// `[network]`.
@@ -133,6 +143,12 @@ pub struct Contracts {
     /// The GoogleJwtRoots proxy. Starts EMPTY on-chain: point a keeper at
     /// it before Google names work.
     pub google_jwt_roots: String,
+    /// The `x/v1` Platform Verifier proxy.
+    pub x_platform_verifier: String,
+    /// The `github/v1` Platform Verifier proxy.
+    pub github_platform_verifier: String,
+    /// The `google/v1` Platform Verifier proxy.
+    pub google_platform_verifier: String,
 }
 
 impl Contracts {
@@ -144,8 +160,34 @@ impl Contracts {
             "ceremony_proof_verifier" => self.ceremony_proof_verifier.as_str(),
             "identity_names" => self.identity_names.as_str(),
             "google_jwt_roots" => self.google_jwt_roots.as_str(),
+            "x_platform_verifier" => self.x_platform_verifier.as_str(),
+            "github_platform_verifier" => self.github_platform_verifier.as_str(),
+            "google_platform_verifier" => self.google_platform_verifier.as_str(),
             _ => return None,
         })
+    }
+}
+
+/// One `[ceremony.<platform>]` entry: what that platform's Platform
+/// Verifier is wired to.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ceremony {
+    /// The bb-generated UltraHonk verifier for this platform's ceremony
+    /// circuit, already deployed on this chain. The Platform Verifier pins
+    /// it by ADDRESS and by CODE HASH, so apply reads the code at this
+    /// address and hashes it — a wrong address is refused on chain rather
+    /// than found at the first user's proof.
+    pub circuit_verifier: String,
+}
+
+impl Ceremony {
+    /// The declared circuit verifier address.
+    pub fn circuit_verifier_address(&self, platform: &str) -> Result<Address> {
+        required_address(
+            &self.circuit_verifier,
+            &format!("ceremony.{platform}.circuit_verifier"),
+        )
     }
 }
 
@@ -207,6 +249,20 @@ impl NetworkConfig {
         if self.aws.kms_deployer.trim().is_empty() {
             bail!("aws.kms_deployer must not be empty");
         }
+        for (key, ceremony) in &self.ceremony {
+            if platforms::by_domain(key).is_none() {
+                bail!(
+                    "[ceremony.{key}] names no launch platform — the launch list \
+                     is {}",
+                    platforms::LAUNCH
+                        .iter()
+                        .map(|p| p.domain)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            ceremony.circuit_verifier_address(key)?;
+        }
         self.validate_canonical_addresses()
     }
 
@@ -258,6 +314,14 @@ impl NetworkConfig {
         }
         Ok(())
     }
+
+    /// The `[ceremony]` entry for a launch platform, if the file declares
+    /// one. Absent = that platform's Platform Verifier is not wanted: it
+    /// owns its keyspace and verifies nothing, which is what the chain
+    /// reports.
+    pub fn ceremony_for(&self, platform: &platforms::Platform) -> Option<&Ceremony> {
+        self.ceremony.get(platform.domain)
+    }
 }
 
 #[cfg(test)]
@@ -296,11 +360,17 @@ notary_service = "{notary_service}"
 ceremony_proof_verifier = "{pv}"
 identity_names = "{names}"
 google_jwt_roots = "{roots}"
+x_platform_verifier = "{x}"
+github_platform_verifier = "{github}"
+google_platform_verifier = "{google}"
 "#,
             notary_service = addr(names::NOTARY_SERVICE),
             pv = addr(names::CEREMONY_PROOF_VERIFIER),
             names = addr(names::IDENTITY_NAMES),
             roots = addr(names::GOOGLE_JWT_ROOTS),
+            x = addr(names::X_PLATFORM_VERIFIER),
+            github = addr(names::GITHUB_PLATFORM_VERIFIER),
+            google = addr(names::GOOGLE_PLATFORM_VERIFIER),
         )
     }
 
@@ -358,6 +428,7 @@ google_jwt_roots = "{roots}"
             )
         );
         assert_eq!(cfg.notary_service.fee().unwrap(), U256::from(1000));
+        assert!(cfg.ceremony.is_empty());
     }
 
     /// A canonical key whose value differs from the prediction is a

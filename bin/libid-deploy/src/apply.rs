@@ -23,15 +23,20 @@
 //! notarized session is authenticated through, the Proof Verifier the
 //! naming system dispatches claims through, the naming system itself with
 //! a keyspace per platform, and the Google JWT root list that pays the
-//! Notary Service for each rotation.
+//! Notary Service for each rotation. Then one step that script does not
+//! have: a Platform Verifier per platform whose ceremony circuit verifier
+//! the file declares, registered into the Supported Version Set — without
+//! which a platform owns a keyspace and can verify nothing.
 
 use std::path::Path;
 
 use alloy::{
     network::TransactionBuilder,
     primitives::{
+        keccak256,
         Address,
         Bytes,
+        B256,
     },
     providers::{
         Provider,
@@ -58,11 +63,9 @@ use libid_contracts::{
         },
         factory::LibidFactory,
         identity::IdentityNames,
+        proxy::IUUPSUpgradeable,
     },
-    deploy::{
-        deploy_contract_from,
-        upgrade_uups,
-    },
+    deploy::deploy_contract_from,
     factory::{
         ensure_create2_deployer,
         ensure_factory,
@@ -78,12 +81,18 @@ use tracing::{
 };
 
 use crate::{
+    ceremony,
     config::{
         required_address,
         NetworkConfig,
     },
     names,
-    platforms,
+    platforms::{
+        self,
+        Platform,
+        VerifierKind,
+        LAUNCH_VERIFIER_VERSION,
+    },
     signer::SignerSource,
 };
 
@@ -100,6 +109,14 @@ pub enum Upgrade {
     IdentityNames,
     /// The Google JWT root list — both key generations survive.
     GoogleJwtRoots,
+    /// The `x/v1` Platform Verifier — its trust roots and parameters
+    /// survive. Registration is not touched: the Proof Verifier points at
+    /// the proxy, which does not move.
+    XPlatformVerifier,
+    /// The `github/v1` Platform Verifier.
+    GitHubPlatformVerifier,
+    /// The `google/v1` Platform Verifier.
+    GooglePlatformVerifier,
 }
 
 impl Upgrade {
@@ -110,6 +127,9 @@ impl Upgrade {
             Self::ProofVerifier => "ceremony_proof_verifier",
             Self::IdentityNames => "identity_names",
             Self::GoogleJwtRoots => "google_jwt_roots",
+            Self::XPlatformVerifier => platforms::X.contracts_key,
+            Self::GitHubPlatformVerifier => platforms::GITHUB.contracts_key,
+            Self::GooglePlatformVerifier => platforms::GOOGLE.contracts_key,
         }
     }
 
@@ -120,6 +140,21 @@ impl Upgrade {
             Self::ProofVerifier => "CeremonyProofVerifier",
             Self::IdentityNames => "IdentityNames",
             Self::GoogleJwtRoots => "GoogleJwtRoots",
+            Self::XPlatformVerifier => platforms::X.contract,
+            Self::GitHubPlatformVerifier => platforms::GITHUB.contract,
+            Self::GooglePlatformVerifier => platforms::GOOGLE.contract,
+        }
+    }
+
+    /// The implementation creation code. The Platform Verifiers come from
+    /// this crate's vendored artifacts; everything else from the bytecode
+    /// `libid-contracts` embeds.
+    fn implementation_code(self, artifacts: &Artifacts) -> Result<Bytes> {
+        match self {
+            Self::XPlatformVerifier
+            | Self::GitHubPlatformVerifier
+            | Self::GooglePlatformVerifier => ceremony::creation_code(self.contract()),
+            _ => Ok(artifacts.bytecode(self.contract())?),
         }
     }
 
@@ -129,6 +164,9 @@ impl Upgrade {
         "proof-verifier",
         "identity-names",
         "google-jwt-roots",
+        "x-platform-verifier",
+        "github-platform-verifier",
+        "google-platform-verifier",
     ];
 }
 
@@ -141,6 +179,9 @@ impl std::str::FromStr for Upgrade {
             "proof-verifier" => Ok(Self::ProofVerifier),
             "identity-names" => Ok(Self::IdentityNames),
             "google-jwt-roots" => Ok(Self::GoogleJwtRoots),
+            "x-platform-verifier" => Ok(Self::XPlatformVerifier),
+            "github-platform-verifier" => Ok(Self::GitHubPlatformVerifier),
+            "google-platform-verifier" => Ok(Self::GooglePlatformVerifier),
             other => bail!(
                 "unknown upgrade component '{other}' (expected {})",
                 Self::VALUES.join(", ")
@@ -318,11 +359,17 @@ pub async fn run(
     // Does anything need `factory.deploy` (owner-gated)? Only then must the
     // apply signer own the factory. On real networks the signer IS the KMS
     // genesis owner; on dev chains ownership is impersonation-transferred.
-    if !(notary_service_present
+    let mut needs_factory_deploy = !(notary_service_present
         && proof_verifier_present
         && identity_names_present
-        && jwt_roots_present)
-    {
+        && jwt_roots_present);
+    for platform in platforms::LAUNCH {
+        if cfg.ceremony_for(platform).is_some() {
+            let declared = declared_verifier(cfg, platform)?;
+            needs_factory_deploy |= !code_present(&provider, declared).await?;
+        }
+    }
+    if needs_factory_deploy {
         ensure_factory_ownership(&provider, libid_factory, sender, opts.dev).await?;
     }
 
@@ -334,6 +381,7 @@ pub async fn run(
             libid_factory,
             names::NOTARY_SERVICE,
             "NotaryService",
+            artifacts.bytecode("NotaryService")?,
             &NotaryService::initializeCall {
                 owner_: sender,
                 notary_: notary_signer,
@@ -401,6 +449,7 @@ pub async fn run(
             libid_factory,
             names::CEREMONY_PROOF_VERIFIER,
             "CeremonyProofVerifier",
+            artifacts.bytecode("CeremonyProofVerifier")?,
             &CeremonyProofVerifier::initializeCall { owner_: sender },
             sender,
         )
@@ -423,6 +472,7 @@ pub async fn run(
             libid_factory,
             names::IDENTITY_NAMES,
             "IdentityNames",
+            artifacts.bytecode("IdentityNames")?,
             &IdentityNames::initializeCall { owner_: sender },
             sender,
         )
@@ -482,6 +532,7 @@ pub async fn run(
             libid_factory,
             names::GOOGLE_JWT_ROOTS,
             "GoogleJwtRoots",
+            artifacts.bytecode("GoogleJwtRoots")?,
             &GoogleJwtRoots::initializeCall {
                 owner_: sender,
                 notary_: notary_service,
@@ -519,6 +570,23 @@ pub async fn run(
             .push(format!("jwt roots -> notary service {notary_service:#x}"));
     }
 
+    // ── 5. A Platform Verifier per declared platform ─────────────────────
+    for platform in platforms::LAUNCH {
+        apply_platform_verifier(
+            &provider,
+            &artifacts,
+            cfg,
+            libid_factory,
+            sender,
+            platform,
+            notary_service,
+            proof_verifier,
+            jwt_roots,
+            &mut summary,
+        )
+        .await?;
+    }
+
     // ── Explicit upgrades ────────────────────────────────────────────────
     for upgrade in &opts.upgrades {
         let key = upgrade.contracts_key();
@@ -528,13 +596,12 @@ pub async fn run(
                 .ok_or_else(|| anyhow!("{key} is not a canonical contract"))?,
             &format!("contracts.{key}"),
         )?;
-        let new_impl = upgrade_uups(
+        let new_impl = upgrade_proxy(
             &provider,
-            &artifacts,
             proxy,
+            upgrade.implementation_code(&artifacts)?,
             upgrade.contract(),
-            Bytes::new(),
-            Some(sender),
+            sender,
         )
         .await?;
         info!(
@@ -870,6 +937,7 @@ async fn deploy_named_proxy<P: Provider, C: SolCall>(
     factory: Address,
     name: &str,
     contract: &str,
+    implementation_code: Bytes,
     init_call: &C,
     sender: Address,
 ) -> Result<Address> {
@@ -885,13 +953,308 @@ async fn deploy_named_proxy<P: Provider, C: SolCall>(
 
     let implementation = deploy_contract_from(
         provider,
-        artifacts.bytecode(contract)?,
+        implementation_code,
         &format!("{contract} (impl)"),
         Some(sender),
     )
     .await?;
     let creation_code = proxy_creation_code(artifacts, implementation, init_call)?;
     factory_deploy_named(provider, factory, name, creation_code, sender).await
+}
+
+/// The Platform Verifier proxy address a platform declares.
+fn declared_verifier(cfg: &NetworkConfig, platform: &Platform) -> Result<Address> {
+    let key = platform.contracts_key;
+    let raw = cfg
+        .contracts
+        .raw(key)
+        .ok_or_else(|| anyhow!("{key} is not a canonical contract"))?;
+    required_address(raw, &format!("contracts.{key}"))
+}
+
+/// The code hash of the declared ceremony circuit verifier.
+///
+/// Read from the chain rather than taken from the file: the Platform
+/// Verifier compares the hash it is handed against `address.codehash` and
+/// refuses a mismatch, so a hash carried in config could only ever agree
+/// with the chain or make the deploy revert. What the file must get right
+/// is the ADDRESS — and an address with no code is caught here, by name,
+/// instead of as a `WrongVerifierArtifact` revert.
+async fn circuit_codehash<P: Provider>(
+    provider: &P,
+    platform: &Platform,
+    circuit: Address,
+) -> Result<B256> {
+    let code = provider
+        .get_code_at(circuit)
+        .await
+        .map_err(|e| anyhow!("get_code({circuit:#x}) failed: {e}"))?;
+    if code.is_empty() {
+        bail!(
+            "ceremony.{}.circuit_verifier declares {circuit:#x}, which has NO CODE on \
+             this chain. The Platform Verifier pins its circuit verifier by code hash, \
+             so deploy the bb-generated UltraHonk verifier for the {} ceremony circuit \
+             first and declare its address here.",
+            platform.domain,
+            platform.label
+        );
+    }
+    Ok(keccak256(&code))
+}
+
+/// Deploy, wire and register one platform's Platform Verifier.
+///
+/// A platform with no `[ceremony]` declaration is left alone: it owns its
+/// keyspace and verifies nothing, and that is a state the chain reports
+/// honestly. Inventing a circuit verifier to fill the gap would register a
+/// contract that answers for a statement nobody proved.
+#[allow(clippy::too_many_arguments)]
+async fn apply_platform_verifier<P: Provider>(
+    provider: &P,
+    artifacts: &Artifacts,
+    cfg: &NetworkConfig,
+    factory: Address,
+    sender: Address,
+    platform: &Platform,
+    notary_service: Address,
+    proof_verifier: Address,
+    jwt_roots: Address,
+    summary: &mut Summary,
+) -> Result<()> {
+    let Some(declaration) = cfg.ceremony_for(platform) else {
+        info!(
+            "{}: no [ceremony.{}] — no Platform Verifier deployed; the platform owns \
+             its keyspace and can verify nothing",
+            platform.label, platform.domain
+        );
+        return Ok(());
+    };
+    let proxy = declared_verifier(cfg, platform)?;
+    let circuit = declaration.circuit_verifier_address(platform.domain)?;
+    let codehash = circuit_codehash(provider, platform, circuit).await?;
+
+    if !code_present(provider, proxy).await? {
+        let implementation_code = ceremony::creation_code(platform.contract)?;
+        let deployed = match platform.kind {
+            VerifierKind::TlsNotary {
+                proof_lifetime,
+                max_future_attestation_skew,
+            } => {
+                deploy_named_proxy(
+                    provider,
+                    artifacts,
+                    factory,
+                    platform.canonical_name,
+                    platform.contract,
+                    implementation_code,
+                    &ceremony::TlsPlatformVerifier::initializeCall {
+                        owner_: sender,
+                        notary_: notary_service,
+                        honkVerifier_: circuit,
+                        honkVerifierCodehash_: codehash,
+                        proofLifetime_: proof_lifetime,
+                        maxFutureAttestationSkew_: max_future_attestation_skew,
+                        futureObservationAllowance_: platform
+                            .future_observation_allowance,
+                    },
+                    sender,
+                )
+                .await?
+            }
+            VerifierKind::GoogleJwt => {
+                deploy_named_proxy(
+                    provider,
+                    artifacts,
+                    factory,
+                    platform.canonical_name,
+                    platform.contract,
+                    implementation_code,
+                    &ceremony::GooglePlatformVerifier::initializeCall {
+                        owner_: sender,
+                        // A profile that notarizes nothing must hold no
+                        // Notary Service: the base contract rejects one,
+                        // and `notaryService()` would otherwise report a
+                        // collaborator nothing on this path calls.
+                        notary_: Address::ZERO,
+                        honkVerifier_: circuit,
+                        honkVerifierCodehash_: codehash,
+                        futureObservationAllowance_: platform
+                            .future_observation_allowance,
+                        jwtRoots_: jwt_roots,
+                    },
+                    sender,
+                )
+                .await?
+            }
+        };
+        info!(
+            "{} Platform Verifier deployed at {deployed:#x} ({})",
+            platform.label, platform.canonical_name
+        );
+        debug_assert_eq!(deployed, proxy);
+        summary
+            .deployed
+            .push((format!("contracts.{}", platform.contracts_key), deployed));
+    }
+
+    converge_trust_roots(
+        provider, platform, proxy, circuit, codehash, sender, summary,
+    )
+    .await?;
+    if matches!(platform.kind, VerifierKind::GoogleJwt) {
+        converge_jwt_roots(provider, proxy, jwt_roots, sender, summary).await?;
+    }
+    register_verifier(provider, platform, proof_verifier, proxy, sender, summary).await
+}
+
+/// Point a Platform Verifier at the declared circuit verifier when the two
+/// have drifted. Editing `circuit_verifier` and re-applying IS the rotation
+/// path: a new circuit release is a new artifact, and the verifier must be
+/// told which one it answers for.
+///
+/// The reads and the write go through the TLSNotary binding for both kinds
+/// — this surface is `PlatformVerifierBase`'s, identical in every Platform
+/// Verifier — and only the Notary Service argument differs, which is what
+/// the profile decides.
+async fn converge_trust_roots<P: Provider>(
+    provider: &P,
+    platform: &Platform,
+    proxy: Address,
+    circuit: Address,
+    codehash: B256,
+    sender: Address,
+    summary: &mut Summary,
+) -> Result<()> {
+    let verifier = ceremony::TlsPlatformVerifier::new(proxy, provider);
+    let wired = verifier
+        .honkVerifier()
+        .call()
+        .await
+        .map_err(|e| anyhow!("{}.honkVerifier read failed: {e}", platform.label))?;
+    let wired_hash = verifier.honkVerifierCodehash().call().await.map_err(|e| {
+        anyhow!("{}.honkVerifierCodehash read failed: {e}", platform.label)
+    })?;
+    if wired == circuit && wired_hash == codehash {
+        return Ok(());
+    }
+    let notary = match platform.kind {
+        VerifierKind::TlsNotary { .. } => {
+            verifier.notaryService().call().await.map_err(|e| {
+                anyhow!("{}.notaryService read failed: {e}", platform.label)
+            })?
+        }
+        VerifierKind::GoogleJwt => Address::ZERO,
+    };
+    send_with_nonce_retry!(
+        verifier.setTrustRoots(notary, circuit, codehash),
+        format!("{}.setTrustRoots", platform.label),
+        provider,
+        sender
+    )?;
+    info!(
+        "{} circuit verifier rotated: {wired:#x} -> {circuit:#x}",
+        platform.label
+    );
+    summary.configured.push(format!(
+        "{} circuit verifier {wired:#x} -> {circuit:#x}",
+        platform.label
+    ));
+    Ok(())
+}
+
+/// The Google verifier reads its trusted moduli through the root list; a
+/// drifted pointer is a verifier trusting a list nobody rotates.
+async fn converge_jwt_roots<P: Provider>(
+    provider: &P,
+    proxy: Address,
+    jwt_roots: Address,
+    sender: Address,
+    summary: &mut Summary,
+) -> Result<()> {
+    let verifier = ceremony::GooglePlatformVerifier::new(proxy, provider);
+    let wired = verifier
+        .jwtRoots()
+        .call()
+        .await
+        .map_err(|e| anyhow!("GooglePlatformVerifier.jwtRoots read failed: {e}"))?;
+    if wired == jwt_roots {
+        return Ok(());
+    }
+    send_with_nonce_retry!(
+        verifier.setJwtRoots(jwt_roots),
+        "GooglePlatformVerifier.setJwtRoots",
+        provider,
+        sender
+    )?;
+    info!("Google verifier reads roots from {jwt_roots:#x}");
+    summary
+        .configured
+        .push(format!("google verifier -> jwt roots {jwt_roots:#x}"));
+    Ok(())
+}
+
+/// Register the verifier in the Supported Version Set. Until this lands,
+/// `IdentityNames.claim` reverts `UnknownVersion` and every resolver for
+/// the platform reverts `UnknownPlatform`.
+async fn register_verifier<P: Provider>(
+    provider: &P,
+    platform: &Platform,
+    proof_verifier: Address,
+    proxy: Address,
+    sender: Address,
+    summary: &mut Summary,
+) -> Result<()> {
+    let platform_id = platforms::platform_id(platform.domain);
+    let registry = CeremonyProofVerifier::new(proof_verifier, provider);
+    let registered = registry
+        .verifierOf(platform_id, LAUNCH_VERIFIER_VERSION)
+        .call()
+        .await
+        .map_err(|e| anyhow!("CeremonyProofVerifier.verifierOf read failed: {e}"))?;
+    if registered == proxy {
+        return Ok(());
+    }
+    send_with_nonce_retry!(
+        registry.setVerifier(platform_id, LAUNCH_VERIFIER_VERSION, proxy),
+        format!("CeremonyProofVerifier.setVerifier({})", platform.label),
+        provider,
+        sender
+    )?;
+    info!(
+        "{} registered at version {LAUNCH_VERIFIER_VERSION} -> {proxy:#x}",
+        platform.label
+    );
+    summary.configured.push(format!(
+        "{} verifier v{LAUNCH_VERIFIER_VERSION} -> {proxy:#x}",
+        platform.label
+    ));
+    Ok(())
+}
+
+/// Replace a UUPS proxy's implementation with a freshly deployed one. The
+/// entry address, its storage and its owner all survive.
+async fn upgrade_proxy<P: Provider>(
+    provider: &P,
+    proxy: Address,
+    implementation_code: Bytes,
+    label: &str,
+    sender: Address,
+) -> Result<Address> {
+    let new_impl = deploy_contract_from(
+        provider,
+        implementation_code,
+        &format!("{label} (new impl)"),
+        Some(sender),
+    )
+    .await?;
+    let proxied = IUUPSUpgradeable::new(proxy, provider);
+    send_with_nonce_retry!(
+        proxied.upgradeToAndCall(new_impl, Bytes::new()),
+        format!("{label}.upgradeToAndCall"),
+        provider,
+        sender
+    )?;
+    Ok(new_impl)
 }
 
 /// ERC1967Proxy creation code ++ `abi.encode(implementation, initData)` —

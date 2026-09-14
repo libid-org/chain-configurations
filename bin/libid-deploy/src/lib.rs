@@ -13,6 +13,7 @@
 //! sources the contracts are.
 
 pub mod apply;
+pub mod ceremony;
 pub mod config;
 pub mod names;
 pub mod plan;

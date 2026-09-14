@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use alloy::{
     node_bindings::AnvilInstance,
     primitives::{
+        keccak256,
         Address,
         U256,
     },
@@ -36,6 +37,7 @@ use libid_contracts::{
         factory::LibidFactory,
         identity::IdentityNames,
     },
+    deploy::deploy_contract_from,
     factory::{
         predict_address,
         predict_factory_address,
@@ -44,13 +46,18 @@ use libid_contracts::{
 };
 use libid_deploy::{
     apply,
+    ceremony,
     config::NetworkConfig,
     names,
     plan::{
         self,
         Status,
     },
-    platforms,
+    platforms::{
+        self,
+        VerifierKind,
+        LAUNCH_VERIFIER_VERSION,
+    },
     signer::SignerSource,
 };
 
@@ -81,6 +88,27 @@ fn spawn_anvil() -> AnvilInstance {
 /// written before the chain has anything on it, because every address is a
 /// pure function of its name. Owner: the anvil #0 wallet, explicitly.
 fn prefilled_network_file(dir: &std::path::Path, rpc: &str) -> PathBuf {
+    write_network_file(dir, rpc, "")
+}
+
+/// The same file plus a `[ceremony]` table pointing every platform at
+/// `circuit`.
+fn network_file_with_ceremony(
+    dir: &std::path::Path,
+    rpc: &str,
+    circuit: Address,
+) -> PathBuf {
+    let mut ceremony = String::new();
+    for platform in platforms::LAUNCH {
+        ceremony.push_str(&format!(
+            "\n[ceremony.{}]\ncircuit_verifier = \"{circuit:#x}\"\n",
+            platform.domain
+        ));
+    }
+    write_network_file(dir, rpc, &ceremony)
+}
+
+fn write_network_file(dir: &std::path::Path, rpc: &str, extra: &str) -> PathBuf {
     let artifacts = Artifacts::embedded();
     let factory = predict_factory_address(&artifacts).unwrap();
     let addr = |name: &str| format!("{:#x}", predict_address(factory, name));
@@ -108,14 +136,44 @@ notary_service = "{notary_service}"
 ceremony_proof_verifier = "{pv}"
 identity_names = "{identity_names}"
 google_jwt_roots = "{roots}"
-"#,
+x_platform_verifier = "{x}"
+github_platform_verifier = "{github}"
+google_platform_verifier = "{google}"
+{extra}"#,
         notary_service = addr(names::NOTARY_SERVICE),
         pv = addr(names::CEREMONY_PROOF_VERIFIER),
         identity_names = addr(names::IDENTITY_NAMES),
         roots = addr(names::GOOGLE_JWT_ROOTS),
+        x = addr(names::X_PLATFORM_VERIFIER),
+        github = addr(names::GITHUB_PLATFORM_VERIFIER),
+        google = addr(names::GOOGLE_PLATFORM_VERIFIER),
     );
     std::fs::write(&path, body).expect("write network file");
     path
+}
+
+/// A stand-in for a ceremony circuit's bb-generated UltraHonk verifier.
+///
+/// The real ones are built from a libid-circuits release and do not exist
+/// yet for the ceremony circuits. What a Platform Verifier's deploy path
+/// requires of one is only that it HAS code whose hash matches the hash it
+/// is handed — `verify` is not called until a user submits a proof — so any
+/// deployed contract exercises the wiring exactly. It could never accept a
+/// real ceremony proof, which is the point: nothing here pretends to.
+async fn deploy_circuit_stand_in(rpc: &str, key: &str) -> Address {
+    let signer: alloy::signers::local::PrivateKeySigner = key.parse().unwrap();
+    let provider = ProviderBuilder::new()
+        .wallet(alloy::network::EthereumWallet::from(signer))
+        .connect_http(rpc.parse().unwrap());
+    let artifacts = Artifacts::embedded();
+    deploy_contract_from(
+        &provider,
+        artifacts.bytecode("WTIA9").unwrap(),
+        "circuit verifier stand-in",
+        None,
+    )
+    .await
+    .expect("stand-in deploys")
 }
 
 /// Apply `path` against its chain with the anvil #0 key.
@@ -129,7 +187,9 @@ async fn apply_with(path: &std::path::Path, opts: apply::Options) -> apply::Summ
 
 /// Assert every declared canonical address equals
 /// `predict_address(factory, name)` — the CREATE3 name-determinism proof —
-/// and that the chain has CODE at each of them.
+/// and that the chain has CODE at every component the file asks for. A
+/// Platform Verifier the file names no circuit verifier for is asked for by
+/// nobody, so it is declared but absent, which is the correct state.
 async fn assert_declared_and_present<P: Provider>(provider: &P, cfg: &NetworkConfig) {
     let artifacts = Artifacts::embedded();
     let factory = predict_factory_address(&artifacts).unwrap();
@@ -146,11 +206,17 @@ async fn assert_declared_and_present<P: Provider>(provider: &P, cfg: &NetworkCon
             "{} is not at its CREATE3 address",
             c.key
         );
-        assert!(
-            !provider.get_code_at(declared).await.unwrap().is_empty(),
-            "{} has no code at {declared:#x}",
-            c.key
-        );
+        let wanted = match platforms::LAUNCH.iter().find(|p| p.contracts_key == c.key) {
+            Some(platform) => cfg.ceremony_for(platform).is_some(),
+            None => true,
+        };
+        if wanted {
+            assert!(
+                !provider.get_code_at(declared).await.unwrap().is_empty(),
+                "{} has no code at {declared:#x}",
+                c.key
+            );
+        }
     }
 }
 
@@ -445,4 +511,325 @@ async fn fresh_apply_addresses_are_network_invariant() {
             c.key
         );
     }
+}
+
+/// The Platform Verifiers: a platform whose ceremony circuit verifier the
+/// file declares gets its verifier deployed at the declared canonical
+/// address, initialized with the parameters the generated tables hold, and
+/// registered into the Supported Version Set — after which the naming
+/// system resolves for it and quotes the right price. A platform with no
+/// declaration gets nothing, and says so.
+#[tokio::test]
+async fn platform_verifiers_deploy_wire_and_register() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let circuit = deploy_circuit_stand_in(&anvil.endpoint(), ANVIL_KEY).await;
+    let path = network_file_with_ceremony(dir.path(), &anvil.endpoint(), circuit);
+    let before = std::fs::read(&path).expect("read config");
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+
+    apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            dev: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    assert_declared_and_present(&provider, &cfg).await;
+
+    let notary_service: Address = cfg.contracts.notary_service.parse().unwrap();
+    let proof_verifier: Address = cfg.contracts.ceremony_proof_verifier.parse().unwrap();
+    let identity_names: Address = cfg.contracts.identity_names.parse().unwrap();
+    let jwt_roots: Address = cfg.contracts.google_jwt_roots.parse().unwrap();
+    let expected_codehash = keccak256(provider.get_code_at(circuit).await.unwrap());
+
+    let registry = CeremonyProofVerifier::new(proof_verifier, &provider);
+    let names_contract = IdentityNames::new(identity_names, &provider);
+
+    for platform in platforms::LAUNCH {
+        let platform_id = platforms::platform_id(platform.domain);
+        let proxy: Address = cfg
+            .contracts
+            .raw(platform.contracts_key)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let verifier = ceremony::TlsPlatformVerifier::new(proxy, &provider);
+
+        // It answers for its own platform, and pins the exact artifact the
+        // file named — by code hash, read off the chain.
+        assert_eq!(
+            verifier.platformId().call().await.unwrap(),
+            platform_id,
+            "{} serves the wrong platform",
+            platform.label
+        );
+        assert_eq!(verifier.honkVerifier().call().await.unwrap(), circuit);
+        assert_eq!(
+            verifier.honkVerifierCodehash().call().await.unwrap(),
+            expected_codehash
+        );
+
+        // The parameters come from the generated tables, not from here.
+        let params = verifier.protocolParameters().call().await.unwrap();
+        assert_eq!(
+            params.futureObservationAllowance,
+            platform.future_observation_allowance
+        );
+        match platform.kind {
+            VerifierKind::TlsNotary {
+                proof_lifetime,
+                max_future_attestation_skew,
+            } => {
+                assert_eq!(params.proofLifetime, proof_lifetime);
+                assert_eq!(params.maxFutureAttestationSkew, max_future_attestation_skew);
+                assert_eq!(
+                    verifier.notaryService().call().await.unwrap(),
+                    notary_service
+                );
+            }
+            VerifierKind::GoogleJwt => {
+                // A profile that notarizes nothing holds no Notary Service
+                // and no attestation window.
+                assert_eq!(params.proofLifetime, 0);
+                assert_eq!(params.maxFutureAttestationSkew, 0);
+                assert_eq!(
+                    verifier.notaryService().call().await.unwrap(),
+                    Address::ZERO
+                );
+                assert_eq!(
+                    ceremony::GooglePlatformVerifier::new(proxy, &provider)
+                        .jwtRoots()
+                        .call()
+                        .await
+                        .unwrap(),
+                    jwt_roots
+                );
+            }
+        }
+
+        // Registered, so the platform can verify and the resolvers answer.
+        assert_eq!(
+            registry
+                .verifierOf(platform_id, LAUNCH_VERIFIER_VERSION)
+                .call()
+                .await
+                .unwrap(),
+            proxy
+        );
+        assert!(registry.verifiesPlatform(platform_id).call().await.unwrap());
+        assert_eq!(
+            names_contract
+                .resolveId(platform_id, "12345".into())
+                .call()
+                .await
+                .expect("a wired platform resolves"),
+            Address::ZERO
+        );
+
+        // One Notary Fee per attestation the profile requires, quoted end
+        // to end through the naming system.
+        let expected_quote = match platform.kind {
+            VerifierKind::TlsNotary { .. } => U256::from(NOTARY_FEE_WEI) * U256::from(2),
+            VerifierKind::GoogleJwt => U256::ZERO,
+        };
+        assert_eq!(
+            names_contract
+                .quoteClaim(platform_id, LAUNCH_VERIFIER_VERSION)
+                .call()
+                .await
+                .unwrap(),
+            expected_quote,
+            "{} quotes the wrong price",
+            platform.label
+        );
+    }
+
+    // A second apply deploys and configures nothing more.
+    let again = apply_with(&path, apply::Options::default()).await;
+    assert!(again.deployed.is_empty(), "{:?}", again.deployed);
+    assert!(again.configured.is_empty(), "{:?}", again.configured);
+    let settled = plan::build(&cfg).await.expect("plan after apply");
+    assert!(
+        !settled.has_deploys(),
+        "the settled plan still wants deploys:\n{}",
+        settled.render()
+    );
+    for platform in platforms::LAUNCH {
+        assert_eq!(
+            settled.status_of(&format!("ceremony.{}.registration", platform.domain)),
+            Some(Status::Ok)
+        );
+    }
+
+    // Every verifier upgrades, and its trust roots survive.
+    let upgrades: Vec<apply::Upgrade> = apply::Upgrade::VALUES
+        .iter()
+        .map(|v| v.parse().expect("value parses"))
+        .collect();
+    let upgraded = apply_with(
+        &path,
+        apply::Options {
+            upgrades,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(upgraded.upgraded.len(), apply::Upgrade::VALUES.len());
+    for platform in platforms::LAUNCH {
+        let proxy: Address = cfg
+            .contracts
+            .raw(platform.contracts_key)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            ceremony::TlsPlatformVerifier::new(proxy, &provider)
+                .honkVerifierCodehash()
+                .call()
+                .await
+                .unwrap(),
+            expected_codehash
+        );
+    }
+
+    assert_eq!(
+        before,
+        std::fs::read(&path).expect("re-read config"),
+        "apply rewrote the network file"
+    );
+}
+
+/// A platform with no `[ceremony]` declaration gets no verifier, and the
+/// plan says why rather than leaving a blank. Editing the file to name a
+/// circuit verifier is what deploys one — and editing it to name a
+/// DIFFERENT one rotates the pin, without moving the proxy.
+#[tokio::test]
+async fn a_declared_circuit_verifier_deploys_and_rotates_the_pin() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bare = prefilled_network_file(dir.path(), &anvil.endpoint());
+    apply_with(
+        &bare,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            dev: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Nothing declared: nothing deployed, and the plan explains it.
+    let cfg = NetworkConfig::load(&bare).expect("config loads");
+    let plan = plan::build(&cfg).await.expect("plan");
+    for platform in platforms::LAUNCH {
+        assert_eq!(
+            plan.status_of(&format!("contracts.{}", platform.contracts_key)),
+            Some(Status::Skipped)
+        );
+        assert_eq!(
+            plan.status_of(&format!("ceremony.{}.registration", platform.domain)),
+            Some(Status::Skipped)
+        );
+    }
+
+    // Declare one and re-apply: the verifier lands on the same chain, at
+    // its canonical address.
+    let first = deploy_circuit_stand_in(&anvil.endpoint(), ANVIL_KEY).await;
+    let declared_dir = dir.path().join("declared");
+    std::fs::create_dir_all(&declared_dir).expect("subdir");
+    let path = network_file_with_ceremony(&declared_dir, &anvil.endpoint(), first);
+    let summary = apply_with(&path, apply::Options::default()).await;
+    assert_eq!(summary.deployed.len(), platforms::LAUNCH.len());
+
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let x_proxy: Address = cfg.contracts.x_platform_verifier.parse().unwrap();
+    let x = ceremony::TlsPlatformVerifier::new(x_proxy, &provider);
+    assert_eq!(x.honkVerifier().call().await.unwrap(), first);
+
+    // Rotate: a new circuit release is a new artifact, and the pin follows
+    // the file without the proxy moving.
+    let second = deploy_circuit_stand_in(&anvil.endpoint(), ANVIL_KEY).await;
+    assert_ne!(first, second);
+    let rotated_dir = dir.path().join("rotated");
+    std::fs::create_dir_all(&rotated_dir).expect("subdir");
+    let rotated = network_file_with_ceremony(&rotated_dir, &anvil.endpoint(), second);
+
+    let rotated_cfg = NetworkConfig::load(&rotated).expect("config loads");
+    let drift = plan::build(&rotated_cfg)
+        .await
+        .expect("plan sees the pin drift");
+    assert_eq!(
+        drift.status_of("contracts.x_platform_verifier.trust_roots"),
+        Some(Status::Configure)
+    );
+    assert!(!drift.has_deploys(), "a rotation is not a redeploy");
+
+    let summary = apply_with(&rotated, apply::Options::default()).await;
+    assert!(summary.deployed.is_empty(), "{:?}", summary.deployed);
+    assert_eq!(x.honkVerifier().call().await.unwrap(), second);
+    assert_eq!(
+        x.honkVerifierCodehash().call().await.unwrap(),
+        keccak256(provider.get_code_at(second).await.unwrap())
+    );
+    // The proxy did not move: the registration still points at it.
+    assert_eq!(
+        CeremonyProofVerifier::new(
+            cfg.contracts.ceremony_proof_verifier.parse().unwrap(),
+            &provider
+        )
+        .verifierOf(
+            platforms::platform_id(platforms::X.domain),
+            LAUNCH_VERIFIER_VERSION
+        )
+        .call()
+        .await
+        .unwrap(),
+        x_proxy
+    );
+}
+
+/// A declared circuit verifier with no code is refused by name, before
+/// anything is deployed. A Platform Verifier pins its circuit by code hash,
+/// so an empty address could only produce a contract that verifies nothing.
+#[tokio::test]
+async fn a_circuit_verifier_without_code_is_refused_by_name() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = network_file_with_ceremony(
+        dir.path(),
+        &anvil.endpoint(),
+        Address::repeat_byte(0x42),
+    );
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
+    let err = apply::run(
+        &path,
+        &cfg,
+        &signer,
+        &apply::Options {
+            confirm_fresh_deploy: true,
+            dev: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("an empty circuit verifier is refused")
+    .to_string();
+    assert!(err.contains("circuit_verifier"), "got: {err}");
+    assert!(err.contains("NO CODE"), "got: {err}");
+
+    // The core stack still converged; only the verifiers were refused.
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let identity_names: Address = cfg.contracts.identity_names.parse().unwrap();
+    assert!(!provider
+        .get_code_at(identity_names)
+        .await
+        .unwrap()
+        .is_empty());
 }

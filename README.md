@@ -26,9 +26,10 @@ The model is DECLARATIVE:
    therefore use identical config data regardless of which chain (or how
    little of the stack) exists yet.
 
-All contract bytecode is embedded in the binary via the
-[`libid-contracts`](https://github.com/libid-org/libid-contracts) crate —
-there is no forge build and no artifact directory at runtime. The platform
+Contract bytecode is embedded in the binary: the core stack via the
+[`libid-contracts`](https://github.com/libid-org/libid-contracts) crate,
+the Platform Verifiers from `bin/libid-deploy/artifacts/` (see below).
+There is no forge build and no artifact directory at runtime. The platform
 tables come from `libid-identity` and `libid-profiles`, generated from the
 same sources the contracts are, so nothing here restates a value the chain
 also holds.
@@ -54,10 +55,78 @@ Four UUPS proxies, in dependency order — the order
    notarized session. It deploys **EMPTY**: point a keeper at it before
    Google names work, or every Google claim reverts `UntrustedModulus`.
 
-No Platform Verifier is registered by this tool. That needs the ceremony
-circuits' compiled artifacts and their code hashes, which arrive with their
-own release; until one is registered a platform owns its keyspace and can
-verify nothing, which is what the plan's `verifiesPlatform` line reports.
+Then one step `Deploy.s.sol` does not have:
+
+5. **A Platform Verifier per platform** — `XPlatformVerifier`,
+   `GitHubPlatformVerifier`, `GooglePlatformVerifier` — deployed behind its
+   own CREATE3 proxy and registered into the Supported Version Set with
+   `CeremonyProofVerifier.setVerifier(platformId, 1, verifier)`. Until that
+   registration lands, a platform owns a keyspace and can verify nothing:
+   `claim` reverts `UnknownVersion` and every resolver reverts
+   `UnknownPlatform`.
+
+## The Platform Verifiers
+
+### Where the bytecode comes from
+
+`libid-contracts` embeds compiled bytecode only for the contracts its
+`COVERED` list names, and the Platform Verifiers are not among them — its
+own `script/Deploy.s.sol` registers none either. This repository deploys
+them, so `scripts/vendor-platform-verifiers.sh` compiles them from the same
+tag the `libid-contracts` dependency comes from and commits the pruned
+artifacts under `bin/libid-deploy/artifacts/`. The tag is **derived from
+`Cargo.toml`**, never restated, so vendored bytecode and typed bindings
+cannot come from different releases; a unit test additionally checks every
+bound selector against the artifact's `methodIdentifiers`.
+
+Regenerate after moving the dependency:
+
+```sh
+scripts/vendor-platform-verifiers.sh                      # clones the pinned tag
+scripts/vendor-platform-verifiers.sh --contracts ../libid-contracts
+```
+
+The build is deterministic (`solc` pinned to 0.8.33, `via_ir`,
+`bytecode_hash = "none"`), so a regenerated artifact that differs from the
+committed one means the sources moved, not the build.
+
+### What this tool cannot supply: the circuit verifier
+
+`PlatformVerifierBase._setTrustRoots` pins the bb-generated UltraHonk
+verifier a platform's proofs are checked under **by address and by code
+hash**: it reads `address(honkVerifier_).codehash` and refuses a value that
+does not match the hash the caller named, refusing the zero and empty
+hashes outright. A bb verifier embeds its verification key as code
+constants and exposes no getter, so the code hash is the only handle on
+which circuit a deployed verifier answers for.
+
+Nothing can invent one. The operator declares the address:
+
+```toml
+[ceremony.x]
+circuit_verifier = "0x…"
+```
+
+and apply reads the code there, hashes it, and passes the hash — so a wrong
+address fails at deploy rather than at the first user's proof. Editing the
+address and re-applying is the rotation path (`setTrustRoots`); the proxy
+does not move, so the registration survives.
+
+A platform with no `[ceremony]` section gets no Platform Verifier. That is
+a state the chain reports honestly through `verifiesPlatform`, and the plan
+prints it as `skipped` with the reason. Nothing is substituted to fill the
+gap: a verifier registered against a circuit nobody proved would accept
+proofs of a statement nobody made.
+
+**The ceremony circuits are not released yet.** `libid-circuits` v0.3.0
+ships the *login* circuits (`jwt_email`, `dyaka-noir-token`), which prove
+different statements; the ceremony ones (`bearer-link`, serving X and
+GitHub, and `oidc-google`) exist only on that repository's unmerged
+`feat/ceremony-circuits` branch — no release, no verification key, no
+generated Solidity verifier. Until such a release exists and
+`libid-contracts` reproduces a verifier from it, `[ceremony]` stays
+commented out in the committed network files and no Platform Verifier is
+deployed.
 
 ## Factory-first deterministic addresses
 
@@ -82,6 +151,9 @@ entry = a NEW address, forever, on every network — names are frozen:
 | `contracts.ceremony_proof_verifier` | `libid.CeremonyProofVerifier` | `0x76bdc18f21c2db0ff796c7cc50348528b2899275` |
 | `contracts.identity_names` | `libid.IdentityNames` | `0xd467d48769c26faee36ba6b6fc9228f14aef6dd2` |
 | `contracts.google_jwt_roots` | `libid.GoogleJwtRoots` | `0xb7a2ce28e71dbb9c877d2b5a48de33b5f0e6838d` |
+| `contracts.x_platform_verifier` | `libid.XPlatformVerifier` | `0xcfc880f62f2744dc000687edf47a98b585d9eb35` |
+| `contracts.github_platform_verifier` | `libid.GitHubPlatformVerifier` | `0xac878389da7a1b58826182da0d8b4cae5e6e4178` |
+| `contracts.google_platform_verifier` | `libid.GooglePlatformVerifier` | `0xf3d537022362d187715b28bc547f8b2532e6d0cf` |
 
 Implementations stay plain CREATE deploys: their addresses are referenced
 by a proxy slot, not canonical, and upgrades replace them **without moving
@@ -123,7 +195,8 @@ only secret in the flow is the KMS key, which never leaves AWS.
 | `[aws]` | input | `region`, `kms_deployer` (key id / `alias/...` / ARN; the default signer) |
 | `[accounts]` | input | `notary` (the notary **signer** — see below), `owner` (the operational owner the factory ends up with; empty = the deployer) — addresses of **keys**, not contracts |
 | `[notary_service]` | input | `fee_wei` — what one attestation verification costs, as a decimal string |
-| `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_names`, `google_jwt_roots` — always present, pre-filled with the canonical table, validated against the prediction |
+| `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_names`, `google_jwt_roots`, `x_platform_verifier`, `github_platform_verifier`, `google_platform_verifier` — always present, pre-filled with the canonical table, validated against the prediction |
+| `[ceremony.<platform>]` | input | `circuit_verifier` — the deployed UltraHonk verifier for that platform's ceremony circuit. Absent = no Platform Verifier for that platform |
 
 The `[accounts].owner` flow: the factory's genesis owner is the libID
 deployer KMS address baked into its frozen init code. `apply` needs factory
@@ -168,6 +241,10 @@ Declared-address semantics:
   getter for a platform's rules, so writing them is the only way to
   converge on what the generated table says; the call is owner-only and
   idempotent.
+- A `[ceremony]` key that names no launch platform, or a
+  `circuit_verifier` that is empty or zero, is a validation error. A
+  declared address with **no code on-chain** is a plan WARN and an apply
+  hard error, by name.
 
 ## Running locally
 
@@ -194,9 +271,10 @@ environment). An all-hex value of the wrong length is rejected as a mangled
 key rather than shipped to AWS.
 
 Upgrade components: `notary-service`, `proof-verifier`, `identity-names`,
-`google-jwt-roots`. Each is a UUPS `upgradeToAndCall`: the entry address,
-its storage and its owner all survive, so an upgrade never moves a
-canonical address.
+`google-jwt-roots`, `x-platform-verifier`, `github-platform-verifier`,
+`google-platform-verifier`. Each is a UUPS `upgradeToAndCall`: the entry
+address, its storage and its owner all survive, so an upgrade never moves a
+canonical address and never disturbs a registration.
 
 For anvil rehearsal, `apply --dev` (or just letting apply detect anvil)
 covers the factory-ownership wrinkle: the local signer is not the baked
@@ -235,7 +313,8 @@ demand reviewers.
 
 Copy `networks/mainnet.toml.example` — it ships FULLY pre-filled with the
 canonical address table, which is valid on every EVM network — fill the
-input keys (chain, RPC, AWS, accounts, Notary Fee), add the name to the
+input keys (chain, RPC, AWS, accounts, Notary Fee, and `[ceremony]` once
+the circuit verifiers exist on that chain), add the name to the
 `network` choice list in `apply.yml`, and run the workflow with `mode:
 plan` first. The first apply on a virgin network needs
 `confirm_fresh_deploy`.
@@ -258,6 +337,10 @@ workflow's default `source: release` consumes the newest x86_64 asset.
   the critical declarative cycle — pre-filled file → fresh apply on a
   virgin anvil lands everything AT the declared addresses → second apply is
   a no-op without any flag → the file is BYTE-IDENTICAL throughout — plus
-  drift repair and the network-invariance proof: two separate bare anvils
-  converge onto the same declared canonical addresses.
+  drift repair, the Platform Verifier deploy/register/rotate path, and the
+  network-invariance proof: two separate bare anvils converge onto the same
+  declared canonical addresses. The circuit verifier those tests pin is a
+  stand-in contract: what a deploy requires of one is that it HAS code
+  whose hash matches, so the wiring is exercised exactly while nothing
+  pretends to verify a real proof.
 - Every commit must be signed off (`git commit -s`); see CONTRIBUTING.md.

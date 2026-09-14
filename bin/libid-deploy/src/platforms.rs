@@ -1,5 +1,6 @@
 //! The launch platform table: what `IdentityNames.setPlatform` writes for
-//! each keyspace.
+//! each keyspace, and what each platform's Platform Verifier is
+//! initialized with.
 //!
 //! Nothing here is retyped. The platform domains and normalization rules
 //! come from `libid-identity`'s generated table — the same one Solidity and
@@ -18,6 +19,37 @@ use libid_identity::{
 };
 use libid_profiles as profiles;
 
+use crate::names;
+
+/// The verifier version the launch profile is registered under.
+///
+/// This is the Proof Verifier's routing slot for a platform — this chain's
+/// slot number, NOT the ceremony version baked into the verifier's code.
+/// The launch profiles are `x/v1`, `github/v1` and `google/v1`, so the
+/// launch deployment takes slot one; a later profile is registered into a
+/// new slot by governance, which is a `setVerifier` call and not a deploy.
+pub const LAUNCH_VERIFIER_VERSION: u16 = 1;
+
+/// How a platform's Platform Verifier is initialized — the shape differs
+/// with what the profile notarizes.
+#[derive(Debug, Clone, Copy)]
+pub enum VerifierKind {
+    /// A TLSNotary profile: two notarized sessions, so the verifier holds
+    /// the Notary Service, a proof lifetime and an attestation skew.
+    TlsNotary {
+        /// Maximum age of this platform's token attestation, in seconds.
+        proof_lifetime: u64,
+        /// Maximum lead over block time an attestation may carry.
+        max_future_attestation_skew: u64,
+    },
+    /// Google's: a signed JWT checked against Google's published keys. It
+    /// notarizes nothing, so the verifier must hold NO Notary Service —
+    /// `PlatformVerifierBase` rejects one for a profile whose attestation
+    /// count is zero — and no attestation window; the signed `exp` is the
+    /// whole validity ceiling. It reads the JWT root list instead.
+    GoogleJwt,
+}
+
 /// One launch platform.
 #[derive(Debug, Clone)]
 pub struct Platform {
@@ -28,6 +60,16 @@ pub struct Platform {
     pub domain: &'static str,
     /// The normalization rules `setPlatform` stores.
     pub rules: IdentityNames::Rules,
+    /// How far ahead of block time this profile's evidence time may run.
+    pub future_observation_allowance: u64,
+    /// How its Platform Verifier initializes.
+    pub kind: VerifierKind,
+    /// The `[contracts]` key holding its Platform Verifier proxy address.
+    pub contracts_key: &'static str,
+    /// The canonical CREATE3 name of that proxy.
+    pub canonical_name: &'static str,
+    /// The vendored contract the proxy points at.
+    pub contract: &'static str,
 }
 
 /// Widen a generated rule table into the contract's struct. `const` so a
@@ -48,6 +90,14 @@ pub const X: Platform = Platform {
     label: "X",
     domain: vectors::PLATFORM_X_DOMAIN,
     rules: on_chain_rules(Rules::X),
+    future_observation_allowance: vectors::FUTURE_ALLOWANCE_X,
+    kind: VerifierKind::TlsNotary {
+        proof_lifetime: profiles::PROOF_LIFETIME_SECONDS_X,
+        max_future_attestation_skew: profiles::MAX_FUTURE_ATTESTATION_SKEW_SECONDS,
+    },
+    contracts_key: "x_platform_verifier",
+    canonical_name: names::X_PLATFORM_VERIFIER,
+    contract: "XPlatformVerifier",
 };
 
 /// GitHub: letters, digits and hyphen.
@@ -55,13 +105,28 @@ pub const GITHUB: Platform = Platform {
     label: "GitHub",
     domain: vectors::PLATFORM_GITHUB_DOMAIN,
     rules: on_chain_rules(Rules::GITHUB),
+    future_observation_allowance: vectors::FUTURE_ALLOWANCE_GITHUB,
+    kind: VerifierKind::TlsNotary {
+        proof_lifetime: profiles::PROOF_LIFETIME_SECONDS_GITHUB,
+        max_future_attestation_skew: profiles::MAX_FUTURE_ATTESTATION_SKEW_SECONDS,
+    },
+    contracts_key: "github_platform_verifier",
+    canonical_name: names::GITHUB_PLATFORM_VERIFIER,
+    contract: "GitHubPlatformVerifier",
 };
 
-/// Google: an email address, used exactly as proved.
+/// Google: an email address, used exactly as proved. The OIDC circuit
+/// exposes no `iat`, so the evidence time is the token's `exp` — about an
+/// hour ahead of the moment it describes, hence the larger allowance.
 pub const GOOGLE: Platform = Platform {
     label: "Google",
     domain: vectors::PLATFORM_GOOGLE_DOMAIN,
     rules: on_chain_rules(Rules::GOOGLE),
+    future_observation_allowance: vectors::FUTURE_ALLOWANCE_GOOGLE,
+    kind: VerifierKind::GoogleJwt,
+    contracts_key: "google_platform_verifier",
+    canonical_name: names::GOOGLE_PLATFORM_VERIFIER,
+    contract: "GooglePlatformVerifier",
 };
 
 /// The closed launch list, in deploy order. A platform outside it has no
@@ -78,10 +143,25 @@ pub fn platform_id(domain: &str) -> FixedBytes<32> {
     keccak256(domain.as_bytes())
 }
 
-// The launch list is the profile table's launch list, and the generated
-// widths fit the contract's. Checked where a mistake cannot run.
+// The verifier shape is a property of the profile, not a choice made here:
+// `PlatformVerifierBase._setTrustRoots` rejects a Notary Service on a
+// profile that notarizes nothing, and rejects its absence on one that does.
+// Checked where a mistake cannot run.
 const _: () = {
     assert!(profiles::LAUNCH.len() == LAUNCH.len());
+    assert!(matches!(X.kind, VerifierKind::TlsNotary { .. }));
+    assert!(profiles::X.attestation_count() == 2);
+    assert!(matches!(GITHUB.kind, VerifierKind::TlsNotary { .. }));
+    assert!(profiles::GITHUB.attestation_count() == 2);
+    assert!(matches!(GOOGLE.kind, VerifierKind::GoogleJwt));
+    assert!(profiles::GOOGLE.attestation_count() == 0);
+    // The launch slot is the launch profile's own version. They are
+    // different numbers for different jobs and happen to agree at launch;
+    // a profile bump that left this behind would register a `v2` verifier
+    // in the `v1` slot.
+    assert!(profiles::X.ceremony_version == LAUNCH_VERIFIER_VERSION);
+    assert!(profiles::GITHUB.ceremony_version == LAUNCH_VERIFIER_VERSION);
+    assert!(profiles::GOOGLE.ceremony_version == LAUNCH_VERIFIER_VERSION);
     assert!(Rules::X.max_length <= u16::MAX as usize);
     assert!(Rules::GITHUB.max_length <= u16::MAX as usize);
     assert!(Rules::GOOGLE.max_length <= u16::MAX as usize);
@@ -129,5 +209,20 @@ mod tests {
             );
         }
         assert!(by_domain("discord").is_none());
+    }
+
+    /// Every platform's Platform Verifier is a canonical contract with its
+    /// own name and its own `[contracts]` key.
+    #[test]
+    fn every_platform_verifier_is_canonical() {
+        for platform in LAUNCH {
+            assert_eq!(
+                names::canonical_name(platform.contracts_key),
+                Some(platform.canonical_name),
+                "{} is not in the canonical table",
+                platform.label
+            );
+            assert!(crate::ceremony::creation_code(platform.contract).is_ok());
+        }
     }
 }

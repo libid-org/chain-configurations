@@ -10,7 +10,10 @@
 //! records against the config to surface drift.
 
 use alloy::{
-    primitives::Address,
+    primitives::{
+        keccak256,
+        Address,
+    },
     providers::{
         Provider,
         ProviderBuilder,
@@ -23,6 +26,7 @@ use anyhow::{
 use libid_contracts::{
     bindings::{
         ceremony::{
+            CeremonyProofVerifier,
             GoogleJwtRoots,
             NotaryService,
         },
@@ -39,12 +43,17 @@ use libid_contracts::{
 use serde::Serialize;
 
 use crate::{
+    ceremony,
     config::{
         required_address,
         NetworkConfig,
     },
     names,
-    platforms,
+    platforms::{
+        self,
+        Platform,
+        LAUNCH_VERIFIER_VERSION,
+    },
 };
 
 /// What a plan concluded about one component.
@@ -256,7 +265,7 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
         &cfg.contracts.ceremony_proof_verifier,
         "contracts.ceremony_proof_verifier",
     )?;
-    check_code(
+    let proof_verifier_present = check_code(
         &mut b,
         &provider,
         "contracts.ceremony_proof_verifier",
@@ -302,6 +311,19 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
         check_code(&mut b, &provider, "contracts.google_jwt_roots", jwt_roots).await?;
     if jwt_roots_present {
         plan_jwt_roots(&mut b, &provider, jwt_roots, notary_service).await;
+    }
+
+    // ── The Platform Verifiers ───────────────────────────────────────────
+    for platform in platforms::LAUNCH {
+        plan_platform_verifier(
+            &mut b,
+            &provider,
+            cfg,
+            platform,
+            proof_verifier,
+            proof_verifier_present,
+        )
+        .await?;
     }
 
     // ── Factory bookkeeping ──────────────────────────────────────────────
@@ -455,6 +477,131 @@ async fn plan_jwt_roots<P: Provider>(
             format!("needsRotation read failed: {e}"),
         ),
     }
+}
+
+/// One platform's Platform Verifier: whether it is declared at all,
+/// whether the circuit verifier it would pin exists, and whether it is
+/// registered in the Supported Version Set.
+async fn plan_platform_verifier<P: Provider>(
+    b: &mut Builder,
+    provider: &P,
+    cfg: &NetworkConfig,
+    platform: &Platform,
+    proof_verifier: Address,
+    proof_verifier_present: bool,
+) -> Result<()> {
+    let component = format!("contracts.{}", platform.contracts_key);
+    let registration = format!("ceremony.{}.registration", platform.domain);
+    let Some(declaration) = cfg.ceremony_for(platform) else {
+        b.push(
+            &component,
+            Status::Skipped,
+            format!(
+                "no [ceremony.{}] — the platform owns its keyspace and verifies \
+                 nothing",
+                platform.domain
+            ),
+        );
+        b.push(&registration, Status::Skipped, "no verifier to register");
+        return Ok(());
+    };
+
+    let proxy = required_address(
+        cfg.contracts.raw(platform.contracts_key).ok_or_else(|| {
+            anyhow!("{} is not a canonical contract", platform.contracts_key)
+        })?,
+        &component,
+    )?;
+    let circuit = declaration.circuit_verifier_address(platform.domain)?;
+    let circuit_code = provider
+        .get_code_at(circuit)
+        .await
+        .map_err(|e| anyhow!("get_code({circuit:#x}) failed: {e}"))?;
+    if circuit_code.is_empty() {
+        // apply hard-errors on this rather than deploying a verifier that
+        // pins nothing, so the plan says so before anyone runs it.
+        b.push(
+            format!("ceremony.{}.circuit_verifier", platform.domain),
+            Status::Warn,
+            format!(
+                "{circuit:#x} has NO CODE — apply would refuse: a Platform Verifier \
+                 pins its circuit verifier by code hash"
+            ),
+        );
+    } else {
+        b.push(
+            format!("ceremony.{}.circuit_verifier", platform.domain),
+            Status::Ok,
+            format!("{circuit:#x} (codehash {:#x})", keccak256(&circuit_code)),
+        );
+    }
+
+    let present = check_code(b, provider, &component, proxy).await?;
+    if present && !circuit_code.is_empty() {
+        let verifier = ceremony::TlsPlatformVerifier::new(proxy, provider);
+        let wired = verifier.honkVerifier().call().await;
+        let wired_hash = verifier.honkVerifierCodehash().call().await;
+        match (wired, wired_hash) {
+            (Ok(addr), Ok(hash))
+                if addr == circuit && hash == keccak256(&circuit_code) =>
+            {
+                b.push(
+                    format!("{component}.trust_roots"),
+                    Status::Ok,
+                    format!("pins {addr:#x}"),
+                );
+            }
+            (Ok(addr), Ok(_)) => b.push(
+                format!("{component}.trust_roots"),
+                Status::Configure,
+                format!(
+                    "pins {addr:#x}, file declares {circuit:#x} — apply sends \
+                     setTrustRoots"
+                ),
+            ),
+            _ => b.push(
+                format!("{component}.trust_roots"),
+                Status::Warn,
+                "trust-root read failed",
+            ),
+        }
+    }
+
+    if !proof_verifier_present {
+        b.push(
+            &registration,
+            Status::Deploy,
+            "the Proof Verifier does not exist yet",
+        );
+        return Ok(());
+    }
+    let platform_id = platforms::platform_id(platform.domain);
+    match CeremonyProofVerifier::new(proof_verifier, provider)
+        .verifierOf(platform_id, LAUNCH_VERIFIER_VERSION)
+        .call()
+        .await
+    {
+        Ok(addr) if addr == proxy => b.push(
+            &registration,
+            Status::Ok,
+            format!("v{LAUNCH_VERIFIER_VERSION} -> {addr:#x}"),
+        ),
+        Ok(addr) if addr == Address::ZERO => b.push(
+            &registration,
+            Status::Configure,
+            format!(
+                "nothing registered for v{LAUNCH_VERIFIER_VERSION} — apply sends \
+                 setVerifier({proxy:#x})"
+            ),
+        ),
+        Ok(addr) => b.push(
+            &registration,
+            Status::Configure,
+            format!("v{LAUNCH_VERIFIER_VERSION} points at {addr:#x}, file declares {proxy:#x}"),
+        ),
+        Err(e) => b.push(&registration, Status::Warn, format!("verifierOf read failed: {e}")),
+    }
+    Ok(())
 }
 
 /// Diff the factory's own `deployedAt` records against the declared table.

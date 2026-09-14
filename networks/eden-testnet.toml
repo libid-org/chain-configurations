@@ -69,3 +69,32 @@ identity_names = "0xd467d48769c26faee36ba6b6fc9228f14aef6dd2"
 # the keeper hourly; the first tick has to be run deliberately, right after this
 # apply.
 google_jwt_roots = "0xb7a2ce28e71dbb9c877d2b5a48de33b5f0e6838d"
+x_platform_verifier = "0xcfc880f62f2744dc000687edf47a98b585d9eb35"
+github_platform_verifier = "0xac878389da7a1b58826182da0d8b4cae5e6e4178"
+google_platform_verifier = "0xf3d537022362d187715b28bc547f8b2532e6d0cf"
+
+# INPUT: the ceremony circuit verifier each platform's proofs are made under.
+#
+# A Platform Verifier pins its bb-generated UltraHonk verifier by ADDRESS and by
+# CODE HASH: it reads the code at the address and refuses a hash that does not
+# match, because such a verifier embeds its verification key as code constants
+# and exposes no getter. `apply` therefore reads the code hash off the chain —
+# only the address belongs here.
+#
+# A platform with no section below gets NO Platform Verifier: it owns its
+# keyspace and can verify nothing, which is what `verifiesPlatform` reports.
+# Nothing is invented to fill the gap; a verifier registered against a circuit
+# nobody proved would accept proofs of a statement nobody made.
+#
+# Deploy the verifiers from a libid-circuits release first, then uncomment and
+# fill these. Editing an address afterwards is the rotation path: apply sends
+# `setTrustRoots`.
+#
+# [ceremony.x]
+# circuit_verifier = ""
+#
+# [ceremony.github]
+# circuit_verifier = ""
+#
+# [ceremony.google]
+# circuit_verifier = ""

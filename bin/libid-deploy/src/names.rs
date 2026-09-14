@@ -34,6 +34,12 @@ pub const CEREMONY_PROOF_VERIFIER: &str = "libid.CeremonyProofVerifier";
 pub const IDENTITY_NAMES: &str = "libid.IdentityNames";
 /// The Google JWT root list proxy, read by the Google Platform Verifier.
 pub const GOOGLE_JWT_ROOTS: &str = "libid.GoogleJwtRoots";
+/// The `x/v1` Platform Verifier proxy.
+pub const X_PLATFORM_VERIFIER: &str = "libid.XPlatformVerifier";
+/// The `github/v1` Platform Verifier proxy.
+pub const GITHUB_PLATFORM_VERIFIER: &str = "libid.GitHubPlatformVerifier";
+/// The `google/v1` Platform Verifier proxy.
+pub const GOOGLE_PLATFORM_VERIFIER: &str = "libid.GooglePlatformVerifier";
 
 /// Every canonical contract, in deploy order.
 pub const CANONICAL_CONTRACTS: &[CanonicalContract] = &[
@@ -52,6 +58,18 @@ pub const CANONICAL_CONTRACTS: &[CanonicalContract] = &[
     CanonicalContract {
         key: "google_jwt_roots",
         name: GOOGLE_JWT_ROOTS,
+    },
+    CanonicalContract {
+        key: "x_platform_verifier",
+        name: X_PLATFORM_VERIFIER,
+    },
+    CanonicalContract {
+        key: "github_platform_verifier",
+        name: GITHUB_PLATFORM_VERIFIER,
+    },
+    CanonicalContract {
+        key: "google_platform_verifier",
+        name: GOOGLE_PLATFORM_VERIFIER,
     },
 ];
 
