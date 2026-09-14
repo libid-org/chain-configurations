@@ -36,9 +36,10 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Rust: formatting, clippy, tests. The integration tests spawn `anvil`
-  # (installed with the foundry toolchain) and run the full deploy cycle
-  # against it from the embedded artifacts — no forge build needed here.
+  # Rust: vendored artifacts, formatting, clippy, tests. The embedded
+  # artifacts are generated from the pins first (gitignored, never
+  # committed), and the integration tests spawn `anvil` (installed with the
+  # foundry toolchain) and run the full deploy cycle against it.
   # ---------------------------------------------------------------------------
   rust:
     name: Rust
@@ -47,9 +48,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+      # Before any cargo step: `include_str!` embeds the artifacts at compile
+      # time, so without them every cargo command fails at macro expansion.
+      # Cached on the pins — a PR that moved neither skips the clone and the
+      # forge build.
+      - uses: ./.github/actions/vendor-artifacts
         with:
-          version: ${{ env.FOUNDRY_VERSION }}
+          foundry-version: ${{ env.FOUNDRY_VERSION }}
+          cache-artifacts: "true"
 
       # Nightly first, stable second: this action makes the LAST toolchain it
       # installs the default, and everything except `cargo +nightly fmt` must

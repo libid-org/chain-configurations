@@ -58,6 +58,9 @@ permissions:
   contents: read # checkout only — apply never writes the network file back
   id-token: write # required to mint the OIDC token AWS exchanges for a role
 
+env:
+  FOUNDRY_VERSION: v1.7.1
+
 jobs:
   apply:
     name: ${{ inputs.network }} (${{ inputs.mode }})
@@ -109,6 +112,13 @@ jobs:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: inputs.source == 'branch'
+      # The embedded artifacts are generated, never committed, and this
+      # binary sends transactions: regenerate from the pins, uncached. Also
+      # installs foundry, so the `cast` step below is release-only.
+      - uses: ./.github/actions/vendor-artifacts
+        if: inputs.source == 'branch'
+        with:
+          foundry-version: ${{ env.FOUNDRY_VERSION }}
       - name: Build libid-deploy from this branch
         if: inputs.source == 'branch'
         run: |
@@ -125,9 +135,11 @@ jobs:
           aws-region: ${{ steps.cfg.outputs.aws_region }}
 
       # `cast` derives the deployer address from the KMS public key below.
+      # A branch build installed foundry while vendoring its artifacts.
       - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        if: inputs.source == 'release'
         with:
-          version: v1.7.1
+          version: ${{ env.FOUNDRY_VERSION }}
 
       # Proves the role can actually sign with this key, and prints the
       # address that will own the contracts. Doing this BEFORE any

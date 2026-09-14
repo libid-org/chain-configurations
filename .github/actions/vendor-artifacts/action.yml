@@ -1,0 +1,112 @@
+# Install the toolchain and generate every compiled artifact the crate embeds.
+#
+# `bin/libid-deploy/artifacts/` is gitignored: `scripts/vendor-artifacts.sh`
+# produces it from the two pins (the libid-contracts tag in Cargo.toml and the
+# libid-circuits release manifest) with the toolchain those pins name, so the
+# bytes a binary embeds are a function of the pins alone, never of what a
+# checkout happens to carry. Every job that runs cargo runs this first, the
+# way libid-contracts regenerates its own vendored artifacts.
+#
+# Two caches:
+#   ~/.bb                       the bb release the circuits manifest names,
+#                               keyed on that version.
+#   bin/libid-deploy/artifacts  the OUTPUT, keyed on every input — the two
+#                               pins (the manifest carries the bb pin and the
+#                               per-asset sha256), the script, the foundry
+#                               version. Opt-in: a PR that moved none of them
+#                               skips the clone and the forge build; a job
+#                               that produces a binary a chain will see
+#                               (release, apply from a branch) regenerates
+#                               from source every time.
+name: vendor-artifacts
+description: Install Foundry and bb, then generate bin/libid-deploy/artifacts from the pinned releases.
+
+inputs:
+  foundry-version:
+    description: Foundry release to install (the workflow's FOUNDRY_VERSION).
+    required: true
+  cache-artifacts:
+    description: Restore the generated artifacts from the cache when no input changed.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    # forge compiles the artifacts; anvil and cast ride along for the jobs
+    # that spawn or query a chain.
+    - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+      with:
+        version: ${{ inputs.foundry-version }}
+
+    # Both pins are DERIVED, never restated: only the bb that wrote a vk
+    # reproduces its verifier, and the manifest is where that version lives.
+    - name: Read the pins
+      id: pins
+      shell: bash
+      run: |
+        set -euo pipefail
+        bb="$(jq -r '.toolchain.bb' bin/libid-deploy/circuits-manifest.json)"
+        [ -n "$bb" ] && [ "$bb" != "null" ] \
+          || { echo "::error::no toolchain.bb in circuits-manifest.json"; exit 1; }
+        contracts="$(sed -n 's/^libid-contracts = "\(.*\)"$/\1/p' bin/libid-deploy/Cargo.toml)"
+        [ -n "$contracts" ] \
+          || { echo "::error::no libid-contracts pin in bin/libid-deploy/Cargo.toml"; exit 1; }
+        echo "bb=$bb" >> "$GITHUB_OUTPUT"
+        echo "contracts=$contracts" >> "$GITHUB_OUTPUT"
+
+    - name: Restore bb
+      id: bb-cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.bb
+        key: bb-${{ runner.os }}-${{ runner.arch }}-${{ steps.pins.outputs.bb }}
+
+    - name: Install bb (pinned)
+      if: steps.bb-cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        BB_VERSION: ${{ steps.pins.outputs.bb }}
+      run: |
+        set -euo pipefail
+        curl -fsSL https://raw.githubusercontent.com/AztecProtocol/aztec-packages/master/barretenberg/bbup/install | bash
+        "$HOME/.bb/bbup" --version "$BB_VERSION"
+
+    # The install puts nothing on the persistent PATH and is skipped on a
+    # cache hit, so this runs unconditionally; the check proves the restored
+    # binary is the pinned one before anything depends on it.
+    - name: Put bb on PATH
+      shell: bash
+      env:
+        BB_VERSION: ${{ steps.pins.outputs.bb }}
+      run: |
+        set -euo pipefail
+        echo "$HOME/.bb" >> "$GITHUB_PATH"
+        [ "$("$HOME/.bb/bb" --version | tail -1)" = "$BB_VERSION" ]
+
+    - name: Restore the generated artifacts
+      if: inputs.cache-artifacts == 'true'
+      id: artifacts-cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: bin/libid-deploy/artifacts
+        key: vendored-${{ runner.os }}-contracts-${{ steps.pins.outputs.contracts }}-foundry-${{ inputs.foundry-version }}-${{ hashFiles('bin/libid-deploy/circuits-manifest.json', 'scripts/vendor-artifacts.sh') }}
+
+    - name: Vendor artifacts
+      if: steps.artifacts-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: scripts/vendor-artifacts.sh
+
+    # One line per embedded file, in the log and the run summary, so what a
+    # given run compiled in can be read off it and compared across runs.
+    - name: What the binary embeds
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd bin/libid-deploy/artifacts
+        {
+          echo '### Vendored artifacts'
+          echo '```'
+          find . -name '*.json' | sort | xargs shasum -a 256
+          echo '```'
+        } | tee -a "$GITHUB_STEP_SUMMARY"
