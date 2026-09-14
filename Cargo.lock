@@ -3284,9 +3284,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libid-contracts"
-version = "0.6.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be42e6b2836d626be1897180bb9b13622e090b528cba5e9bc60cf695fff296b6"
+checksum = "8580e927cfd1de5a8072e88853f6bf923fe15795bd622bb4861e3f2d4594e18b"
 dependencies = [
  "alloy",
  "include_dir",
@@ -3298,7 +3298,7 @@ dependencies = [
 
 [[package]]
 name = "libid-deploy"
-version = "0.6.0"
+version = "0.10.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -3306,6 +3306,8 @@ dependencies = [
  "aws-sdk-kms",
  "clap",
  "libid-contracts",
+ "libid-identity",
+ "libid-profiles",
  "serde",
  "serde_json",
  "tempfile",
@@ -3315,6 +3317,18 @@ dependencies = [
  "tracing-subscriber",
  "url",
 ]
+
+[[package]]
+name = "libid-identity"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e2218d0a04555a2cb962465660dd7981d4a462ac1aac27e347414084c7762fc"
+
+[[package]]
+name = "libid-profiles"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b500f5875925c4bce39377730a0ffc8f66dd4d623fc7c1555411b48b2076530e"
 
 [[package]]
 name = "libm"

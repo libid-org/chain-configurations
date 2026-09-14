@@ -63,7 +63,9 @@ enum Command {
         #[arg(long)]
         signer: Option<String>,
         /// Comma-separated components to explicitly upgrade:
-        /// registry, wallet-factory, notary, bank, oidc-verifier.
+        /// notary-service, proof-verifier, identity-names,
+        /// google-jwt-roots. Each is a UUPS proxy; the entry address, its
+        /// storage and its owner all survive.
         #[arg(long, value_delimiter = ',')]
         upgrade: Vec<apply::Upgrade>,
         /// Proceed without the interactive confirmation prompt.
@@ -96,15 +98,11 @@ async fn main() -> Result<()> {
         Command::Validate { network, check_rpc } => {
             let cfg = NetworkConfig::load(&network)?;
             println!(
-                "{} parses and validates (network {}, chain {}, {} addresses)",
+                "{} parses and validates (network {}, chain {}, canonical \
+                 addresses)",
                 network.display(),
                 cfg.network.name,
-                cfg.network.chain_id,
-                if cfg.network.legacy_addresses {
-                    "legacy"
-                } else {
-                    "canonical"
-                }
+                cfg.network.chain_id
             );
             if check_rpc {
                 let built = plan::build(&cfg).await?;

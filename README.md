@@ -1,10 +1,10 @@
 # chain-configurations
 
-Desired-state configuration for the libid contract stack, one file per
+Desired-state configuration for the libid identity stack, one file per
 network, plus the `libid-deploy` binary and the GitHub Actions that apply a
 file to its chain with an AWS KMS signer.
 
-The model is DECLARATIVE (0.4.0):
+The model is DECLARATIVE:
 
 1. `networks/<name>.toml` declares what should exist on a chain — including
    **every address, pre-filled up front**. Canonical contracts live at
@@ -14,8 +14,7 @@ The model is DECLARATIVE (0.4.0):
    name)`, naming the expected value.
 2. Deployed-vs-not is determined from **chain state** (`eth_getCode` at the
    declared address / the factory's `deployedAt` record) — never from
-   config emptiness. The old "empty = not deployed" convention is dead on
-   declarative files.
+   config emptiness.
 3. `libid-deploy plan` compares the declarations with the chain, read-only:
    each component is "declared + present" (ok) or "declared + missing"
    (DEPLOY — apply would put it at exactly the declared address). A wrong
@@ -29,13 +28,38 @@ The model is DECLARATIVE (0.4.0):
 
 All contract bytecode is embedded in the binary via the
 [`libid-contracts`](https://github.com/libid-org/libid-contracts) crate —
-there is no forge build and no artifact directory at runtime.
+there is no forge build and no artifact directory at runtime. The platform
+tables come from `libid-identity` and `libid-profiles`, generated from the
+same sources the contracts are, so nothing here restates a value the chain
+also holds.
 
-> The generated UltraHonk circuit verifiers exceed the EIP-170 code-size
-> limit. Target chains must allow big code (Eden does — they are deployed
-> there today). Local rehearsal needs `anvil --disable-code-size-limit`.
+## The stack
 
-## Factory-first deterministic addresses (libid-contracts 0.3.0)
+Four UUPS proxies, in dependency order — the order
+`libid-contracts`' own `script/Deploy.s.sol` uses:
+
+1. **NotaryService** — the ONE place a notary attestation is
+   authenticated. It derives the digest from the attested bytes itself and
+   charges the Notary Fee. Deployed first so its proxy address can be
+   wired into every consumer's `initialize`.
+2. **CeremonyProofVerifier** — the Supported Version Set: which Platform
+   Verifier answers for a `(platformId, verifierVersion)` pair. Without it
+   the naming system's `proofVerifier` reads zero and every resolver
+   reverts.
+3. **IdentityNames** — the naming system, pointed at the Proof Verifier
+   and given a keyspace per platform (`x`, `github`, `google`). The
+   normalization rules come from `libid-identity`'s generated table.
+4. **GoogleJwtRoots** — the Google signing keys the `google/v1` Platform
+   Verifier trusts, verified through the Notary Service like any other
+   notarized session. It deploys **EMPTY**: point a keeper at it before
+   Google names work, or every Google claim reverts `UntrustedModulus`.
+
+No Platform Verifier is registered by this tool. That needs the ceremony
+circuits' compiled artifacts and their code hashes, which arrive with their
+own release; until one is registered a platform owns its keyspace and can
+verify nothing, which is what the plan's `verifiesPlatform` line reports.
+
+## Factory-first deterministic addresses
 
 Every top-level (entry) contract deploys THROUGH the deterministic
 `LibidFactory` via CREATE3, with `salt = keccak256(name)` for a fixed
@@ -54,22 +78,14 @@ entry = a NEW address, forever, on every network — names are frozen:
 | Config key | Canonical name | Address (every network) |
 |---|---|---|
 | `contracts.factory` | — (CREATE2, frozen init code) | `0xa92244c3f4462aad08bd1a33c3940b9b936321ad` |
-| `contracts.notary` | `libid.Notary` | `0x4bddfe9fb875d03838e5013c338e2dea9dcc2fc5` |
-| `contracts.wallet_factory` | `libid.WalletFactory` | `0x945b8a7a480a2552ec3c61c24d4363c9558107a8` |
-| `contracts.registry` | `libid.Registry` | `0x03c2b8d5f4d5cf7b7f81f876035046e262c4c9c9` |
-| `contracts.bank` | `libid.Bank` | `0x060708036a9ee89c6513346abab0929427bc9b06` |
-| `contracts.x_zk_verifier` | `libid.XZkVerifier` | `0xf8ddccfebfefdc5cbae308f0aac9a12e275eda5f` |
-| `contracts.google_oidc_verifier` | `libid.GoogleOidcVerifier` | `0xef53a51e3a46e5f82248a39ddff0b7b901ab438c` |
-| `identity.identity_names` | `libid.IdentityNames` | `0xd467d48769c26faee36ba6b6fc9228f14aef6dd2` |
-| `identity.github_identity_verifier` | `libid.GitHubIdentityVerifier` | `0x936067c1b5d77c67358210e77f664382191d2015` |
-| `identity.x_identity_verifier` | `libid.XIdentityVerifier` | `0xda66811e494a918e9ae0e5797206fca04333c055` |
-| `identity.google_identity_verifier` | `libid.GoogleIdentityVerifier` | `0x1b9db690ee040ca92d44d1585b3aab625a475c27` |
-| `identity.identity_jwks_roots` | `libid.IdentityJwksRoots` | `0x589b56f95d5df5483c79e46e7b20293135c9ebd9` |
+| `contracts.notary_service` | `libid.NotaryService` | `0xbb5871167b0128939cab6850877981421e8dcbf5` |
+| `contracts.ceremony_proof_verifier` | `libid.CeremonyProofVerifier` | `0x76bdc18f21c2db0ff796c7cc50348528b2899275` |
+| `contracts.identity_names` | `libid.IdentityNames` | `0xd467d48769c26faee36ba6b6fc9228f14aef6dd2` |
+| `contracts.google_jwt_roots` | `libid.GoogleJwtRoots` | `0xb7a2ce28e71dbb9c877d2b5a48de33b5f0e6838d` |
 
-Implementations, Bank facets, and the Honk circuit verifiers stay plain
-CREATE deploys: their addresses are referenced (by a proxy slot, the
-diamond, or the Registry), not canonical, and upgrades replace them
-**without moving any entry address**.
+Implementations stay plain CREATE deploys: their addresses are referenced
+by a proxy slot, not canonical, and upgrades replace them **without moving
+any entry address**.
 
 How apply gets there, in order:
 
@@ -96,30 +112,18 @@ How apply gets there, in order:
    `factory.deploy(name, creationCode)` and is verified to land on
    `predict_address(factory, name)`.
 
-One exception: `--upgrade oidc-verifier` REPLACES the GoogleOidcVerifier
-with a plain CREATE deployment — the canonical name is single-use and the
-replacement's address is meant to change. The new address is recorded
-**on-chain only**: `Registry.oidcVerifierOf` is the record, and the config
-keeps declaring the canonical first-deploy address (the file is never
-rewritten). `plan` knows the pattern and reports the divergence as ok, not
-a warning.
-
 ## Config schema
 
-Every value in a network file is public: addresses, a public RPC, OAuth
-*client ids*. The only secret in the flow is the KMS key, which never
-leaves AWS.
+Every value in a network file is public: addresses and a public RPC. The
+only secret in the flow is the KMS key, which never leaves AWS.
 
 | Section | Kind | Contents |
 |---|---|---|
-| `[network]` | input | `name`, `chain_id` (apply refuses a mismatch), `rpc_url`, `legacy_addresses` (marks a pre-factory record — see below) |
+| `[network]` | input | `name`, `chain_id` (apply refuses a mismatch), `rpc_url` |
 | `[aws]` | input | `region`, `kms_deployer` (key id / `alias/...` / ARN; the default signer) |
-| `[accounts]` | input | `notary` (the notary **signer** — see below), `backend`, `owner` (the operational owner the factory ends up with; empty = the deployer) — addresses of **keys**, not contracts. `oidc_notary` is accepted for legacy pre-Notary files but no longer wired anywhere |
-| `[contracts]` | declared | `factory` (the deterministic LibidFactory), `notary` (the Notary **proxy**), `bank`, `registry`, `wallet_factory`, `x_zk_verifier`, `google_oidc_verifier` — always present, pre-filled with the canonical table, validated against the prediction |
-| `[identity]` | declared | `identity_names`, `github_identity_verifier`, `x_identity_verifier`, `google_identity_verifier`, `identity_jwks_roots` — same rules; the optional keys signal wanted-ness by presence |
-| `[platforms]` | input | `x_client_id`, `google_client_id`, `github_bot_handle`, `x_bot_handle` |
-| `[[tokens]]` | input | `symbol`, `address` (zero address = native; token addresses are non-canonical and stay free-form) |
-| `[templates]` | input | per-platform comment templates (string or array), keyed by platform domain |
+| `[accounts]` | input | `notary` (the notary **signer** — see below), `owner` (the operational owner the factory ends up with; empty = the deployer) — addresses of **keys**, not contracts |
+| `[notary_service]` | input | `fee_wei` — what one attestation verification costs, as a decimal string |
+| `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_names`, `google_jwt_roots` — always present, pre-filled with the canonical table, validated against the prediction |
 
 The `[accounts].owner` flow: the factory's genesis owner is the libID
 deployer KMS address baked into its frozen init code. `apply` needs factory
@@ -132,21 +136,21 @@ key must `acceptOwnership` itself). Local dev configs set
 completes the handover by impersonation, so the stack ends fully owned by
 the declared operational owner.
 
-The Notary split (libid-contracts 0.2.0):
+The notary split:
 
-- `accounts.notary` is the notary **signer** — the EOA/KMS identity whose
-  attestations the stack accepts. `contracts.notary` is the Notary
-  **contract** (a UUPS proxy) that stores that signer; every other
-  contract takes the proxy address at initialize and verifies through it.
-- On a fresh deploy the Notary deploys **first**
-  (`initialize(owner = deployer, notary = accounts.notary)`) and its proxy
-  is wired into everything else.
-- Rotation is declarative: edit `accounts.notary`, `plan` diffs it against
-  the on-chain `Notary.notary()` and shows the pending rotation, `apply`
-  sends the one `setNotary` — every consumer follows the contract.
-- `plan` also spot-checks consumers' `notaryContract()` wiring; a mismatch
-  (or a pre-Notary contract without the getter) is a WARN that apply does
-  not fix silently.
+- `accounts.notary` is the notary **signer** — the identity whose
+  attestations the stack accepts. `contracts.notary_service` is the Notary
+  Service **contract** (a UUPS proxy) that holds the trusted key set; every
+  other contract takes the proxy address at initialize and verifies
+  through it.
+- On a fresh deploy the Notary Service deploys **first**
+  (`initialize(owner = deployer, notary = accounts.notary, fee =
+  notary_service.fee_wei)`) and its proxy is wired into everything else.
+- Rotation is half declarative: `plan` shows whether the declared signer is
+  trusted, `apply` sends the one `setNotary` that adds it. Dropping the
+  outgoing key is a separate governance call on purpose — the service holds
+  a SET so a rotation can overlap, and which key to stop trusting is not
+  something the file can say.
 
 Declared-address semantics:
 
@@ -160,23 +164,10 @@ Declared-address semantics:
   is required exactly when the FACTORY has no code on-chain (a virgin
   network — that first apply publishes the entire declared stack). With
   the factory present, apply converges incrementally without the flag.
-- `[identity]` absent = the identity-names stack is not wanted. Once the
-  section exists, `identity_names` and `github_identity_verifier` are
-  always converged; `x_identity_verifier` / `google_identity_verifier` are
-  requested by their key being *present* (carrying the canonical address).
-  Google requires `identity_jwks_roots` declared alongside; the roots
-  contract starts EMPTY — point a JWKS rotation listener at it before
-  Google names work.
-- The verifiers are guarded: the X ZK verifier deploys only when
-  `x_client_id` is set and the Registry slot is zero; the Google OIDC
-  verifier only when `google_client_id` is set and the slot is zero. A
-  changed client id is **not** applied to an already-deployed verifier —
-  that is what `--upgrade oidc-verifier` is for.
-- **Legacy files** (`network.legacy_addresses = true`, today only
-  `networks/eden-testnet.toml`) record a pre-factory deployment verbatim:
-  the canonical equality check is skipped, `plan` keeps the old
-  empty-means-not-deployed reading, and `apply` refuses to run — the
-  planned fresh redeploy replaces such stacks.
+- The three keyspaces are **re-sent every run**. `IdentityNames` exposes no
+  getter for a platform's rules, so writing them is the only way to
+  converge on what the generated table says; the call is owner-only and
+  idempotent.
 
 ## Running locally
 
@@ -193,7 +184,7 @@ cargo run -- plan --network networks/eden-testnet.toml
 # converge; the signer defaults to aws.kms_deployer (needs ambient AWS
 # credentials), or pass a local key for anvil rehearsal
 cargo run -- apply --network networks/eden-testnet.toml \
-  --signer <64-hex-key-or-kms-id> [--upgrade bank,registry] [--yes] \
+  --signer <64-hex-key-or-kms-id> [--upgrade identity-names] [--yes] \
   [--confirm-fresh-deploy]
 ```
 
@@ -202,14 +193,10 @@ key, anything else goes to AWS KMS (region/credentials from the ambient AWS
 environment). An all-hex value of the wrong length is rejected as a mangled
 key rather than shipped to AWS.
 
-Upgrade components: `registry`, `wallet-factory`, `notary` (UUPS
-`upgradeToAndCall`; the proxy address and its stored signer survive),
-`bank` (diamond facet REPLACE — the diamond is the storage, the facets are
-the code), `oidc-verifier` (redeploy + re-point; the new address is
-recorded on-chain in `Registry.oidcVerifierOf`, not in the file). Upgrades
-never move an entry address — the canonical CREATE3 addresses are stable
-across every upgrade except the OIDC REPLACE, whose address change is the
-point.
+Upgrade components: `notary-service`, `proof-verifier`, `identity-names`,
+`google-jwt-roots`. Each is a UUPS `upgradeToAndCall`: the entry address,
+its storage and its owner all survive, so an upgrade never moves a
+canonical address.
 
 For anvil rehearsal, `apply --dev` (or just letting apply detect anvil)
 covers the factory-ownership wrinkle: the local signer is not the baked
@@ -248,9 +235,9 @@ demand reviewers.
 
 Copy `networks/mainnet.toml.example` — it ships FULLY pre-filled with the
 canonical address table, which is valid on every EVM network — fill the
-input keys (chain, RPC, AWS, accounts, platforms, tokens, templates), add
-the name to the `network` choice list in `apply.yml`, and run the workflow
-with `mode: plan` first. The first apply on a virgin network needs
+input keys (chain, RPC, AWS, accounts, Notary Fee), add the name to the
+`network` choice list in `apply.yml`, and run the workflow with `mode:
+plan` first. The first apply on a virgin network needs
 `confirm_fresh_deploy`.
 
 ## Release process
@@ -271,6 +258,6 @@ workflow's default `source: release` consumes the newest x86_64 asset.
   the critical declarative cycle — pre-filled file → fresh apply on a
   virgin anvil lands everything AT the declared addresses → second apply is
   a no-op without any flag → the file is BYTE-IDENTICAL throughout — plus
-  the network-invariance proof: two separate bare anvils converge onto the
-  same declared canonical addresses.
+  drift repair and the network-invariance proof: two separate bare anvils
+  converge onto the same declared canonical addresses.
 - Every commit must be signed off (`git commit -s`); see CONTRIBUTING.md.

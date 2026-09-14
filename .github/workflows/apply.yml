@@ -3,9 +3,9 @@ name: Apply
 # Apply a network's desired-state file to its chain, signing with an AWS KMS
 # key.
 #
-# WHY KMS AND NOT A GITHUB SECRET: the deployer owns every UUPS proxy and
-# the Bank diamond. A leaked deployer key means an attacker can upgrade them
-# to arbitrary code and drain them. A KMS key cannot be exported — CI calls
+# WHY KMS AND NOT A GITHUB SECRET: the deployer owns every UUPS proxy in
+# the stack. A leaked deployer key means an attacker can upgrade them to
+# arbitrary code. A KMS key cannot be exported — CI calls
 # kms:Sign and gets a signature back — so a compromised runner can sign
 # while the job runs but cannot walk away with the key. Revocation is an IAM
 # change, not a redeploy.
@@ -23,8 +23,7 @@ on:
       network:
         description: "Network file under networks/ (add new networks to this list)"
         type: choice
-        # eden-testnet is a canonical declarative file now, so both plan and
-        # apply work on it. Its FIRST apply needs confirm_fresh_deploy: the
+        # eden-testnet's FIRST apply needs confirm_fresh_deploy: the
         # factory is virgin on that chain.
         options: [eden-testnet]
         default: eden-testnet
@@ -34,7 +33,7 @@ on:
         options: [plan, apply]
         default: plan
       upgrade:
-        description: "Comma list to explicitly upgrade: registry, wallet-factory, notary, bank, oidc-verifier"
+        description: "Comma list to explicitly upgrade: notary-service, proof-verifier, identity-names, google-jwt-roots"
         type: string
         default: ""
       confirm_fresh_deploy:

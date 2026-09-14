@@ -1,14 +1,11 @@
 //! Read-only comparison of desired state (the network file) against the
 //! chain. No signer, no transactions — safe to run from anywhere.
 //!
-//! Declarative model (0.4.0): a canonical file pre-declares EVERY address,
-//! so presence is read from CHAIN STATE. A component is either
-//! "declared + present" (ok), "declared + missing" (DEPLOY — apply would
-//! put it at exactly the declared address), or declared at a WRONG address
-//! — which never reaches the plan, because `NetworkConfig::load` rejects a
-//! canonical key that does not equal `predict_address(factory, name)`.
-//! Legacy files (`network.legacy_addresses`) keep the old reading: an
-//! empty key plans a deploy and a populated key with no code is a WARN.
+//! A file pre-declares EVERY address, so presence is read from CHAIN STATE.
+//! A component is either "declared + present" (ok) or "declared + missing"
+//! (DEPLOY — apply would put it at exactly the declared address). Declared
+//! at a WRONG address never reaches the plan: `NetworkConfig::load` rejects
+//! a canonical key that does not equal `predict_address(factory, name)`.
 //! Once the factory exists the plan also diffs its on-chain `deployedAt`
 //! records against the config to surface drift.
 
@@ -25,11 +22,12 @@ use anyhow::{
 };
 use libid_contracts::{
     bindings::{
+        ceremony::{
+            GoogleJwtRoots,
+            NotaryService,
+        },
         factory::LibidFactory,
         identity::IdentityNames,
-        login::Registry,
-        notary::Notary,
-        transfer::Bank,
     },
     factory::{
         predict_address,
@@ -42,21 +40,11 @@ use serde::Serialize;
 
 use crate::{
     config::{
-        opt_address,
+        required_address,
         NetworkConfig,
     },
     names,
-    platforms::{
-        identity_platform_id,
-        GOOGLE_DOMAIN,
-        IDENTITY_GITHUB,
-        IDENTITY_GOOGLE,
-        IDENTITY_X,
-        INITIAL_VERSION,
-        PLATFORM_CONFIGS,
-        WEB_PREFIXES,
-        X_DOMAIN,
-    },
+    platforms,
 };
 
 /// What a plan concluded about one component.
@@ -78,7 +66,7 @@ pub enum Status {
 /// One line of the plan.
 #[derive(Debug, Clone, Serialize)]
 pub struct Item {
-    /// Component name, e.g. `contracts.bank`.
+    /// Component name, e.g. `contracts.identity_names`.
     pub component: String,
     /// What apply would do.
     pub status: Status,
@@ -104,6 +92,14 @@ impl Plan {
     /// idempotent configuration ops.
     pub fn has_deploys(&self) -> bool {
         self.items.iter().any(|i| i.status == Status::Deploy)
+    }
+
+    /// The status recorded for one component, if the plan covers it.
+    pub fn status_of(&self, component: &str) -> Option<Status> {
+        self.items
+            .iter()
+            .find(|i| i.component == component)
+            .map(|i| i.status)
     }
 
     /// Render for humans.
@@ -148,35 +144,27 @@ impl Builder {
     }
 }
 
-/// Check whether a declared address actually has code, and report. On a
-/// canonical file a code-less declared address is a planned DEPLOY (the
-/// address is deterministic, apply lands there); on a legacy file it is a
-/// WARN (the record claims something the chain does not have).
+/// Check whether a declared address actually has code, and report. A
+/// code-less declared address is a planned DEPLOY: the address is
+/// deterministic, so apply lands exactly there.
 async fn check_code<P: Provider>(
     b: &mut Builder,
     provider: &P,
     component: &str,
     addr: Address,
-    legacy: bool,
 ) -> Result<bool> {
     let code = provider
         .get_code_at(addr)
         .await
         .map_err(|e| anyhow!("get_code({component}) failed: {e}"))?;
     if code.is_empty() {
-        if legacy {
-            b.push(
-                component,
-                Status::Warn,
-                format!("{addr:#x} is recorded but has NO CODE on-chain"),
-            );
-        } else {
-            b.push(
-                component,
-                Status::Deploy,
-                format!("declared at {addr:#x} — no code on-chain; apply would deploy it there"),
-            );
-        }
+        b.push(
+            component,
+            Status::Deploy,
+            format!(
+                "declared at {addr:#x} — no code on-chain; apply would deploy it there"
+            ),
+        );
         Ok(false)
     } else {
         b.push(component, Status::Ok, format!("{addr:#x}"));
@@ -184,49 +172,7 @@ async fn check_code<P: Provider>(
     }
 }
 
-/// Cheap consumer check: does `contract`'s `notaryContract()` point at the
-/// recorded Notary proxy? The selector is shared by every 0.2.0 consumer
-/// (read here through the Registry binding). Unreadable usually means a
-/// pre-Notary (0.1.x) deployment; a mismatch is not something apply fixes
-/// silently — both warn.
-async fn check_notary_wiring<P: Provider>(
-    b: &mut Builder,
-    provider: &P,
-    component: &str,
-    contract: Address,
-    notary: Address,
-) {
-    let component = format!("{component}.notary_wiring");
-    match Registry::new(contract, provider)
-        .notaryContract()
-        .call()
-        .await
-    {
-        Ok(wired) if wired == notary => b.push(
-            component,
-            Status::Ok,
-            format!("notaryContract() = {wired:#x}"),
-        ),
-        Ok(wired) => b.push(
-            component,
-            Status::Warn,
-            format!(
-                "notaryContract() = {wired:#x} but contracts.notary is {notary:#x} — \
-                 apply will not fix this silently"
-            ),
-        ),
-        Err(e) => b.push(
-            component,
-            Status::Warn,
-            format!(
-                "notaryContract() unreadable ({e}) — a pre-Notary (0.1.x) deployment? \
-                 The planned fresh redeploy is the fix"
-            ),
-        ),
-    }
-}
-
-/// Build the plan. Connects read-only; sends nothing.
+/// Compare the desired state with the chain.
 pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
     let rpc_url: url::Url = cfg
         .network
@@ -234,649 +180,352 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
         .parse()
         .map_err(|e| anyhow!("invalid RPC URL: {e}"))?;
     let provider = ProviderBuilder::new().connect_http(rpc_url);
-    let chain_id = provider.get_chain_id().await.map_err(|e| {
-        anyhow!(
-            "failed to read the chain id from {}: {e}",
-            cfg.network.rpc_url
-        )
-    })?;
+    let chain_id_actual = provider
+        .get_chain_id()
+        .await
+        .map_err(|e| anyhow!("failed to read the chain id: {e}"))?;
 
-    let legacy = cfg.network.legacy_addresses;
     let mut b = Builder { items: Vec::new() };
-    if chain_id != cfg.network.chain_id {
+    if chain_id_actual != cfg.network.chain_id {
         b.push(
             "network.chain_id",
             Status::Warn,
             format!(
-                "config says {} but the RPC reports {chain_id} — apply will refuse",
+                "file says {} but the RPC reports {chain_id_actual} — apply would \
+                 refuse to send anything",
                 cfg.network.chain_id
             ),
         );
     }
 
-    // ── The onboarding gate: CREATE2 deployer + deterministic factory ────
-    // These come FIRST: a chain that cannot host them cannot host the
-    // stack, and every expected address below hangs off the factory.
+    // ── The onboarding gate ──────────────────────────────────────────────
     let artifacts = Artifacts::embedded();
-    let predicted_factory = predict_factory_address(&artifacts)
-        .map_err(|e| anyhow!("predict_factory_address failed: {e}"))?;
-    let deployer_code = provider
+    let predicted_factory = predict_factory_address(&artifacts)?;
+    let deployer_present = !provider
         .get_code_at(CREATE2_DEPLOYER)
         .await
-        .map_err(|e| anyhow!("get_code(create2 deployer) failed: {e}"))?;
-    if deployer_code.is_empty() {
-        b.push(
-            "contracts.create2_deployer",
-            Status::Deploy,
+        .map_err(|e| anyhow!("get_code(create2_deployer) failed: {e}"))?
+        .is_empty();
+    b.push(
+        "create2_deployer",
+        if deployer_present {
+            Status::Ok
+        } else {
+            Status::Deploy
+        },
+        if deployer_present {
+            format!("{CREATE2_DEPLOYER:#x}")
+        } else {
             format!(
-                "missing — apply installs the keyless deployer at \
-                 {CREATE2_DEPLOYER:#x} via its presigned transaction; a chain \
-                 that rejects it (EIP-155-only) CANNOT host the stack"
-            ),
-        );
-    } else {
-        b.push(
-            "contracts.create2_deployer",
-            Status::Ok,
-            format!("{CREATE2_DEPLOYER:#x}"),
-        );
-    }
-    let factory_code = provider
-        .get_code_at(predicted_factory)
-        .await
-        .map_err(|e| anyhow!("get_code(factory) failed: {e}"))?;
-    let factory_present = !factory_code.is_empty();
-    if factory_present {
+                "{CREATE2_DEPLOYER:#x} has no code — apply would install it via the \
+                 keyless presigned transaction"
+            )
+        },
+    );
+
+    let declared_factory = required_address(&cfg.contracts.factory, "contracts.factory")?;
+    let factory_present =
+        check_code(&mut b, &provider, "contracts.factory", declared_factory).await?;
+    if declared_factory != predicted_factory {
+        // Unreachable through `load`, which validates the equality; kept so
+        // a caller building a config by hand still gets told.
         b.push(
             "contracts.factory",
-            Status::Ok,
-            format!("{predicted_factory:#x} (canonical)"),
-        );
-    } else {
-        b.push(
-            "contracts.factory",
-            Status::Deploy,
+            Status::Warn,
             format!(
-                "missing — apply deploys it at its canonical address \
-                 {predicted_factory:#x} (CANARY: any other address aborts)"
+                "declared {declared_factory:#x} but predicted {predicted_factory:#x}"
             ),
         );
     }
-    if let Some(recorded) = opt_address(&cfg.contracts.factory, "contracts.factory")? {
-        if recorded != predicted_factory {
-            b.push(
-                "contracts.factory.record",
-                Status::Warn,
-                format!(
-                    "config records {recorded:#x} but the canonical factory \
-                     address is {predicted_factory:#x}"
-                ),
-            );
-        }
-    }
-    // Every canonical contract's expected address is a pure function of
-    // (factory, name) — quotable before anything is deployed.
-    let expected = |name: &str| predict_address(predicted_factory, name);
 
-    // ── Notary (deploys first; everything verifies through it) ───────────
-    let cfg_signer = opt_address(&cfg.accounts.notary, "accounts.notary")?;
-    let mut notary_addr = None;
-    match opt_address(&cfg.contracts.notary, "contracts.notary")? {
-        None => b.push(
-            "contracts.notary",
-            Status::Deploy,
-            format!(
-                "not deployed — apply would deploy it FIRST at {:#x} \
-                 (CREATE3 '{}') and wire every other contract through it",
-                expected(names::NOTARY),
-                names::NOTARY
-            ),
-        ),
-        Some(addr) => {
-            if check_code(&mut b, &provider, "contracts.notary", addr, legacy).await? {
-                notary_addr = Some(addr);
-                // The signer DIFF: the file says who the notary signer is;
-                // an on-chain mismatch is a planned setNotary rotation.
-                let on_chain = Notary::new(addr, &provider)
-                    .notary()
-                    .call()
-                    .await
-                    .map_err(|e| anyhow!("Notary.notary read failed: {e}"))?;
-                match cfg_signer {
-                    Some(signer) if signer == on_chain => b.push(
-                        "contracts.notary.signer",
-                        Status::Ok,
-                        format!("{on_chain:#x}"),
-                    ),
-                    Some(signer) => b.push(
-                        "contracts.notary.signer",
-                        Status::Configure,
-                        format!(
-                            "on-chain {on_chain:#x} but accounts.notary says \
-                             {signer:#x} — apply would setNotary (rotation)"
-                        ),
-                    ),
-                    // validate() rejects an empty accounts.notary, so this
-                    // arm is unreachable through NetworkConfig::load.
-                    None => b.push(
-                        "contracts.notary.signer",
-                        Status::Warn,
-                        "accounts.notary is empty — nothing to diff against",
-                    ),
-                }
-            }
-        }
+    // ── The stack, in deploy order ───────────────────────────────────────
+    let notary_service =
+        required_address(&cfg.contracts.notary_service, "contracts.notary_service")?;
+    let notary_service_present = check_code(
+        &mut b,
+        &provider,
+        "contracts.notary_service",
+        notary_service,
+    )
+    .await?;
+    if notary_service_present {
+        plan_notary_service(&mut b, &provider, cfg, notary_service).await;
     }
 
-    // ── Core contracts ───────────────────────────────────────────────────
-    let core = [
-        (
-            "contracts.wallet_factory",
-            &cfg.contracts.wallet_factory,
-            names::WALLET_FACTORY,
-        ),
-        (
-            "contracts.registry",
-            &cfg.contracts.registry,
-            names::REGISTRY,
-        ),
-        ("contracts.bank", &cfg.contracts.bank, names::BANK),
-    ];
-    let mut registry_addr = None;
-    let mut bank_addr = None;
-    for (component, value, name) in core {
-        match opt_address(value, component)? {
-            Some(addr) => {
-                let present =
-                    check_code(&mut b, &provider, component, addr, legacy).await?;
-                if present {
-                    if component == "contracts.registry" {
-                        registry_addr = Some(addr);
-                    }
-                    if component == "contracts.bank" {
-                        bank_addr = Some(addr);
-                    }
-                }
-            }
-            None => b.push(
-                component,
-                Status::Deploy,
-                format!(
-                    "not deployed — apply would deploy at {:#x} (CREATE3 '{name}')",
-                    expected(name)
-                ),
-            ),
-        }
-    }
-
-    // ── Verifier wiring (read from the Registry, the source of truth) ────
-    let cfg_x_verifier =
-        opt_address(&cfg.contracts.x_zk_verifier, "contracts.x_zk_verifier")?;
-    let cfg_oidc_verifier = opt_address(
-        &cfg.contracts.google_oidc_verifier,
-        "contracts.google_oidc_verifier",
+    let proof_verifier = required_address(
+        &cfg.contracts.ceremony_proof_verifier,
+        "contracts.ceremony_proof_verifier",
     )?;
-    if let Some(registry_addr) = registry_addr {
-        let registry = Registry::new(registry_addr, &provider);
+    check_code(
+        &mut b,
+        &provider,
+        "contracts.ceremony_proof_verifier",
+        proof_verifier,
+    )
+    .await?;
 
-        if let Some(notary) = notary_addr {
-            check_notary_wiring(
-                &mut b,
-                &provider,
-                "contracts.registry",
-                registry_addr,
-                notary,
-            )
-            .await;
-        }
-
-        let on_chain_x = registry
-            .zkVerifierOf(X_DOMAIN.into())
-            .call()
-            .await
-            .map_err(|e| anyhow!("Registry.zkVerifierOf({X_DOMAIN}) read failed: {e}"))?;
-        verifier_item(
-            &mut b,
-            "contracts.x_zk_verifier",
-            on_chain_x,
-            cfg_x_verifier,
-            !cfg.platforms.x_client_id.trim().is_empty(),
-            "platforms.x_client_id is empty",
-            expected(names::X_ZK_VERIFIER),
-            names::X_ZK_VERIFIER,
-            legacy,
-        );
-        if let (Some(notary), false) = (notary_addr, on_chain_x == Address::ZERO) {
-            check_notary_wiring(
-                &mut b,
-                &provider,
-                "contracts.x_zk_verifier",
-                on_chain_x,
-                notary,
-            )
-            .await;
-        }
-
-        let on_chain_oidc = registry
-            .oidcVerifierOf(GOOGLE_DOMAIN.into())
-            .call()
-            .await
-            .map_err(|e| {
-                anyhow!("Registry.oidcVerifierOf({GOOGLE_DOMAIN}) read failed: {e}")
-            })?;
-        let oidc_wanted = !cfg.platforms.google_client_id.trim().is_empty();
-        verifier_item(
-            &mut b,
-            "contracts.google_oidc_verifier",
-            on_chain_oidc,
-            cfg_oidc_verifier,
-            oidc_wanted,
-            "platforms.google_client_id is empty",
-            expected(names::GOOGLE_OIDC_VERIFIER),
-            names::GOOGLE_OIDC_VERIFIER,
-            legacy,
-        );
-        if let (Some(notary), false) = (notary_addr, on_chain_oidc == Address::ZERO) {
-            check_notary_wiring(
-                &mut b,
-                &provider,
-                "contracts.google_oidc_verifier",
-                on_chain_oidc,
-                notary,
-            )
-            .await;
-        }
-
-        // Platform resolve configs: getPlatform exposes only endpoint +
-        // handlePrefix, so apply always re-sends (owner-only, idempotent).
-        for &(domain, endpoint, ..) in PLATFORM_CONFIGS {
-            let current = registry.getPlatform(domain.into()).call().await;
-            let detail = match current {
-                Ok(p) if p.endpoint == endpoint => {
-                    "present; re-sent on every apply (idempotent)".to_owned()
-                }
-                Ok(p) if p.endpoint.is_empty() => {
-                    "unset — apply would configure".to_owned()
-                }
-                Ok(p) => {
-                    format!("endpoint differs ({} on-chain) — apply resets", p.endpoint)
-                }
-                Err(e) => format!("unreadable ({e}) — apply would configure"),
-            };
-            b.push(
-                format!("registry.platform.{domain}"),
-                Status::Configure,
-                detail,
-            );
-        }
-    } else {
-        b.push(
-            "registry.wiring",
-            Status::Skipped,
-            "registry not deployed; verifier and platform checks deferred",
-        );
+    let identity_names =
+        required_address(&cfg.contracts.identity_names, "contracts.identity_names")?;
+    let identity_names_present = check_code(
+        &mut b,
+        &provider,
+        "contracts.identity_names",
+        identity_names,
+    )
+    .await?;
+    if identity_names_present {
+        plan_identity_names(&mut b, &provider, identity_names, proof_verifier).await;
     }
-
-    // ── Bank configuration ───────────────────────────────────────────────
-    if let Some(bank_addr) = bank_addr {
-        let bank = Bank::new(bank_addr, &provider);
-        for (platform, prefix) in WEB_PREFIXES {
-            let on_chain = bank
-                .getPlatformWebPrefix(platform.to_string())
-                .call()
-                .await
-                .unwrap_or_default();
-            if on_chain == *prefix {
-                b.push(
-                    format!("bank.web_prefix.{platform}"),
-                    Status::Ok,
-                    prefix.to_string(),
-                );
+    // The keyspaces are written, not read: IdentityNames exposes no getter
+    // for a platform's rules, so apply converges them by re-sending
+    // `setPlatform`, which is owner-only and idempotent.
+    for platform in platforms::LAUNCH {
+        b.push(
+            format!("identity_names.platform.{}", platform.domain),
+            if identity_names_present {
+                Status::Configure
             } else {
-                b.push(
-                    format!("bank.web_prefix.{platform}"),
-                    Status::Configure,
-                    format!("on-chain {on_chain:?} → {prefix:?}"),
-                );
-            }
-        }
-        for token in &cfg.tokens {
-            let resolved = bank.resolveToken(token.symbol.clone()).call().await;
-            let desired: Address = token.address.parse().map_err(|e| {
-                anyhow!("invalid token address for {}: {e}", token.symbol)
-            })?;
-            match resolved {
-                Ok(addr) if addr == desired => {
-                    b.push(
-                        format!("bank.token.{}", token.symbol),
-                        Status::Ok,
-                        format!("{addr:#x}"),
-                    );
-                }
-                Ok(addr) => b.push(
-                    format!("bank.token.{}", token.symbol),
-                    Status::Warn,
-                    format!("registered as {addr:#x}, config says {desired:#x}"),
-                ),
-                Err(_) => b.push(
-                    format!("bank.token.{}", token.symbol),
-                    Status::Configure,
-                    "not registered — apply would register",
-                ),
-            }
-        }
-        for (platform, templates) in &cfg.templates {
-            let desired = templates.as_vec().len();
-            let count = bank
-                .platformTemplateCount(platform.clone())
-                .call()
-                .await
-                .map(|c| c.to::<u64>())
-                .unwrap_or(0);
-            b.push(
-                format!("bank.templates.{platform}"),
-                Status::Configure,
-                format!(
-                    "{count} on-chain, {desired} desired — cleared and re-seeded on \
-                     every apply"
-                ),
-            );
-        }
-    } else {
-        b.push(
-            "bank.configuration",
-            Status::Skipped,
-            "bank not deployed; token/template/prefix checks deferred",
+                Status::Deploy
+            },
+            format!(
+                "setPlatform({:#x}) re-sent — the contract exposes no rules getter",
+                platforms::platform_id(platform.domain)
+            ),
         );
     }
 
-    // ── Identity-names stack ─────────────────────────────────────────────
-    if let Some(identity) = &cfg.identity {
-        let names = opt_address(&identity.identity_names, "identity.identity_names")?;
-        // Wiring reads below must only hit a LIVE IdentityNames: a declared
-        // address with no code (virgin chain) cannot answer eth_call.
-        let mut names_live = None;
-        match names {
-            Some(addr) => {
-                if check_code(&mut b, &provider, "identity.identity_names", addr, legacy)
-                    .await?
-                {
-                    names_live = Some(addr);
-                }
-            }
-            None => b.push(
-                "identity.identity_names",
-                Status::Deploy,
-                format!(
-                    "not deployed — apply would deploy at {:#x} (CREATE3 '{}')",
-                    expected(names::IDENTITY_NAMES),
-                    names::IDENTITY_NAMES
-                ),
-            ),
-        }
-        let wanted: Vec<(
-            &str,
-            Option<Address>,
-            bool,
-            &crate::platforms::IdentityPlatform,
-        )> = vec![
-            (
-                "identity.github_identity_verifier",
-                opt_address(
-                    &identity.github_identity_verifier,
-                    "identity.github_identity_verifier",
-                )?,
-                true,
-                &IDENTITY_GITHUB,
-            ),
-            (
-                "identity.x_identity_verifier",
-                identity
-                    .x_identity_verifier
-                    .as_deref()
-                    .map(|v| opt_address(v, "identity.x_identity_verifier"))
-                    .transpose()?
-                    .flatten(),
-                identity.x_identity_verifier.is_some(),
-                &IDENTITY_X,
-            ),
-            (
-                "identity.google_identity_verifier",
-                identity
-                    .google_identity_verifier
-                    .as_deref()
-                    .map(|v| opt_address(v, "identity.google_identity_verifier"))
-                    .transpose()?
-                    .flatten(),
-                identity.google_identity_verifier.is_some(),
-                &IDENTITY_GOOGLE,
-            ),
-        ];
-        for (component, configured, requested, platform) in wanted {
-            if !requested {
-                b.push(component, Status::Skipped, "key absent — not requested");
-                continue;
-            }
-            match configured {
-                Some(addr) => {
-                    let present =
-                        check_code(&mut b, &provider, component, addr, legacy).await?;
-                    // GitHub and X verify through the Notary contract;
-                    // Google trusts the JWKS roots instead and has no
-                    // notaryContract() getter.
-                    if present && component != "identity.google_identity_verifier" {
-                        if let Some(notary) = notary_addr {
-                            check_notary_wiring(
-                                &mut b, &provider, component, addr, notary,
-                            )
-                            .await;
-                        }
-                    }
-                    if let Some(names_addr) = names_live {
-                        let names_contract = IdentityNames::new(names_addr, &provider);
-                        let wired = names_contract
-                            .verifierOf(
-                                identity_platform_id(platform.domain),
-                                INITIAL_VERSION,
-                            )
-                            .call()
-                            .await
-                            .map_err(|e| {
-                                anyhow!("verifierOf({}) failed: {e}", platform.label)
-                            })?;
-                        if wired != addr {
-                            b.push(
-                                format!("{component}.wiring"),
-                                Status::Configure,
-                                format!(
-                                    "IdentityNames points at {wired:#x} — apply re-wires \
-                                     to {addr:#x}"
-                                ),
-                            );
-                        }
-                    }
-                }
-                None => {
-                    let key = component
-                        .strip_prefix("identity.")
-                        .expect("identity components are identity.*");
-                    let detail = match names::canonical_name("identity", key) {
-                        Some(name) => format!(
-                            "not deployed — apply would deploy at {:#x} \
-                             (CREATE3 '{name}')",
-                            expected(name)
-                        ),
-                        None => "not deployed — apply would deploy".into(),
-                    };
-                    b.push(component, Status::Deploy, detail);
-                }
-            }
-        }
-    } else {
-        b.push(
-            "identity",
-            Status::Skipped,
-            "section absent — the identity-names stack is not requested",
-        );
+    let jwt_roots = required_address(
+        &cfg.contracts.google_jwt_roots,
+        "contracts.google_jwt_roots",
+    )?;
+    let jwt_roots_present =
+        check_code(&mut b, &provider, "contracts.google_jwt_roots", jwt_roots).await?;
+    if jwt_roots_present {
+        plan_jwt_roots(&mut b, &provider, jwt_roots, notary_service).await;
     }
 
-    // ── Factory records vs config (drift) ────────────────────────────────
-    // The factory's `deployedAt` mapping is the on-chain truth about what
-    // was deployed under each canonical name; a populated config key must
-    // agree with it.
+    // ── Factory bookkeeping ──────────────────────────────────────────────
     if factory_present {
-        let factory = LibidFactory::new(predicted_factory, &provider);
-        for c in names::CANONICAL_CONTRACTS {
-            let recorded = factory
-                .deployedAt(c.name.to_string())
-                .call()
-                .await
-                .map_err(|e| anyhow!("factory deployedAt({}) failed: {e}", c.name))?;
-            if recorded == Address::ZERO {
-                // Never deployed under this name; the per-component items
-                // above already cover it.
-                continue;
-            }
-            let component = format!("factory.record.{}.{}", c.section, c.key);
-            match config_canonical_value(cfg, c.section, c.key)? {
-                Some(addr) if addr == recorded => b.push(
-                    component,
-                    Status::Ok,
-                    format!("'{}' = {recorded:#x}", c.name),
-                ),
-                Some(addr) if c.name == names::GOOGLE_OIDC_VERIFIER => b.push(
-                    component,
-                    Status::Ok,
-                    format!(
-                        "config {addr:#x} diverges from the factory record \
-                         {recorded:#x} — expected after an `--upgrade \
-                         oidc-verifier` REPLACE (the canonical name is \
-                         single-use; the record keeps the first deploy)"
-                    ),
-                ),
-                Some(addr) => b.push(
-                    component,
-                    Status::Warn,
-                    format!(
-                        "config records {addr:#x} but the factory deployed \
-                         '{}' at {recorded:#x}",
-                        c.name
-                    ),
-                ),
-                None => b.push(
-                    component,
-                    Status::Configure,
-                    format!(
-                        "factory deployed '{}' at {recorded:#x} but this file \
-                         does not declare it — apply would reuse it (the factory \
-                         record is the on-chain truth)",
-                        c.name
-                    ),
-                ),
-            }
-        }
+        plan_factory_records(&mut b, &provider, cfg, declared_factory).await;
     }
 
     Ok(Plan {
         network: cfg.network.name.clone(),
         chain_id_expected: cfg.network.chain_id,
-        chain_id_actual: chain_id,
+        chain_id_actual,
         items: b.items,
     })
 }
 
-/// The config's declared address for a canonical `(section, key)` pair,
-/// treating an absent `[identity]` section or absent optional key as
-/// undeclared.
-fn config_canonical_value(
+/// The declared notary signer must be trusted, and the declared fee must be
+/// the one the service charges.
+async fn plan_notary_service<P: Provider>(
+    b: &mut Builder,
+    provider: &P,
     cfg: &NetworkConfig,
-    section: &str,
-    key: &str,
-) -> Result<Option<Address>> {
-    match cfg.canonical_raw(section, key) {
-        Some(value) => opt_address(value, key),
-        None => Ok(None),
+    notary_service: Address,
+) {
+    let service = NotaryService::new(notary_service, provider);
+    let declared_signer = match required_address(&cfg.accounts.notary, "accounts.notary")
+    {
+        Ok(addr) => addr,
+        Err(e) => {
+            b.push("notary_service.signer", Status::Warn, e.to_string());
+            return;
+        }
+    };
+    match service.isTrustedNotary(declared_signer).call().await {
+        Ok(true) => b.push(
+            "notary_service.signer",
+            Status::Ok,
+            format!("{declared_signer:#x} is trusted"),
+        ),
+        Ok(false) => b.push(
+            "notary_service.signer",
+            Status::Configure,
+            format!(
+                "{declared_signer:#x} is NOT trusted — apply would setNotary it. \
+                 Untrusting the outgoing key is a separate governance call, so a \
+                 rotation can overlap"
+            ),
+        ),
+        Err(e) => b.push(
+            "notary_service.signer",
+            Status::Warn,
+            format!("isTrustedNotary read failed: {e}"),
+        ),
+    }
+
+    let declared_fee = match cfg.notary_service.fee() {
+        Ok(fee) => fee,
+        Err(e) => {
+            b.push("notary_service.fee", Status::Warn, e.to_string());
+            return;
+        }
+    };
+    match service.fee().call().await {
+        Ok(on_chain) if on_chain == declared_fee => b.push(
+            "notary_service.fee",
+            Status::Ok,
+            format!("{declared_fee} wei"),
+        ),
+        Ok(on_chain) => b.push(
+            "notary_service.fee",
+            Status::Configure,
+            format!(
+                "{on_chain} wei on-chain, file says {declared_fee} — apply sends setFee"
+            ),
+        ),
+        Err(e) => b.push(
+            "notary_service.fee",
+            Status::Warn,
+            format!("fee read failed: {e}"),
+        ),
     }
 }
 
-/// Classify a Registry-wired verifier slot. The Registry pointer is the
-/// on-chain truth; on a canonical file the declared address always equals
-/// the CREATE3 prediction, so a zero slot on a wanted verifier is simply a
-/// planned deploy-and-wire.
-#[allow(clippy::too_many_arguments)]
-fn verifier_item(
+/// The naming system dispatches every claim through the Proof Verifier;
+/// without that pointer `quoteClaim` calls the zero address.
+async fn plan_identity_names<P: Provider>(
     b: &mut Builder,
-    component: &str,
-    on_chain: Address,
-    configured: Option<Address>,
-    wanted: bool,
-    unwanted_reason: &str,
-    expected: Address,
-    name: &str,
-    legacy: bool,
+    provider: &P,
+    identity_names: Address,
+    proof_verifier: Address,
 ) {
-    // `--upgrade oidc-verifier` REPLACES the GoogleOidcVerifier with a
-    // plain-CREATE deploy; the Registry then legitimately points away from
-    // the canonical declared address, and the chain is the only record.
-    let replaceable = name == names::GOOGLE_OIDC_VERIFIER;
-    match (on_chain == Address::ZERO, configured) {
-        (true, Some(cfg_addr)) if !legacy && wanted => b.push(
-            component,
-            Status::Deploy,
-            format!(
-                "declared at {cfg_addr:#x} but the Registry points at nothing — \
-                 apply would deploy (CREATE3 '{name}') and wire"
-            ),
-        ),
-        (true, Some(_)) if !legacy => b.push(
-            component,
-            Status::Skipped,
-            format!("declared but not requested ({unwanted_reason})"),
-        ),
-        (true, None) if wanted => b.push(
-            component,
-            Status::Deploy,
-            format!(
-                "not deployed — apply would deploy at {expected:#x} \
-                 (CREATE3 '{name}') and wire"
-            ),
-        ),
-        (true, None) => b.push(
-            component,
-            Status::Skipped,
-            format!("not requested ({unwanted_reason})"),
-        ),
-        (true, Some(cfg_addr)) => b.push(
-            component,
-            Status::Warn,
-            format!("config records {cfg_addr:#x} but the Registry points at nothing"),
-        ),
-        (false, None) => b.push(
-            component,
-            Status::Configure,
-            format!(
-                "on-chain {on_chain:#x} — a legacy file does not record it; the \
-                 Registry is the record"
-            ),
-        ),
-        (false, Some(cfg_addr)) if cfg_addr == on_chain => {
-            b.push(component, Status::Ok, format!("{on_chain:#x}"))
-        }
-        (false, Some(cfg_addr)) if !legacy && replaceable => b.push(
-            component,
+    match IdentityNames::new(identity_names, provider)
+        .proofVerifier()
+        .call()
+        .await
+    {
+        Ok(addr) if addr == proof_verifier => b.push(
+            "identity_names.proof_verifier",
             Status::Ok,
-            format!(
-                "live verifier {on_chain:#x} diverges from the canonical declaration \
-                 {cfg_addr:#x} — expected after an `--upgrade oidc-verifier` REPLACE; \
-                 the Registry pointer is the record"
-            ),
+            format!("{addr:#x}"),
         ),
-        (false, Some(cfg_addr)) => b.push(
-            component,
+        Ok(addr) => b.push(
+            "identity_names.proof_verifier",
+            Status::Configure,
+            format!("points at {addr:#x}, file declares {proof_verifier:#x}"),
+        ),
+        Err(e) => b.push(
+            "identity_names.proof_verifier",
             Status::Warn,
-            format!(
-                "config records {cfg_addr:#x} but the Registry points at {on_chain:#x}"
-            ),
+            format!("proofVerifier read failed: {e}"),
         ),
     }
+}
+
+/// The root list pays the Notary Service for each rotation, and holds
+/// nothing until a keeper has landed one.
+async fn plan_jwt_roots<P: Provider>(
+    b: &mut Builder,
+    provider: &P,
+    jwt_roots: Address,
+    notary_service: Address,
+) {
+    let roots = GoogleJwtRoots::new(jwt_roots, provider);
+    match roots.notaryService().call().await {
+        Ok(addr) if addr == notary_service => b.push(
+            "google_jwt_roots.notary_service",
+            Status::Ok,
+            format!("{addr:#x}"),
+        ),
+        Ok(addr) => b.push(
+            "google_jwt_roots.notary_service",
+            Status::Configure,
+            format!("points at {addr:#x}, file declares {notary_service:#x}"),
+        ),
+        Err(e) => b.push(
+            "google_jwt_roots.notary_service",
+            Status::Warn,
+            format!("notaryService read failed: {e}"),
+        ),
+    }
+    match roots.needsRotation().call().await {
+        Ok(true) => b.push(
+            "google_jwt_roots.rotation",
+            Status::Warn,
+            "the trust list wants a rotation — every Google claim reverts \
+             UntrustedModulus until a keeper lands one. Not apply's job",
+        ),
+        Ok(false) => b.push("google_jwt_roots.rotation", Status::Ok, "trusted and fresh"),
+        Err(e) => b.push(
+            "google_jwt_roots.rotation",
+            Status::Warn,
+            format!("needsRotation read failed: {e}"),
+        ),
+    }
+}
+
+/// Diff the factory's own `deployedAt` records against the declared table.
+/// A record that disagrees with the declaration means the chain and the
+/// file describe different deployments.
+async fn plan_factory_records<P: Provider>(
+    b: &mut Builder,
+    provider: &P,
+    cfg: &NetworkConfig,
+    factory: Address,
+) {
+    let contract = LibidFactory::new(factory, provider);
+    for c in names::CANONICAL_CONTRACTS {
+        let component = format!("factory.record.{}", c.key);
+        let Some(raw) = cfg.contracts.raw(c.key) else {
+            continue;
+        };
+        let Ok(declared) = required_address(raw, &component) else {
+            continue;
+        };
+        match contract.deployedAt(c.name.to_string()).call().await {
+            Ok(addr) if addr == Address::ZERO => b.push(
+                &component,
+                Status::Skipped,
+                format!("'{}' not yet deployed by the factory", c.name),
+            ),
+            Ok(addr) if addr == declared => {
+                b.push(&component, Status::Ok, format!("'{}' -> {addr:#x}", c.name))
+            }
+            Ok(addr) => b.push(
+                &component,
+                Status::Warn,
+                format!(
+                    "factory recorded '{}' at {addr:#x} but the file declares \
+                     {declared:#x} — the deterministic invariant is broken",
+                    c.name
+                ),
+            ),
+            Err(e) => b.push(
+                &component,
+                Status::Warn,
+                format!("deployedAt('{}') read failed: {e}", c.name),
+            ),
+        }
+    }
+    match contract.owner().call().await {
+        Ok(owner) => {
+            let desired = cfg.accounts.owner_address().ok().flatten();
+            match desired {
+                Some(want) if want != owner => b.push(
+                    "factory.owner",
+                    Status::Configure,
+                    format!("{owner:#x} on-chain, accounts.owner declares {want:#x}"),
+                ),
+                _ => b.push("factory.owner", Status::Ok, format!("{owner:#x}")),
+            }
+        }
+        Err(e) => b.push(
+            "factory.owner",
+            Status::Warn,
+            format!("owner read failed: {e}"),
+        ),
+    }
+}
+
+/// The canonical address a component would land at — the prediction the
+/// declarative table is built from.
+pub fn predicted(key: &str) -> Result<Address> {
+    let artifacts = Artifacts::embedded();
+    let factory = predict_factory_address(&artifacts)?;
+    let name = names::canonical_name(key)
+        .ok_or_else(|| anyhow!("{key} is not a canonical contract"))?;
+    Ok(predict_address(factory, name))
 }

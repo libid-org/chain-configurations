@@ -17,7 +17,10 @@ use std::path::PathBuf;
 
 use alloy::{
     node_bindings::AnvilInstance,
-    primitives::Address,
+    primitives::{
+        Address,
+        U256,
+    },
     providers::{
         Provider,
         ProviderBuilder,
@@ -25,18 +28,13 @@ use alloy::{
 };
 use libid_contracts::{
     bindings::{
+        ceremony::{
+            CeremonyProofVerifier,
+            GoogleJwtRoots,
+            NotaryService,
+        },
         factory::LibidFactory,
         identity::IdentityNames,
-        login::{
-            IRegistryAdmin,
-            Registry,
-            WalletFactory,
-        },
-        notary::Notary,
-    },
-    deploy::{
-        deploy_behind_proxy,
-        deploy_contract,
     },
     factory::{
         predict_address,
@@ -52,11 +50,7 @@ use libid_deploy::{
         self,
         Status,
     },
-    platforms::{
-        identity_platform_id,
-        IDENTITY_GITHUB,
-        INITIAL_VERSION,
-    },
+    platforms,
     signer::SignerSource,
 };
 
@@ -64,16 +58,20 @@ use libid_deploy::{
 const ANVIL_KEY: &str =
     "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 // The address of anvil account #0 — the declared operational owner in the
-// local dev config, exactly as the real local-dev files describe it.
+// local dev config, exactly as networks/local-dev.toml describes it.
 const ANVIL_OWNER: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+// Anvil account #1, the notary signer in the local dev config.
+const ANVIL_NOTARY: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+// A Notary Fee that is not zero, so the fee path is exercised rather than
+// passing by default.
+const NOTARY_FEE_WEI: u64 = 1_000_000_000_000_000;
 
-/// Anvil with the code-size limit off (the generated UltraHonk verifiers
-/// exceed EIP-170, exactly like the real target chains that raise it) and
-/// WITHOUT its predeployed CREATE2 deployer, so apply's install path is
-/// what puts it there.
+/// Anvil WITHOUT its predeployed CREATE2 deployer, so apply's install path
+/// is what puts it there. The stack itself fits under EIP-170 — only the
+/// ceremony circuits' Honk verifiers do not, and those are deployed
+/// elsewhere.
 fn spawn_anvil() -> AnvilInstance {
     alloy::node_bindings::Anvil::new()
-        .arg("--disable-code-size-limit")
         .arg("--disable-default-create2-deployer")
         .try_spawn()
         .expect("anvil spawns (is foundry on PATH?)")
@@ -81,136 +79,77 @@ fn spawn_anvil() -> AnvilInstance {
 
 /// A network file PRE-FILLED with the full canonical address table —
 /// written before the chain has anything on it, because every address is a
-/// pure function of its name. Everything requested: both login verifiers
-/// and the full identity stack. Owner: the anvil #0 wallet, explicitly.
+/// pure function of its name. Owner: the anvil #0 wallet, explicitly.
 fn prefilled_network_file(dir: &std::path::Path, rpc: &str) -> PathBuf {
     let artifacts = Artifacts::embedded();
     let factory = predict_factory_address(&artifacts).unwrap();
     let addr = |name: &str| format!("{:#x}", predict_address(factory, name));
     let path = dir.join("anvil-local.toml");
-    let text = format!(
-        r#"# Test network file — apply must NEVER rewrite it.
-[network]
+    let body = format!(
+        r#"[network]
 name = "anvil-local"
 chain_id = 31337
 rpc_url = "{rpc}"
 
 [aws]
 region = "eu-central-1"
-kms_deployer = "alias/never-used-in-tests"
+kms_deployer = "alias/unused-in-tests"
 
 [accounts]
-notary = "0x1111111111111111111111111111111111111111"
-backend = "0x2222222222222222222222222222222222222222"
-# The operational owner: the anvil #0 wallet, explicitly.
+notary = "{ANVIL_NOTARY}"
 owner = "{ANVIL_OWNER}"
 
-# Declared canonical addresses — identical on every EVM network.
+[notary_service]
+fee_wei = "{NOTARY_FEE_WEI}"
+
 [contracts]
 factory = "{factory:#x}"
-notary = "{notary}"
-bank = "{bank}"
-registry = "{registry}"
-wallet_factory = "{wallet_factory}"
-x_zk_verifier = "{x_zk}"
-google_oidc_verifier = "{oidc}"
-
-[identity]
-identity_names = "{id_names}"
-github_identity_verifier = "{gh}"
-x_identity_verifier = "{x_id}"
-google_identity_verifier = "{g_id}"
-identity_jwks_roots = "{jwks}"
-
-[platforms]
-x_client_id = "test-x-client-id"
-google_client_id = "test-google-client-id.apps.googleusercontent.com"
-github_bot_handle = "testbot"
-x_bot_handle = "testbot"
-
-[[tokens]]
-symbol = "$TIA"
-address = "0x0000000000000000000000000000000000000000"
-
-[templates]
-"api.x.com" = [
-    "@testbot honor @{{recipient}} with {{amount}} of {{token}}",
-    "@testbot honor with {{amount}} {{token}}",
-]
-"api.github.com" = "@testbot honor @{{recipient}} with {{amount}} of {{token}}"
+notary_service = "{notary_service}"
+ceremony_proof_verifier = "{pv}"
+identity_names = "{identity_names}"
+google_jwt_roots = "{roots}"
 "#,
-        notary = addr(names::NOTARY),
-        bank = addr(names::BANK),
-        registry = addr(names::REGISTRY),
-        wallet_factory = addr(names::WALLET_FACTORY),
-        x_zk = addr(names::X_ZK_VERIFIER),
-        oidc = addr(names::GOOGLE_OIDC_VERIFIER),
-        id_names = addr(names::IDENTITY_NAMES),
-        gh = addr(names::GITHUB_IDENTITY_VERIFIER),
-        x_id = addr(names::X_IDENTITY_VERIFIER),
-        g_id = addr(names::GOOGLE_IDENTITY_VERIFIER),
-        jwks = addr(names::IDENTITY_JWKS_ROOTS),
+        notary_service = addr(names::NOTARY_SERVICE),
+        pv = addr(names::CEREMONY_PROOF_VERIFIER),
+        identity_names = addr(names::IDENTITY_NAMES),
+        roots = addr(names::GOOGLE_JWT_ROOTS),
     );
-    std::fs::write(&path, text).expect("test config writes");
+    std::fs::write(&path, body).expect("write network file");
     path
 }
 
-/// Every canonical component the full config declares, as `(config value,
-/// factory name)` pairs read from the network file.
-fn canonical_pairs(cfg: &NetworkConfig) -> Vec<(String, &'static str)> {
-    let identity = cfg.identity.as_ref().expect("identity stack declared");
-    vec![
-        (cfg.contracts.notary.clone(), names::NOTARY),
-        (cfg.contracts.wallet_factory.clone(), names::WALLET_FACTORY),
-        (cfg.contracts.registry.clone(), names::REGISTRY),
-        (cfg.contracts.bank.clone(), names::BANK),
-        (cfg.contracts.x_zk_verifier.clone(), names::X_ZK_VERIFIER),
-        (
-            cfg.contracts.google_oidc_verifier.clone(),
-            names::GOOGLE_OIDC_VERIFIER,
-        ),
-        (identity.identity_names.clone(), names::IDENTITY_NAMES),
-        (
-            identity.github_identity_verifier.clone(),
-            names::GITHUB_IDENTITY_VERIFIER,
-        ),
-        (
-            identity.x_identity_verifier.clone().unwrap_or_default(),
-            names::X_IDENTITY_VERIFIER,
-        ),
-        (
-            identity
-                .google_identity_verifier
-                .clone()
-                .unwrap_or_default(),
-            names::GOOGLE_IDENTITY_VERIFIER,
-        ),
-        (
-            identity.identity_jwks_roots.clone().unwrap_or_default(),
-            names::IDENTITY_JWKS_ROOTS,
-        ),
-    ]
+/// Apply `path` against its chain with the anvil #0 key.
+async fn apply_with(path: &std::path::Path, opts: apply::Options) -> apply::Summary {
+    let cfg = NetworkConfig::load(path).expect("config loads");
+    let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
+    apply::run(path, &cfg, &signer, &opts)
+        .await
+        .expect("apply converges")
 }
 
 /// Assert every declared canonical address equals
 /// `predict_address(factory, name)` — the CREATE3 name-determinism proof —
 /// and that the chain has CODE at each of them.
-async fn assert_declared_and_present<P: Provider>(
-    cfg: &NetworkConfig,
-    factory: Address,
-    provider: &P,
-) {
-    for (declared, name) in canonical_pairs(cfg) {
-        let predicted = predict_address(factory, name);
+async fn assert_declared_and_present<P: Provider>(provider: &P, cfg: &NetworkConfig) {
+    let artifacts = Artifacts::embedded();
+    let factory = predict_factory_address(&artifacts).unwrap();
+    for c in names::CANONICAL_CONTRACTS {
+        let declared: Address = cfg
+            .contracts
+            .raw(c.key)
+            .unwrap_or_else(|| panic!("{} declared", c.key))
+            .parse()
+            .unwrap_or_else(|e| panic!("{} parses: {e}", c.key));
         assert_eq!(
-            declared.to_lowercase(),
-            format!("{predicted:#x}"),
-            "{name} must be declared at its predicted CREATE3 address"
+            declared,
+            predict_address(factory, c.name),
+            "{} is not at its CREATE3 address",
+            c.key
         );
-        let code = provider.get_code_at(predicted).await.unwrap();
         assert!(
-            !code.is_empty(),
-            "{name} declared at {predicted:#x} must have code after apply"
+            !provider.get_code_at(declared).await.unwrap().is_empty(),
+            "{} has no code at {declared:#x}",
+            c.key
         );
     }
 }
@@ -223,266 +162,242 @@ async fn assert_declared_and_present<P: Provider>(
 #[tokio::test]
 async fn declarative_apply_cycle_never_touches_the_config() {
     let anvil = spawn_anvil();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     let path = prefilled_network_file(dir.path(), &anvil.endpoint());
-    let original_bytes = std::fs::read_to_string(&path).unwrap();
-    let signer = SignerSource::from_spec(ANVIL_KEY).unwrap();
-    let cfg = NetworkConfig::load(&path).unwrap();
+    let before = std::fs::read(&path).expect("read config");
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let cfg = NetworkConfig::load(&path).expect("config loads");
 
-    // The chain is VIRGIN (no factory code), so apply without
-    // --confirm-fresh-deploy must refuse — the guard keys on CHAIN STATE,
-    // not on config emptiness (the config is fully populated!).
-    let err = apply::run(&path, &cfg, &signer, &apply::Options::default())
-        .await
-        .unwrap_err();
-    assert!(format!("{err}").contains("FRESH DEPLOY"), "got: {err}");
-    assert!(format!("{err}").contains("VIRGIN"), "got: {err}");
-
-    // First apply: everything deploys, at exactly the declared addresses.
-    let fresh = apply::Options {
-        upgrades: vec![],
-        confirm_fresh_deploy: true,
-        dev: false, // anvil is auto-detected; the flag must not be needed
-    };
-    let summary = apply::run(&path, &cfg, &signer, &fresh).await.unwrap();
-    let deployed: Vec<&str> = summary.deployed.iter().map(|(c, _)| c.as_str()).collect();
-    for component in [
-        "contracts.factory",
-        "contracts.notary",
-        "contracts.wallet_factory",
-        "contracts.registry",
-        "contracts.bank",
-        "contracts.x_zk_verifier",
-        "contracts.google_oidc_verifier",
-        "identity.identity_names",
-        "identity.github_identity_verifier",
-        "identity.x_identity_verifier",
-        "identity.identity_jwks_roots",
-        "identity.google_identity_verifier",
-    ] {
-        assert!(
-            deployed.contains(&component),
-            "missing {component}: {deployed:?}"
-        );
-    }
-
-    // The version this deployer installs every platform under has to be the
-    // one the contract calls first. They are two constants in two repositories
-    // and nothing but this check ties them together: a contract that renumbered
-    // would leave every platform wired under a version `bind` never reaches.
-    {
-        let provider =
-            ProviderBuilder::new().connect_http(anvil.endpoint().parse().unwrap());
-        let names_addr: Address = cfg
-            .identity
-            .as_ref()
-            .unwrap()
-            .identity_names
-            .parse()
-            .unwrap();
-        let names = IdentityNames::new(names_addr, &provider);
-        assert_eq!(
-            names.INITIAL_VERSION().call().await.unwrap(),
-            INITIAL_VERSION,
-            "libid-deploy and IdentityNames disagree on the first version"
-        );
-        // And the platform really is wired under it, not merely deployed.
-        let wired = names
-            .verifierOf(
-                identity_platform_id(IDENTITY_GITHUB.domain),
-                INITIAL_VERSION,
-            )
-            .call()
-            .await
-            .unwrap();
-        assert_ne!(wired, Address::ZERO, "GitHub is not wired at v1");
-        assert_eq!(
-            names
-                .latestVersionOf(identity_platform_id(IDENTITY_GITHUB.domain))
-                .call()
-                .await
-                .unwrap(),
-            INITIAL_VERSION,
-            "the first version installed did not become the default"
-        );
-    }
-
-    // THE determinism assertion: apply never rewrote the file.
+    // Virgin chain: the plan wants everything, including the onboarding gate.
+    let virgin = plan::build(&cfg).await.expect("plan on a virgin chain");
+    assert_eq!(virgin.status_of("create2_deployer"), Some(Status::Deploy));
+    assert_eq!(virgin.status_of("contracts.factory"), Some(Status::Deploy));
     assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
-        original_bytes,
-        "apply must leave the config byte-identical"
+        virgin.status_of("contracts.notary_service"),
+        Some(Status::Deploy)
     );
+    assert!(virgin.has_deploys());
 
-    // Everything sits where the file declared it before the chain existed.
-    let artifacts = Artifacts::embedded();
-    let factory_addr = predict_factory_address(&artifacts).unwrap();
-    let read_provider =
-        ProviderBuilder::new().connect_http(anvil.endpoint().parse().unwrap());
-    assert_eq!(
-        cfg.contracts.factory.to_lowercase(),
-        format!("{factory_addr:#x}"),
-        "the declared factory must be the canonical predicted one"
-    );
-    assert_declared_and_present(&cfg, factory_addr, &read_provider).await;
-
-    // Factory ownership ended at the declared operational owner.
-    let owner = LibidFactory::new(factory_addr, &read_provider)
-        .owner()
-        .call()
-        .await
-        .unwrap();
-    assert_eq!(
-        owner,
-        ANVIL_OWNER.parse::<Address>().unwrap(),
-        "factory ownership must end at [accounts].owner"
-    );
-
-    // The plan against the converged chain has nothing to deploy and no
-    // warnings.
-    let built = plan::build(&cfg).await.unwrap();
+    // A fresh deploy without the flag is refused: the guard reads chain
+    // state, and a virgin chain means this apply publishes the whole stack.
+    let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
+    let refused = apply::run(&path, &cfg, &signer, &apply::Options::default()).await;
     assert!(
-        !built.has_deploys(),
-        "plan still wants deploys:\n{}",
-        built.render()
-    );
-    assert!(
-        !built.items.iter().any(|i| i.status == Status::Warn),
-        "plan warns:\n{}",
-        built.render()
+        refused
+            .expect_err("a virgin chain needs the flag")
+            .to_string()
+            .contains("--confirm-fresh-deploy"),
+        "the refusal must name the flag that lifts it"
     );
 
-    // Second apply: NO --confirm-fresh-deploy needed (the factory has
-    // code), nothing deploys, and the file is still byte-identical.
-    let incremental = apply::Options::default();
-    let summary = apply::run(&path, &cfg, &signer, &incremental)
-        .await
-        .unwrap();
-    assert!(
-        summary.deployed.is_empty(),
-        "re-apply deployed: {:?}",
-        summary.deployed
-    );
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), original_bytes);
-
-    // Notary signer rotation, declaratively: edit accounts.notary in the
-    // file (an OPERATOR edit — the only kind of change the file ever
-    // sees), the plan diffs Notary.notary() against it, apply setNotary's.
-    let rotated = "0x4444444444444444444444444444444444444444";
-    let rotated_bytes =
-        original_bytes.replace("0x1111111111111111111111111111111111111111", rotated);
-    std::fs::write(&path, &rotated_bytes).unwrap();
-    let cfg = NetworkConfig::load(&path).unwrap();
-    let built = plan::build(&cfg).await.unwrap();
-    let signer_item = built
-        .items
-        .iter()
-        .find(|i| i.component == "contracts.notary.signer")
-        .expect("the plan diffs the notary signer");
-    assert_eq!(
-        signer_item.status,
-        Status::Configure,
-        "a signer mismatch is a planned rotation:\n{}",
-        built.render()
-    );
-    assert!(!built.has_deploys(), "rotation must not redeploy anything");
-
-    let summary = apply::run(&path, &cfg, &signer, &incremental)
-        .await
-        .unwrap();
-    assert!(summary.deployed.is_empty());
+    // The fresh deploy itself.
+    let summary = apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            dev: true,
+            ..Default::default()
+        },
+    )
+    .await;
     assert!(
         summary
-            .configured
+            .deployed
             .iter()
-            .any(|c| c.contains("notary signer rotated")),
-        "apply must report the rotation: {summary:?}"
+            .any(|(c, _)| c == "contracts.notary_service"),
+        "the Notary Service is deployed first: {:?}",
+        summary.deployed
     );
-    let notary_proxy: Address = cfg.contracts.notary.parse().unwrap();
-    let on_chain = Notary::new(notary_proxy, &read_provider)
-        .notary()
+    assert_declared_and_present(&provider, &cfg).await;
+
+    // The wiring the stack is useless without.
+    let notary_service: Address = cfg.contracts.notary_service.parse().unwrap();
+    let proof_verifier: Address = cfg.contracts.ceremony_proof_verifier.parse().unwrap();
+    let identity_names: Address = cfg.contracts.identity_names.parse().unwrap();
+    let jwt_roots: Address = cfg.contracts.google_jwt_roots.parse().unwrap();
+
+    let service = NotaryService::new(notary_service, &provider);
+    assert!(service
+        .isTrustedNotary(ANVIL_NOTARY.parse().unwrap())
         .call()
         .await
-        .unwrap();
-    assert_eq!(on_chain, rotated.parse::<Address>().unwrap());
-    // The rotation came from the operator's edit; apply changed nothing.
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), rotated_bytes);
-
-    // A further apply is a no-op again: the signer already matches.
-    let summary = apply::run(&path, &cfg, &signer, &incremental)
-        .await
-        .unwrap();
-    assert!(summary.configured.is_empty(), "{summary:?}");
-
-    // Explicit upgrades: UUPS for the registry and the Notary (whose state
-    // — the rotated signer — must survive), facet REPLACE for the bank,
-    // redeploy+repoint for the OIDC verifier. The REPLACE's new address is
-    // recorded ON-CHAIN ONLY (Registry.oidcVerifierOf); the config keeps
-    // declaring the canonical address and stays byte-identical.
-    let canonical_oidc: Address = cfg.contracts.google_oidc_verifier.parse().unwrap();
-    let upgrades = apply::Options {
-        upgrades: vec![
-            apply::Upgrade::Registry,
-            apply::Upgrade::Notary,
-            apply::Upgrade::Bank,
-            apply::Upgrade::OidcVerifier,
-        ],
-        confirm_fresh_deploy: false,
-        dev: false,
-    };
-    let summary = apply::run(&path, &cfg, &signer, &upgrades).await.unwrap();
-    assert!(summary.upgraded.iter().any(|u| u == "registry"));
-    assert!(summary.upgraded.iter().any(|u| u == "notary"));
-    assert!(summary.upgraded.iter().any(|u| u == "bank"));
-    assert!(summary
-        .upgraded
-        .iter()
-        .any(|u| u.contains("google_oidc_verifier")));
+        .unwrap());
     assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
-        rotated_bytes,
-        "an upgrade run must not rewrite the config either"
+        service.fee().call().await.unwrap(),
+        U256::from(NOTARY_FEE_WEI)
     );
 
-    // The chain records the replacement: the Registry points away from the
-    // canonical declaration now.
-    let registry_addr: Address = cfg.contracts.registry.parse().unwrap();
-    let live_oidc = Registry::new(registry_addr, &read_provider)
-        .oidcVerifierOf("www.googleapis.com".into())
-        .call()
-        .await
-        .unwrap();
-    assert_ne!(
-        live_oidc, canonical_oidc,
-        "the OIDC verifier REPLACE must move the Registry pointer"
-    );
-
-    // The Notary implementation changed; the proxy (address AND state,
-    // i.e. the rotated signer) did not.
-    let on_chain = Notary::new(notary_proxy, &read_provider)
-        .notary()
-        .call()
-        .await
-        .unwrap();
+    let names_contract = IdentityNames::new(identity_names, &provider);
     assert_eq!(
-        on_chain,
-        rotated.parse::<Address>().unwrap(),
-        "the stored signer must survive the UUPS upgrade"
+        names_contract.proofVerifier().call().await.unwrap(),
+        proof_verifier
     );
 
-    // Upgrades never move an entry address: every canonical contract still
-    // has code at its declared CREATE3 address (the replaced OIDC verifier
-    // keeps its canonical predecessor's code in place too).
-    assert_declared_and_present(&cfg, factory_addr, &read_provider).await;
+    let roots = GoogleJwtRoots::new(jwt_roots, &provider);
+    assert_eq!(roots.notaryService().call().await.unwrap(), notary_service);
+    assert_eq!(
+        roots.quoteRotation().call().await.unwrap(),
+        U256::from(NOTARY_FEE_WEI)
+    );
+    // The trust list starts empty, so it wants a rotation before any Google
+    // name can bind. That is a keeper's job, not apply's.
+    assert!(roots.needsRotation().call().await.unwrap());
 
-    // And the plan is still clean afterwards: the diverged OIDC pointer is
-    // a known, expected consequence of the REPLACE — not a warning.
-    let built = plan::build(&cfg).await.unwrap();
-    assert!(!built.has_deploys(), "{}", built.render());
+    // Every launch platform owns its keyspace, and none can verify anything
+    // yet: no Platform Verifier is registered, so the Proof Verifier says so
+    // rather than answering for a platform it cannot check.
+    let verifier = CeremonyProofVerifier::new(proof_verifier, &provider);
+    for platform in platforms::LAUNCH {
+        let platform_id = platforms::platform_id(platform.domain);
+        assert!(
+            !verifier.verifiesPlatform(platform_id).call().await.unwrap(),
+            "{} has a verifier registered already",
+            platform.label
+        );
+        assert!(
+            names_contract
+                .resolveId(platform_id, "12345".into())
+                .call()
+                .await
+                .is_err(),
+            "{} answered instead of reverting UnknownPlatform",
+            platform.label
+        );
+    }
+
+    // Factory ownership ended at the declared operational owner.
+    let factory: Address = cfg.contracts.factory.parse().unwrap();
+    assert_eq!(
+        LibidFactory::new(factory, &provider)
+            .owner()
+            .call()
+            .await
+            .unwrap(),
+        ANVIL_OWNER.parse::<Address>().unwrap()
+    );
+
+    // A second apply needs no flag and deploys nothing.
+    let again = apply_with(&path, apply::Options::default()).await;
     assert!(
-        !built.items.iter().any(|i| i.status == Status::Warn),
-        "plan warns after upgrades:\n{}",
-        built.render()
+        again.deployed.is_empty(),
+        "the second apply deployed {:?}",
+        again.deployed
+    );
+    let settled = plan::build(&cfg).await.expect("plan after apply");
+    assert!(
+        !settled.has_deploys(),
+        "the settled plan still wants deploys:\n{}",
+        settled.render()
+    );
+
+    // Every explicit upgrade runs, and the state behind each proxy survives.
+    let upgrades: Vec<apply::Upgrade> = apply::Upgrade::VALUES
+        .iter()
+        .map(|v| v.parse().expect("value parses"))
+        .collect();
+    let upgraded = apply_with(
+        &path,
+        apply::Options {
+            upgrades,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(upgraded.upgraded.len(), apply::Upgrade::VALUES.len());
+    assert_eq!(
+        service.fee().call().await.unwrap(),
+        U256::from(NOTARY_FEE_WEI)
+    );
+    assert_eq!(
+        names_contract.proofVerifier().call().await.unwrap(),
+        proof_verifier
+    );
+    assert_eq!(roots.notaryService().call().await.unwrap(), notary_service);
+    assert_declared_and_present(&provider, &cfg).await;
+
+    // The whole point: the file is byte-identical through all of it.
+    assert_eq!(
+        before,
+        std::fs::read(&path).expect("re-read config"),
+        "apply rewrote the network file"
+    );
+}
+
+/// Declarative convergence: a stack that lost its wiring is repaired by the
+/// next apply, without redeploying anything. The rotation path is the same
+/// one an operator uses by editing `accounts.notary`.
+#[tokio::test]
+async fn apply_converges_drifted_wiring_without_redeploying() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prefilled_network_file(dir.path(), &anvil.endpoint());
+    apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            dev: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let notary_service: Address = cfg.contracts.notary_service.parse().unwrap();
+    let proof_verifier: Address = cfg.contracts.ceremony_proof_verifier.parse().unwrap();
+    let identity_names: Address = cfg.contracts.identity_names.parse().unwrap();
+
+    // Drift: the owner (the anvil #0 key, which is also the apply signer)
+    // points the naming system somewhere else and changes the fee.
+    let key: alloy::signers::local::PrivateKeySigner = ANVIL_KEY.parse().unwrap();
+    let owned = ProviderBuilder::new()
+        .wallet(alloy::network::EthereumWallet::from(key))
+        .connect_http(anvil.endpoint_url());
+    IdentityNames::new(identity_names, &owned)
+        .setProofVerifier(Address::repeat_byte(0x99))
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    NotaryService::new(notary_service, &owned)
+        .setFee(U256::from(7))
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+
+    let drifted = plan::build(&cfg).await.expect("plan sees the drift");
+    assert_eq!(
+        drifted.status_of("identity_names.proof_verifier"),
+        Some(Status::Configure)
+    );
+    assert_eq!(
+        drifted.status_of("notary_service.fee"),
+        Some(Status::Configure)
+    );
+    assert!(!drifted.has_deploys(), "drift is not a redeploy");
+
+    let repaired = apply_with(&path, apply::Options::default()).await;
+    assert!(repaired.deployed.is_empty());
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    assert_eq!(
+        IdentityNames::new(identity_names, &provider)
+            .proofVerifier()
+            .call()
+            .await
+            .unwrap(),
+        proof_verifier
+    );
+    assert_eq!(
+        NotaryService::new(notary_service, &provider)
+            .fee()
+            .call()
+            .await
+            .unwrap(),
+        U256::from(NOTARY_FEE_WEI)
     );
 }
 
@@ -493,172 +408,41 @@ async fn declarative_apply_cycle_never_touches_the_config() {
 /// identical config data regardless of which chain they run on.
 #[tokio::test]
 async fn fresh_apply_addresses_are_network_invariant() {
-    let artifacts = Artifacts::embedded();
-    let factory_addr = predict_factory_address(&artifacts).unwrap();
-    let mut runs: Vec<Vec<(String, &'static str)>> = Vec::new();
-
-    for run in 0..2 {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut instances = Vec::new();
+    for index in 0..2u8 {
         let anvil = spawn_anvil();
-        let dir = tempfile::tempdir().unwrap();
-        let path = prefilled_network_file(dir.path(), &anvil.endpoint());
-        let original_bytes = std::fs::read_to_string(&path).unwrap();
-        let signer = SignerSource::from_spec(ANVIL_KEY).unwrap();
-        let cfg = NetworkConfig::load(&path).unwrap();
-        let opts = apply::Options {
-            upgrades: vec![],
-            confirm_fresh_deploy: true,
-            dev: false,
-        };
-        apply::run(&path, &cfg, &signer, &opts)
-            .await
-            .unwrap_or_else(|e| panic!("fresh apply #{run} failed: {e:#}"));
-
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            original_bytes,
-            "run #{run}: apply must not rewrite the config"
-        );
-        let provider =
-            ProviderBuilder::new().connect_http(anvil.endpoint().parse().unwrap());
-        assert_declared_and_present(&cfg, factory_addr, &provider).await;
-        runs.push(canonical_pairs(&cfg));
-        drop(anvil);
+        let sub = dir.path().join(format!("chain{index}"));
+        std::fs::create_dir_all(&sub).expect("subdir");
+        let path = prefilled_network_file(&sub, &anvil.endpoint());
+        apply_with(
+            &path,
+            apply::Options {
+                confirm_fresh_deploy: true,
+                dev: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        instances.push((anvil, path));
     }
 
-    assert_eq!(
-        runs[0], runs[1],
-        "two fresh chains must carry identical canonical addresses"
-    );
-}
+    for (anvil, path) in &instances {
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+        let cfg = NetworkConfig::load(path).expect("config loads");
+        assert_declared_and_present(&provider, &cfg).await;
+    }
 
-/// Plan against a partially-deployed LEGACY chain: the login stack exists
-/// (deployed with the crate directly, at non-canonical addresses — hence
-/// `legacy_addresses = true`), the bank does not — the plan must say so.
-/// This mirrors the committed eden-testnet.toml record.
-#[tokio::test]
-async fn plan_reports_missing_and_present_components_on_a_legacy_file() {
-    let anvil = spawn_anvil();
-    let provider = ProviderBuilder::new()
-        .wallet(alloy::network::EthereumWallet::from(
-            ANVIL_KEY
-                .parse::<alloy::signers::local::PrivateKeySigner>()
-                .unwrap(),
-        ))
-        .connect_http(anvil.endpoint().parse().unwrap());
-    let deployer = provider.get_accounts().await.unwrap()[0];
-    let artifacts = Artifacts::embedded();
-
-    let notary_contract = deploy_behind_proxy(
-        &provider,
-        &artifacts,
-        "Notary",
-        &Notary::initializeCall {
-            owner_: deployer,
-            notary_: Address::repeat_byte(0x11),
-        },
-        None,
-    )
-    .await
-    .unwrap();
-    let wallet_impl = deploy_contract(
-        &provider,
-        artifacts.bytecode("WebWallet").unwrap(),
-        "WebWallet (impl)",
-    )
-    .await
-    .unwrap();
-    let factory = deploy_behind_proxy(
-        &provider,
-        &artifacts,
-        "WalletFactory",
-        &WalletFactory::initializeCall {
-            owner_: deployer,
-            walletImpl_: wallet_impl,
-            registry_: Address::ZERO,
-        },
-        None,
-    )
-    .await
-    .unwrap();
-    let registry = deploy_behind_proxy(
-        &provider,
-        &artifacts,
-        "Registry",
-        &IRegistryAdmin::initializeCall {
-            _notaryContract: notary_contract,
-            _backend: Address::repeat_byte(0x22),
-            _walletFactory: factory,
-            _owner: deployer,
-        },
-        None,
-    )
-    .await
-    .unwrap();
-
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("partial.toml");
-    std::fs::write(
-        &path,
-        format!(
-            r#"[network]
-name = "anvil-partial"
-chain_id = 31337
-rpc_url = "{rpc}"
-legacy_addresses = true
-
-[aws]
-region = "eu-central-1"
-kms_deployer = "alias/never-used-in-tests"
-
-[accounts]
-notary = "0x1111111111111111111111111111111111111111"
-backend = "0x2222222222222222222222222222222222222222"
-
-[contracts]
-notary = "{notary_contract:#x}"
-registry = "{registry:#x}"
-wallet_factory = "{factory:#x}"
-
-[platforms]
-x_client_id = "test-x-client-id"
-"#,
-            rpc = anvil.endpoint(),
-        ),
-    )
-    .unwrap();
-
-    let cfg = NetworkConfig::load(&path).unwrap();
-
-    // A legacy file plans, but apply refuses it outright.
-    let signer = SignerSource::from_spec(ANVIL_KEY).unwrap();
-    let err = apply::run(&path, &cfg, &signer, &apply::Options::default())
-        .await
-        .unwrap_err();
-    assert!(format!("{err}").contains("LEGACY"), "got: {err}");
-
-    let built = plan::build(&cfg).await.unwrap();
-    let status_of = |component: &str| {
-        built
-            .items
-            .iter()
-            .find(|i| i.component == component)
-            .unwrap_or_else(|| {
-                panic!("no plan item for {component}:\n{}", built.render())
-            })
-            .status
-    };
-    assert_eq!(status_of("contracts.notary"), Status::Ok);
-    // The stored signer matches accounts.notary: no rotation planned.
-    assert_eq!(status_of("contracts.notary.signer"), Status::Ok);
-    assert_eq!(status_of("contracts.registry"), Status::Ok);
-    // The Registry's notaryContract() points at the recorded proxy.
-    assert_eq!(status_of("contracts.registry.notary_wiring"), Status::Ok);
-    assert_eq!(status_of("contracts.wallet_factory"), Status::Ok);
-    assert_eq!(status_of("contracts.bank"), Status::Deploy);
-    // x_client_id is set and nothing is wired: a deploy is pending.
-    assert_eq!(status_of("contracts.x_zk_verifier"), Status::Deploy);
-    // No Google client id: skipped, not deployed.
-    assert_eq!(status_of("contracts.google_oidc_verifier"), Status::Skipped);
-    // Identity section absent: skipped.
-    assert_eq!(status_of("identity"), Status::Skipped);
+    // Same declarations, so the same addresses — the whole cross-network
+    // guarantee, checked rather than asserted in a comment.
+    let first = NetworkConfig::load(&instances[0].1).unwrap();
+    let second = NetworkConfig::load(&instances[1].1).unwrap();
+    for c in names::CANONICAL_CONTRACTS {
+        assert_eq!(
+            first.contracts.raw(c.key),
+            second.contracts.raw(c.key),
+            "{} diverged between chains",
+            c.key
+        );
+    }
 }
