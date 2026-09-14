@@ -275,7 +275,9 @@ pub fn circuits_version() -> Result<&'static str> {
 }
 
 /// The vendored artifacts, embedded at compile time as
-/// `(<file>, <contract>, json)`. Named individually rather than pulled
+/// `(<file>, <contract>, json)`. Generated, not committed:
+/// `scripts/vendor-artifacts.sh` writes them, and CI runs it before every
+/// cargo step. Named individually rather than pulled
 /// from a directory: a missing one must be a compile error, not a runtime
 /// surprise on a chain that has already been half converged.
 const ARTIFACTS: &[(&str, &str, &str)] = &[

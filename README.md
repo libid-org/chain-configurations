@@ -29,8 +29,8 @@ The model is DECLARATIVE:
 Contract bytecode is embedded in the binary: the core stack via the
 [`libid-contracts`](https://github.com/libid-org/libid-contracts) crate,
 the Platform Verifiers and the ceremony circuits' Honk verifiers from
-`bin/libid-deploy/artifacts/` (see below). There is no forge build, no bb
-and no artifact directory at runtime. The platform
+`bin/libid-deploy/artifacts/`, generated at build time (see below). There
+is no forge build, no bb and no artifact directory at runtime. The platform
 tables come from `libid-identity` and `libid-profiles`, generated from the
 same sources the contracts are, so nothing here restates a value the chain
 also holds.
@@ -79,8 +79,8 @@ Then two steps `Deploy.s.sol` does not have:
 own `script/Deploy.s.sol` registers none either. Nor does anything upstream
 ship a Honk verifier: one derives from a circuit's verification key, which
 [`libid-circuits`](https://github.com/libid-org/libid-circuits) publishes
-as a release asset. `scripts/vendor-artifacts.sh` builds all of them and
-commits the pruned artifacts under `bin/libid-deploy/artifacts/`:
+as a release asset. `scripts/vendor-artifacts.sh` builds all of them into
+`bin/libid-deploy/artifacts/` from two committed pins:
 
 - the Platform Verifiers, from the `libid-contracts` tag `Cargo.toml` pins;
 - the Honk verifiers, from the `libid-circuits` release
@@ -98,7 +98,10 @@ selector against the artifact's `methodIdentifiers`, that each circuit
 verifier exposes the `verify(bytes,bytes32[])` its Platform Verifier calls,
 and that both libraries a bb verifier links are vendored beside it.
 
-Regenerate after moving either pin:
+The directory is gitignored: CI regenerates it before every cargo step,
+and a local build runs the script first (see
+[Development](#development)). Generate, and regenerate after moving
+either pin:
 
 ```sh
 scripts/vendor-artifacts.sh                            # both pins as committed
@@ -106,10 +109,13 @@ scripts/vendor-artifacts.sh --contracts ../libid-contracts
 scripts/vendor-artifacts.sh --circuits 0.4.0           # move the circuits pin
 ```
 
-The build is deterministic (`solc` pinned to 0.8.33, `via_ir`,
+`--circuits` rewrites `circuits-manifest.json`; commit that, it is the
+pin. The build is deterministic (`solc` pinned to 0.8.33, `via_ir`,
 `bytecode_hash = "none"`, and a `vk` taken from the release rather than a
-local circuit build), so a regenerated artifact that differs from the
-committed one means the sources moved, not the build.
+local circuit build), so every run from the same pins produces the same
+bytes on any machine, and two runs that differ mean the sources moved,
+not the build. Each CI run's summary lists the sha256 of every file the
+binary embedded.
 
 ### How the circuit verifier is wired
 
@@ -361,14 +367,27 @@ plan` first. The first apply on a virgin network needs
 
 ## Release process
 
-Publish a GitHub Release (tag `vX.Y.Z`). `release.yml` re-runs the CI
-checks, then builds `libid-deploy` for `x86_64-unknown-linux-gnu` and
-`aarch64-unknown-linux-gnu` (natively, on arm64 runners) and uploads
-`libid-deploy-<version>-<target>.tar.gz` as release assets. The apply
-workflow's default `source: release` consumes the newest x86_64 asset.
+Publish a GitHub Release (tag `vX.Y.Z`). `release.yml` generates the
+embedded artifacts once from the pins, uncached, re-runs the CI checks on
+exactly those bytes, then builds `libid-deploy` for
+`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` (natively, on
+arm64 runners) and uploads `libid-deploy-<version>-<target>.tar.gz` as
+release assets. The apply workflow's default `source: release` consumes
+the newest x86_64 asset.
 
 ## Development
 
+- The crate embeds artifacts that are generated, not committed. Before the
+  first cargo command, and again whenever either pin moves:
+
+  ```sh
+  scripts/vendor-artifacts.sh
+  ```
+
+  It needs `jq`, `curl`, `shasum`, `forge`, and `bb` at exactly the version
+  `bin/libid-deploy/circuits-manifest.json` names (`bbup --version <that
+  version>`); any other bb is refused. Without the artifacts every cargo
+  command fails at `include_str!`, naming the missing file.
 - `cargo +nightly fmt` only — stable rustfmt silently ignores the
   nightly-only options in `rustfmt.toml`.
 - `cargo clippy --all-targets --all-features -- -D warnings`

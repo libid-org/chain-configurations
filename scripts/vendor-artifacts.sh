@@ -11,17 +11,17 @@
 # publishes as a release asset. This repository deploys all of them, so it
 # builds them here and embeds the result.
 #
-# The output is committed, unlike libid-contracts' own vendored artifacts:
-# a release build of this binary must not need forge, solc, bb or a contracts
-# checkout. Regenerate it whenever either pin moves.
+# The output is gitignored, like libid-contracts' own vendored artifacts: CI
+# runs this before every cargo step, and a local build runs it once and again
+# whenever either pin moves. The circuits manifest it rewrites IS committed:
+# that is the pin.
 #
 # Determinism: solidity/foundry.toml pins solc 0.8.33, builds with via_ir, and
 # sets bytecode_hash = "none" / cbor_metadata = false, so two builds of the same
 # sources produce byte-identical bytecode on any machine. A Honk verifier
 # derives from the vk alone, and the vk comes from the pinned release rather
-# than a local circuit build, so it is byte-identical too. A regenerated
-# artifact that differs from the committed one means the SOURCES moved, not the
-# build.
+# than a local circuit build, so it is byte-identical too. Two runs that
+# differ mean the SOURCES moved, not the build.
 #
 # Usage:
 #   scripts/vendor-artifacts.sh                     # both pins as committed
@@ -68,7 +68,7 @@ HONK_LIBRARIES=(RelationsLib ZKTranscriptLib)
 
 # Where the generated sources are dropped inside the contracts checkout. FIXED,
 # not a mktemp name: solc records the source path in `linkReferences`, and a
-# path that changed per run would churn the committed artifact.
+# path that changed per run would churn the artifact between runs.
 CIRCUITS_SRC_REL="contracts/circuits"
 
 CONTRACTS_DIR=""
@@ -200,8 +200,8 @@ for entry in "${ARTIFACTS[@]}"; do
     contract="${entry##*:}"
     src="$CONTRACTS_DIR/solidity/out/$file.sol/$contract.json"
     [[ -f "$src" ]] || { echo "missing artifact: $src" >&2; exit 1; }
-    # Only the fields the loader reads, sorted, so the committed file diffs
-    # cleanly and carries nothing about the machine that built it.
+    # Only the fields the loader reads, sorted, so two runs diff cleanly and
+    # the file carries nothing about the machine that built it.
     mkdir -p "$STAGE/$file.sol"
     jq -S '{
         bytecode: {
