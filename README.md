@@ -219,7 +219,7 @@ only secret in the flow is the KMS key, which never leaves AWS.
 
 | Section | Kind | Contents |
 |---|---|---|
-| `[network]` | input | `name`, `chain_id` (apply refuses a mismatch), `rpc_url` |
+| `[network]` | input | `name`, `chain_id` (apply refuses a mismatch, whichever endpoint answers), `rpc_url` (the endpoint the file's own environment reaches; `--rpc-url` names another without touching the file) |
 | `[aws]` | input | `region`, `kms_deployer` (key id / `alias/...` / ARN; the default signer) |
 | `[accounts]` | input | `notary` (the notary **signer** — see below), `owner` (the operational owner the factory ends up with; empty = the deployer) — addresses of **keys**, not contracts |
 | `[notary_service]` | input | `fee_wei` — what one attestation verification costs, as a decimal string |
@@ -297,6 +297,16 @@ key, anything else goes to AWS KMS (region/credentials from the ambient AWS
 environment). An all-hex value of the wrong length is rejected as a mangled
 key rather than shipped to AWS.
 
+Every command that contacts a chain takes `--rpc-url <URL>`. A network
+file names the endpoint its own environment reaches (`network.rpc_url`);
+the flag is for a caller somewhere else — the host outside a compose
+network, a CI job with a bare anvil — and it wins outright, the file being
+the default. Only the transport moves: the declared chain id is still
+enforced against whatever answers, every address is still the file's, and
+the file is still never rewritten. A value that does not parse or does not
+answer is an error, never a fallback to the file. `plan --print-addresses`
+is offline and rejects the flag.
+
 Upgrade components: `notary-service`, `proof-verifier`, `identity-names`,
 `google-jwt-roots`, `x-platform-verifier`, `github-platform-verifier`,
 `google-platform-verifier`. Each is a UUPS `upgradeToAndCall`: the entry
@@ -338,23 +348,36 @@ demand reviewers.
 
 ## Local development chain
 
-`networks/local-dev.toml` is the stack as a docker-compose CI brings it up:
-chain 31337 at `http://anvil:8545`, anvil account #0 as deployer and
-operational owner, anvil account #1 as the notary signer, and a **non-zero**
-Notary Fee — a local stack that meters at no charge lets a client attaching
-the wrong value pass, and `WrongValue` is then first seen where it costs
-something. The deployer spec in the file is anvil's own published test key:
-`--signer` specs are classified by shape, so 64 hex characters is a local
-key and no AWS call happens.
+`networks/local-dev.toml` is the stack on a throwaway anvil: chain 31337,
+anvil account #0 as deployer and operational owner, anvil account #1 as the
+notary signer, and a **non-zero** Notary Fee — a local stack that meters at
+no charge lets a client attaching the wrong value pass, and `WrongValue` is
+then first seen where it costs something. The deployer spec in the file is
+anvil's own published test key: `--signer` specs are classified by shape,
+so 64 hex characters is a local key and no AWS call happens.
+
+Its `rpc_url` is the compose service name, `http://anvil:8545`, which only
+resolves inside that network. From anywhere else — the host, a CI job that
+started `anvil --host 127.0.0.1 --port 8545` — the file is consumed as it
+is and `--rpc-url` names the endpoint:
 
 ```sh
+# inside the compose network
 docker compose up -d anvil
 libid-deploy apply --network networks/local-dev.toml --yes \
   --confirm-fresh-deploy --dev
+
+# from the host, or a CI runner with a bare anvil
+anvil --host 127.0.0.1 --port 8545 &
+libid-deploy apply --network networks/local-dev.toml \
+  --rpc-url http://127.0.0.1:8545 --yes --confirm-fresh-deploy --dev
 ```
 
-An integration test applies the committed file against a real anvil, so it
-cannot rot into something that only parses.
+Integration tests apply the committed file, unmodified, against a real
+anvil through `--rpc-url`, so it cannot rot into something that only
+parses, and prove the flag moves nothing but the transport: the same
+addresses land, the file's chain id is enforced against the override, and
+an override that does not answer fails instead of falling back to the file.
 
 ## Adding a network
 
@@ -396,9 +419,12 @@ the newest x86_64 asset.
   the critical declarative cycle — pre-filled file → fresh apply on a
   virgin anvil lands everything AT the declared addresses → second apply is
   a no-op without any flag → the file is BYTE-IDENTICAL throughout — plus
-  drift repair, the Platform Verifier deploy/register/rotate path, and the
+  drift repair, the Platform Verifier deploy/register/rotate path, the
   network-invariance proof: two separate bare anvils converge onto the same
-  declared canonical addresses. The circuit verifier those tests pin is a
+  declared canonical addresses, and the `--rpc-url` contract: the committed
+  local-dev file, unmodified, converges an anvil the file does not name,
+  while a wrong chain id or a dead override is refused. The circuit
+  verifier those tests pin is a
   stand-in contract: what a deploy requires of one is that it HAS code
   whose hash matches, so the wiring is exercised exactly while nothing
   pretends to verify a real proof.

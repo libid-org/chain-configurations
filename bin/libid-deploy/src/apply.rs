@@ -101,6 +101,7 @@ use crate::{
         VerifierKind,
         LAUNCH_VERIFIER_VERSION,
     },
+    rpc::RpcEndpoint,
     signer::SignerSource,
 };
 
@@ -255,34 +256,36 @@ impl Summary {
     }
 }
 
-/// Run the apply: converge the chain onto the declared state. The file is
-/// never rewritten.
+/// Run the apply: converge the chain behind `rpc` onto the declared state.
+/// The file is never rewritten, and the endpoint decides nothing about what
+/// is deployed: the file's chain id is enforced against whatever answers.
 pub async fn run(
     path: &Path,
     cfg: &NetworkConfig,
+    rpc: &RpcEndpoint,
     signer: &SignerSource,
     opts: &Options,
 ) -> Result<Summary> {
-    let rpc_url: url::Url = cfg
-        .network
-        .rpc_url
-        .parse()
-        .map_err(|e| anyhow!("invalid RPC URL: {e}"))?;
-
     let (wallet, sender) = signer.build_wallet(None).await?;
-    info!("applying as {sender:#x} via {}", signer.describe());
-    let provider = ProviderBuilder::new().wallet(wallet).connect_http(rpc_url);
+    info!(
+        "applying as {sender:#x} via {} against {}",
+        signer.describe(),
+        rpc.describe()
+    );
+    let provider = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(rpc.url().clone());
 
-    let chain_id = provider
-        .get_chain_id()
-        .await
-        .map_err(|e| anyhow!("failed to read the chain id: {e}"))?;
+    let chain_id = provider.get_chain_id().await.map_err(|e| {
+        anyhow!("failed to read the chain id from {}: {e}", rpc.describe())
+    })?;
     if chain_id != cfg.network.chain_id {
         bail!(
-            "chain id mismatch: {} expects {}, the RPC reports {chain_id} — refusing \
-             to send anything",
+            "chain id mismatch: {} expects {}, {} reports {chain_id} — refusing to \
+             send anything",
             cfg.network.name,
-            cfg.network.chain_id
+            cfg.network.chain_id,
+            rpc.describe()
         );
     }
 

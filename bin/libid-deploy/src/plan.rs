@@ -57,6 +57,7 @@ use crate::{
         Platform,
         LAUNCH_VERIFIER_VERSION,
     },
+    rpc::RpcEndpoint,
 };
 
 /// What a plan concluded about one component.
@@ -91,6 +92,9 @@ pub struct Item {
 pub struct Plan {
     /// Network name from the file.
     pub network: String,
+    /// The endpoint that answered — the file's `network.rpc_url` unless
+    /// `--rpc-url` named another.
+    pub rpc_url: String,
     /// Chain id the file expects.
     pub chain_id_expected: u64,
     /// Chain id the RPC reported.
@@ -120,8 +124,8 @@ impl Plan {
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "Plan for {} (chain {} — RPC reports {})",
-            self.network, self.chain_id_expected, self.chain_id_actual
+            "Plan for {} via {} (chain {} — RPC reports {})",
+            self.network, self.rpc_url, self.chain_id_expected, self.chain_id_actual
         );
         for item in &self.items {
             let tag = match item.status {
@@ -184,18 +188,12 @@ async fn check_code<P: Provider>(
     }
 }
 
-/// Compare the desired state with the chain.
-pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
-    let rpc_url: url::Url = cfg
-        .network
-        .rpc_url
-        .parse()
-        .map_err(|e| anyhow!("invalid RPC URL: {e}"))?;
-    let provider = ProviderBuilder::new().connect_http(rpc_url);
-    let chain_id_actual = provider
-        .get_chain_id()
-        .await
-        .map_err(|e| anyhow!("failed to read the chain id: {e}"))?;
+/// Compare the desired state with the chain behind `rpc`.
+pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
+    let provider = ProviderBuilder::new().connect_http(rpc.url().clone());
+    let chain_id_actual = provider.get_chain_id().await.map_err(|e| {
+        anyhow!("failed to read the chain id from {}: {e}", rpc.describe())
+    })?;
 
     let mut b = Builder { items: Vec::new() };
     if chain_id_actual != cfg.network.chain_id {
@@ -375,6 +373,7 @@ pub async fn build(cfg: &NetworkConfig) -> Result<Plan> {
 
     Ok(Plan {
         network: cfg.network.name.clone(),
+        rpc_url: rpc.url().to_string(),
         chain_id_expected: cfg.network.chain_id,
         chain_id_actual,
         items: b.items,

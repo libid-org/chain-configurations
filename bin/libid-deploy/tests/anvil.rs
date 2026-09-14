@@ -60,6 +60,7 @@ use libid_deploy::{
         VerifierKind,
         LAUNCH_VERIFIER_VERSION,
     },
+    rpc::RpcEndpoint,
     signer::SignerSource,
 };
 
@@ -81,10 +82,32 @@ const NOTARY_FEE_WEI: u64 = 1_000_000_000_000_000;
 /// fits under EIP-170, and a test that raised the limit would stop
 /// proving it.
 fn spawn_anvil() -> AnvilInstance {
-    alloy::node_bindings::Anvil::new()
-        .arg("--disable-default-create2-deployer")
+    anvil_builder()
         .try_spawn()
         .expect("anvil spawns (is foundry on PATH?)")
+}
+
+fn anvil_builder() -> alloy::node_bindings::Anvil {
+    alloy::node_bindings::Anvil::new().arg("--disable-default-create2-deployer")
+}
+
+/// An `http://127.0.0.1:<port>` nothing listens on: the port is taken from
+/// the kernel and released again, so a connection is refused at once.
+fn closed_endpoint() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}")
+}
+
+/// The committed `networks/local-dev.toml`, read from the repository.
+fn committed_local_dev() -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../networks/local-dev.toml")
+}
+
+/// `--rpc-url <endpoint>` over `cfg`.
+fn override_rpc(cfg: &NetworkConfig, endpoint: &str) -> RpcEndpoint {
+    RpcEndpoint::resolve(cfg, Some(endpoint)).expect("the override resolves")
 }
 
 /// A network file PRE-FILLED with the full canonical address table —
@@ -158,11 +181,16 @@ async fn deploy_stand_in(rpc: &str, key: &str) -> Address {
     .expect("stand-in deploys")
 }
 
-/// Apply `path` against its chain with the anvil #0 key.
+/// The endpoint the file itself names — no `--rpc-url`.
+fn file_rpc(cfg: &NetworkConfig) -> RpcEndpoint {
+    RpcEndpoint::resolve(cfg, None).expect("the file's endpoint resolves")
+}
+
+/// Apply `path` against the chain it names with the anvil #0 key.
 async fn apply_with(path: &std::path::Path, opts: apply::Options) -> apply::Summary {
     let cfg = NetworkConfig::load(path).expect("config loads");
     let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
-    apply::run(path, &cfg, &signer, &opts)
+    apply::run(path, &cfg, &file_rpc(&cfg), &signer, &opts)
         .await
         .expect("apply converges")
 }
@@ -234,7 +262,9 @@ async fn declarative_apply_cycle_never_touches_the_config() {
     let cfg = NetworkConfig::load(&path).expect("config loads");
 
     // Virgin chain: the plan wants everything, including the onboarding gate.
-    let virgin = plan::build(&cfg).await.expect("plan on a virgin chain");
+    let virgin = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan on a virgin chain");
     assert_eq!(virgin.status_of("create2_deployer"), Some(Status::Deploy));
     assert_eq!(virgin.status_of("contracts.factory"), Some(Status::Deploy));
     assert_eq!(
@@ -246,7 +276,14 @@ async fn declarative_apply_cycle_never_touches_the_config() {
     // A fresh deploy without the flag is refused: the guard reads chain
     // state, and a virgin chain means this apply publishes the whole stack.
     let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
-    let refused = apply::run(&path, &cfg, &signer, &apply::Options::default()).await;
+    let refused = apply::run(
+        &path,
+        &cfg,
+        &file_rpc(&cfg),
+        &signer,
+        &apply::Options::default(),
+    )
+    .await;
     assert!(
         refused
             .expect_err("a virgin chain needs the flag")
@@ -348,7 +385,9 @@ async fn declarative_apply_cycle_never_touches_the_config() {
         "the second apply deployed {:?}",
         again.deployed
     );
-    let settled = plan::build(&cfg).await.expect("plan after apply");
+    let settled = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan after apply");
     assert!(
         !settled.has_deploys(),
         "the settled plan still wants deploys:\n{}",
@@ -434,7 +473,9 @@ async fn apply_converges_drifted_wiring_without_redeploying() {
         .await
         .unwrap();
 
-    let drifted = plan::build(&cfg).await.expect("plan sees the drift");
+    let drifted = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan sees the drift");
     assert_eq!(
         drifted.status_of("identity_names.proof_verifier"),
         Some(Status::Configure)
@@ -706,7 +747,9 @@ async fn platform_verifiers_deploy_wire_and_register() {
     let again = apply_with(&path, apply::Options::default()).await;
     assert!(again.deployed.is_empty(), "{:?}", again.deployed);
     assert!(again.configured.is_empty(), "{:?}", again.configured);
-    let settled = plan::build(&cfg).await.expect("plan after apply");
+    let settled = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan after apply");
     assert!(
         !settled.has_deploys(),
         "the settled plan still wants deploys:\n{}",
@@ -815,7 +858,9 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
         .await
         .unwrap();
 
-    let drifted = plan::build(&cfg).await.expect("plan sees the pin drift");
+    let drifted = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan sees the pin drift");
     assert_eq!(
         drifted.status_of("contracts.x_platform_verifier.trust_roots"),
         Some(Status::Configure)
@@ -847,25 +892,25 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
     );
 }
 
-/// The committed local-dev file is not just parseable: it converges a real
-/// anvil, signing with the deployer spec it carries. Only the RPC endpoint
-/// is substituted, because the compose service name does not resolve here.
+/// The committed local-dev file is not just parseable: UNMODIFIED, it
+/// converges a real anvil the file does not name, signing with the
+/// deployer spec it carries. Its `rpc_url` is the compose service name,
+/// which does not resolve here; `--rpc-url` is the way in from outside that
+/// network, and the file stays byte-identical through the apply.
 #[tokio::test]
-async fn the_committed_local_dev_file_converges_an_anvil() {
+async fn the_committed_local_dev_file_converges_an_anvil_through_rpc_url() {
     let anvil = spawn_anvil();
-    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../networks/local-dev.toml");
-    let body = std::fs::read_to_string(&source)
-        .expect("networks/local-dev.toml readable")
-        .replace(
-            "rpc_url = \"http://anvil:8545\"",
-            &format!("rpc_url = \"{}\"", anvil.endpoint()),
-        );
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("local-dev.toml");
-    std::fs::write(&path, &body).expect("write config");
+    let path = committed_local_dev();
+    let before = std::fs::read(&path).expect("networks/local-dev.toml readable");
 
     let cfg = NetworkConfig::load(&path).expect("local-dev loads");
+    assert_eq!(
+        cfg.network.rpc_url, "http://anvil:8545",
+        "the committed file names the compose service, not this anvil"
+    );
+    let rpc = override_rpc(&cfg, &anvil.endpoint());
+    assert!(rpc.is_override());
+
     // The signer spec in the file is what apply uses by default — no
     // --signer, no AWS.
     let signer = SignerSource::from_spec(&cfg.aws.kms_deployer).expect("signer spec");
@@ -873,6 +918,7 @@ async fn the_committed_local_dev_file_converges_an_anvil() {
     apply::run(
         &path,
         &cfg,
+        &rpc,
         &signer,
         &apply::Options {
             confirm_fresh_deploy: true,
@@ -882,6 +928,12 @@ async fn the_committed_local_dev_file_converges_an_anvil() {
     )
     .await
     .expect("local-dev converges");
+
+    assert_eq!(
+        std::fs::read(&path).expect("readable after apply"),
+        before,
+        "apply rewrote the committed file"
+    );
 
     let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
     assert_declared_and_present(&provider, &cfg).await;
@@ -913,4 +965,203 @@ async fn the_committed_local_dev_file_converges_an_anvil() {
             .unwrap(),
         ANVIL_OWNER.parse::<Address>().unwrap()
     );
+}
+
+/// `--rpc-url` moves the transport and nothing else. The file names an
+/// endpoint nothing listens on; through the override everything lands at
+/// the addresses the file declares — `predict_address(factory, name)`, the
+/// same CREATE3 salts as any other network — the file still names its dead
+/// endpoint afterwards, and a second apply through the override is a
+/// no-op.
+#[tokio::test]
+async fn rpc_override_moves_only_the_transport() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dead = closed_endpoint();
+    let path = prefilled_network_file(dir.path(), &dead);
+    let before = std::fs::read(&path).unwrap();
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+
+    // The file's own endpoint really is unusable, or this proves nothing.
+    plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect_err("nothing listens where the file points");
+
+    let rpc = override_rpc(&cfg, &anvil.endpoint());
+    let signer = SignerSource::from_spec(ANVIL_KEY).unwrap();
+    let opts = apply::Options {
+        confirm_fresh_deploy: true,
+        dev: true,
+        ..Default::default()
+    };
+    let summary = apply::run(&path, &cfg, &rpc, &signer, &opts)
+        .await
+        .expect("apply converges through the override");
+
+    // Every canonical component deployed, at exactly the file's address.
+    let factory = predict_factory_address(&Artifacts::embedded()).unwrap();
+    for c in names::CANONICAL_CONTRACTS {
+        let declared: Address = cfg.contracts.raw(c.key).unwrap().parse().unwrap();
+        let landed = summary
+            .deployed
+            .iter()
+            .find(|(component, _)| component == &format!("contracts.{}", c.key))
+            .unwrap_or_else(|| panic!("{} was not deployed", c.key))
+            .1;
+        assert_eq!(landed, declared, "{} moved off its declared address", c.key);
+        assert_eq!(landed, predict_address(factory, c.name));
+    }
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    assert_declared_and_present(&provider, &cfg).await;
+    for circuit in ceremony::CIRCUITS {
+        let addr = circuit_verifier_address(circuit);
+        assert!(
+            !provider.get_code_at(addr).await.unwrap().is_empty(),
+            "{} has no code at its CREATE3 address {addr:#x}",
+            circuit.name
+        );
+    }
+
+    // The file is untouched and still names the dead endpoint; the
+    // override lived only in the invocation.
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(NetworkConfig::load(&path).unwrap().network.rpc_url, dead);
+
+    let settled = plan::build(&cfg, &rpc)
+        .await
+        .expect("plan through the override");
+    assert_eq!(settled.rpc_url, rpc.url().to_string());
+    assert!(!settled.has_deploys(), "{}", settled.render());
+    let again = apply::run(&path, &cfg, &rpc, &signer, &apply::Options::default())
+        .await
+        .expect("second apply through the override");
+    assert!(again.deployed.is_empty(), "{:?}", again.deployed);
+}
+
+/// A set-but-unusable override is an error, never a fallback: the file
+/// names a LIVE anvil, the flag names a dead port, and both plan and apply
+/// must fail without touching the live chain.
+#[tokio::test]
+async fn rpc_override_never_falls_back_to_the_file() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prefilled_network_file(dir.path(), &anvil.endpoint());
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let dead = closed_endpoint();
+    let rpc = override_rpc(&cfg, &dead);
+
+    let err = plan::build(&cfg, &rpc)
+        .await
+        .expect_err("plan must not fall back to the file's endpoint")
+        .to_string();
+    assert!(err.contains(&dead), "{err}");
+    assert!(err.contains("--rpc-url"), "{err}");
+
+    let signer = SignerSource::from_spec(ANVIL_KEY).unwrap();
+    let opts = apply::Options {
+        confirm_fresh_deploy: true,
+        dev: true,
+        ..Default::default()
+    };
+    let err = apply::run(&path, &cfg, &rpc, &signer, &opts)
+        .await
+        .expect_err("apply must not fall back to the file's endpoint")
+        .to_string();
+    assert!(err.contains(&dead), "{err}");
+
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    assert_eq!(
+        provider.get_block_number().await.unwrap(),
+        0,
+        "something reached the chain the file names"
+    );
+}
+
+/// The override changes where the calls go, not which chain the file
+/// describes: an anvil on another chain id is refused with the file's
+/// number, and nothing is sent.
+#[tokio::test]
+async fn rpc_override_still_enforces_the_declared_chain_id() {
+    let other = anvil_builder()
+        .args(["--chain-id", "31338"])
+        .try_spawn()
+        .expect("anvil spawns");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prefilled_network_file(dir.path(), &closed_endpoint());
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    assert_eq!(cfg.network.chain_id, 31337);
+    let rpc = override_rpc(&cfg, &other.endpoint());
+
+    let plan = plan::build(&cfg, &rpc).await.expect("plan is read-only");
+    assert_eq!(plan.chain_id_actual, 31338);
+    assert_eq!(plan.status_of("network.chain_id"), Some(Status::Warn));
+
+    let signer = SignerSource::from_spec(ANVIL_KEY).unwrap();
+    let opts = apply::Options {
+        confirm_fresh_deploy: true,
+        dev: true,
+        ..Default::default()
+    };
+    let err = apply::run(&path, &cfg, &rpc, &signer, &opts)
+        .await
+        .expect_err("apply refuses the wrong chain")
+        .to_string();
+    assert!(err.contains("chain id mismatch"), "{err}");
+    assert!(err.contains("31337") && err.contains("31338"), "{err}");
+
+    let provider = ProviderBuilder::new().connect_http(other.endpoint_url());
+    assert_eq!(provider.get_block_number().await.unwrap(), 0);
+}
+
+/// The command line a consumer with a bare anvil runs — keeper's CI, a
+/// developer on the host — against the committed file, unmodified. Pins the
+/// flag name downstream depends on.
+#[test]
+fn the_cli_applies_the_committed_file_through_rpc_url() {
+    let anvil = spawn_anvil();
+    let path = committed_local_dev();
+    let before = std::fs::read(&path).unwrap();
+    let bin = env!("CARGO_BIN_EXE_libid-deploy");
+
+    let apply = std::process::Command::new(bin)
+        .arg("apply")
+        .arg("--network")
+        .arg(&path)
+        .arg("--rpc-url")
+        .arg(anvil.endpoint())
+        .args(["--yes", "--confirm-fresh-deploy", "--dev"])
+        .output()
+        .expect("libid-deploy runs");
+    let stdout = String::from_utf8_lossy(&apply.stdout);
+    let stderr = String::from_utf8_lossy(&apply.stderr);
+    assert!(apply.status.success(), "apply failed\n{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("Deployed (all at their declared canonical addresses):"),
+        "{stdout}"
+    );
+    for c in names::CANONICAL_CONTRACTS {
+        let addr = plan::predicted(c.key).unwrap();
+        assert!(
+            stdout.contains(&format!("contracts.{} = {addr:#x}", c.key)),
+            "{} missing from the summary:\n{stdout}",
+            c.key
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    let plan = std::process::Command::new(bin)
+        .arg("plan")
+        .arg("--network")
+        .arg(&path)
+        .arg("--rpc-url")
+        .arg(anvil.endpoint())
+        .output()
+        .expect("libid-deploy runs");
+    let stdout = String::from_utf8_lossy(&plan.stdout);
+    assert!(plan.status.success(), "{stdout}");
+    assert!(
+        stdout.starts_with(&format!("Plan for local-dev via {}/", anvil.endpoint())),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("DEPLOY"), "{stdout}");
 }
