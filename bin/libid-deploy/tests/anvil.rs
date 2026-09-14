@@ -34,11 +34,15 @@ use libid_contracts::{
         ceremony::{
             CeremonyProofVerifier,
             GoogleJwtRoots,
+            GooglePlatformVerifier,
             NotaryService,
+            TlsNotaryPlatformVerifier,
         },
+        circuits::HonkVerifier,
         factory::LibidFactory,
         identity::IdentityNames,
     },
+    circuits::LIBRARIES,
     deploy::deploy_contract_from,
     factory::{
         predict_address,
@@ -48,7 +52,10 @@ use libid_contracts::{
 };
 use libid_deploy::{
     apply,
-    ceremony,
+    circuits::{
+        self,
+        Circuit,
+    },
     config::NetworkConfig,
     names,
     plan::{
@@ -226,7 +233,7 @@ async fn assert_declared_and_present<P: Provider>(provider: &P, cfg: &NetworkCon
 /// handing it a proof of the wrong length. The error is
 /// `ProofLengthWrongWithLogN`, which only a Honk verifier raises.
 async fn honk_log_n<P: Provider>(provider: &P, verifier: Address) -> u64 {
-    let err = ceremony::HonkVerifier::new(verifier, provider)
+    let err = HonkVerifier::new(verifier, provider)
         .verify(Bytes::new(), Vec::new())
         .call()
         .await
@@ -234,17 +241,17 @@ async fn honk_log_n<P: Provider>(provider: &P, verifier: Address) -> u64 {
     let data = err
         .as_revert_data()
         .expect("the verifier reverted with data");
-    let decoded = ceremony::HonkVerifier::ProofLengthWrongWithLogN::abi_decode(&data)
+    let decoded = HonkVerifier::ProofLengthWrongWithLogN::abi_decode(&data)
         .expect("only a Honk verifier raises ProofLengthWrongWithLogN");
     decoded.logN.to::<u64>()
 }
 
 /// The address apply deploys a circuit's Honk verifier to: CREATE3 under a
-/// name carrying the pinned circuits version, so it is known before the
+/// name carrying the pinned circuits release, so it is known before the
 /// chain has anything on it.
-fn circuit_verifier_address(circuit: &ceremony::Circuit) -> Address {
+fn circuit_verifier_address(circuit: Circuit) -> Address {
     let factory = predict_factory_address(&Artifacts::embedded()).unwrap();
-    predict_address(factory, &circuit.factory_name().unwrap())
+    predict_address(factory, &circuits::factory_name(circuit).unwrap())
 }
 
 /// The critical test: pre-filled declarative config → fresh apply on a
@@ -553,12 +560,12 @@ async fn fresh_apply_addresses_are_network_invariant() {
     }
 }
 
-/// The Platform Verifiers, end to end on a virgin chain: one apply builds
-/// the two ceremony circuits' Honk verifiers from the vendored artifacts,
-/// deploys a Platform Verifier per platform pinned to the right one — by
-/// address AND by the code hash the chain reports — registers each into the
-/// Supported Version Set, and leaves the naming system resolving and
-/// quoting for all three.
+/// The Platform Verifiers, end to end on a virgin chain: one apply deploys
+/// the two ceremony circuits' Honk verifiers from the embedded artifacts on
+/// ONE shared copy of each library, deploys a Platform Verifier per
+/// platform pinned to the right one — by address AND by the code hash the
+/// chain reports — registers each into the Supported Version Set, and
+/// leaves the naming system resolving and quoting for all three.
 #[tokio::test]
 async fn platform_verifiers_deploy_wire_and_register() {
     let anvil = spawn_anvil();
@@ -567,7 +574,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
     let before = std::fs::read(&path).expect("read config");
     let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
 
-    apply_with(
+    let fresh = apply_with(
         &path,
         apply::Options {
             confirm_fresh_deploy: true,
@@ -580,30 +587,66 @@ async fn platform_verifiers_deploy_wire_and_register() {
     let cfg = NetworkConfig::load(&path).expect("config loads");
     assert_declared_and_present(&provider, &cfg).await;
 
+    // Each library deployed exactly once, at the address its bytecode
+    // derives — the same on every chain — however many verifiers link it.
+    let libraries = circuits::library_addresses().unwrap();
+    assert_eq!(libraries.len(), LIBRARIES.len());
+    let deployed_libraries: Vec<(&str, Address)> = fresh
+        .deployed
+        .iter()
+        .filter_map(|(component, addr)| {
+            component
+                .strip_prefix("circuits.library.")
+                .map(|library| (library, *addr))
+        })
+        .collect();
+    assert_eq!(
+        deployed_libraries.len(),
+        LIBRARIES.len(),
+        "{:?}",
+        fresh.deployed
+    );
+    for (library, addr) in &deployed_libraries {
+        assert_eq!(libraries.get(addr), Some(library), "{library} at {addr:#x}");
+        assert!(
+            !provider.get_code_at(*addr).await.unwrap().is_empty(),
+            "{library} has no code at {addr:#x}"
+        );
+    }
+
     // Both circuit verifiers are real Honk verifiers at their CREATE3
     // addresses, over DIFFERENT circuits. A bb verifier has no getter for
     // its verification key; the one thing it says about itself is the logN
     // a wrong-length proof comes back with, so that is what separates a
-    // real verifier from a contract that merely has code.
+    // real verifier from a contract that merely has code. And each one's
+    // runtime code carries the SHARED library addresses: that is what
+    // links them, and what the pinned code hash covers.
     let mut log_n = Vec::new();
-    for circuit in ceremony::CIRCUITS {
+    for circuit in Circuit::ALL {
         let address = circuit_verifier_address(circuit);
         let code = provider.get_code_at(address).await.unwrap();
         assert!(
             !code.is_empty(),
             "the {} circuit verifier has no code at {address:#x}",
-            circuit.name
+            circuit.name()
         );
         // EIP-170: anvil runs the default limit, so a verifier over it
         // could not have been deployed — this passing IS the size proof.
         assert!(
             code.len() <= 24_576,
             "the {} circuit verifier is {} bytes, over EIP-170",
-            circuit.name,
+            circuit.name(),
             code.len()
         );
+        for (addr, library) in &libraries {
+            assert!(
+                code.windows(20).any(|w| w == addr.as_slice()),
+                "the {} circuit verifier does not link the shared {library} at {addr:#x}",
+                circuit.name()
+            );
+        }
         let reported = honk_log_n(&provider, address).await;
-        assert!(reported > 0, "{} reports no circuit size", circuit.name);
+        assert!(reported > 0, "{} reports no circuit size", circuit.name());
         log_n.push(reported);
     }
     assert_ne!(
@@ -627,7 +670,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
             .unwrap()
             .parse()
             .unwrap();
-        let verifier = ceremony::TlsPlatformVerifier::new(proxy, &provider);
+        let verifier = TlsNotaryPlatformVerifier::new(proxy, &provider);
 
         // It answers for its own platform, and pins the verifier of the
         // circuit its proofs are made under — nonzero, at the address the
@@ -638,7 +681,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
             "{} serves the wrong platform",
             platform.label
         );
-        let circuit = circuit_verifier_address(&platform.circuit);
+        let circuit = circuit_verifier_address(platform.circuit());
         let wired = verifier.honkVerifier().call().await.unwrap();
         assert_ne!(wired, Address::ZERO, "{} pins nothing", platform.label);
         assert_eq!(wired, circuit, "{} pins the wrong circuit", platform.label);
@@ -677,7 +720,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
                     Address::ZERO
                 );
                 assert_eq!(
-                    ceremony::GooglePlatformVerifier::new(proxy, &provider)
+                    GooglePlatformVerifier::new(proxy, &provider)
                         .jwtRoots()
                         .call()
                         .await
@@ -732,7 +775,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
     let mut pinned = Vec::new();
     for proxy in [x_proxy, github_proxy, google_proxy] {
         pinned.push(
-            ceremony::TlsPlatformVerifier::new(proxy, &provider)
+            TlsNotaryPlatformVerifier::new(proxy, &provider)
                 .honkVerifier()
                 .call()
                 .await
@@ -743,7 +786,8 @@ async fn platform_verifiers_deploy_wire_and_register() {
     assert_ne!(pinned[0], pinned[2], "Google shares X's circuit");
 
     // A second apply deploys and configures nothing more: the circuit
-    // verifiers are CREATE3-named, so a converged chain is recognised.
+    // verifiers are CREATE3-named and the libraries bytecode-addressed, so
+    // a converged chain is recognised.
     let again = apply_with(&path, apply::Options::default()).await;
     assert!(again.deployed.is_empty(), "{:?}", again.deployed);
     assert!(again.configured.is_empty(), "{:?}", again.configured);
@@ -755,9 +799,15 @@ async fn platform_verifiers_deploy_wire_and_register() {
         "the settled plan still wants deploys:\n{}",
         settled.render()
     );
-    for circuit in ceremony::CIRCUITS {
+    for circuit in Circuit::ALL {
         assert_eq!(
-            settled.status_of(&format!("circuits.{}", circuit.name)),
+            settled.status_of(&format!("circuits.{}", circuit.name())),
+            Some(Status::Ok)
+        );
+    }
+    for library in LIBRARIES {
+        assert_eq!(
+            settled.status_of(&format!("circuits.library.{library}")),
             Some(Status::Ok)
         );
     }
@@ -794,9 +844,9 @@ async fn platform_verifiers_deploy_wire_and_register() {
             .unwrap()
             .parse()
             .unwrap();
-        let circuit = circuit_verifier_address(&platform.circuit);
+        let circuit = circuit_verifier_address(platform.circuit());
         assert_eq!(
-            ceremony::TlsPlatformVerifier::new(proxy, &provider)
+            TlsNotaryPlatformVerifier::new(proxy, &provider)
                 .honkVerifierCodehash()
                 .call()
                 .await
@@ -835,7 +885,7 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
     let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
     let notary_service: Address = cfg.contracts.notary_service.parse().unwrap();
     let x_proxy: Address = cfg.contracts.x_platform_verifier.parse().unwrap();
-    let pinned = circuit_verifier_address(&platforms::X.circuit);
+    let pinned = circuit_verifier_address(platforms::X.circuit());
 
     // Drift: the owner points X at some other contract with code. It would
     // never accept a proof, which is why apply must pull the pin back.
@@ -845,7 +895,7 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
     let owned = ProviderBuilder::new()
         .wallet(alloy::network::EthereumWallet::from(key))
         .connect_http(anvil.endpoint_url());
-    ceremony::TlsPlatformVerifier::new(x_proxy, &owned)
+    TlsNotaryPlatformVerifier::new(x_proxy, &owned)
         .setTrustRoots(
             notary_service,
             elsewhere,
@@ -869,7 +919,7 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
 
     let repaired = apply_with(&path, apply::Options::default()).await;
     assert!(repaired.deployed.is_empty(), "{:?}", repaired.deployed);
-    let x = ceremony::TlsPlatformVerifier::new(x_proxy, &provider);
+    let x = TlsNotaryPlatformVerifier::new(x_proxy, &provider);
     assert_eq!(x.honkVerifier().call().await.unwrap(), pinned);
     assert_eq!(
         x.honkVerifierCodehash().call().await.unwrap(),
@@ -1013,12 +1063,12 @@ async fn rpc_override_moves_only_the_transport() {
     }
     let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
     assert_declared_and_present(&provider, &cfg).await;
-    for circuit in ceremony::CIRCUITS {
+    for circuit in Circuit::ALL {
         let addr = circuit_verifier_address(circuit);
         assert!(
             !provider.get_code_at(addr).await.unwrap().is_empty(),
             "{} has no code at its CREATE3 address {addr:#x}",
-            circuit.name
+            circuit.name()
         );
     }
 

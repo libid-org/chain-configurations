@@ -32,6 +32,7 @@ use libid_contracts::{
             CeremonyProofVerifier,
             GoogleJwtRoots,
             NotaryService,
+            TlsNotaryPlatformVerifier,
         },
         factory::LibidFactory,
         identity::IdentityNames,
@@ -46,7 +47,10 @@ use libid_contracts::{
 use serde::Serialize;
 
 use crate::{
-    ceremony,
+    circuits::{
+        self,
+        Circuit,
+    },
     config::{
         required_address,
         NetworkConfig,
@@ -316,17 +320,38 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
 
     // ── The ceremony circuit verifiers ───────────────────────────────────
     // apply deploys these through the factory under a name carrying the
-    // pinned circuits version, so the address is a pure function of which
-    // artifact it is — known here before the chain has anything on it.
-    let mut circuits: BTreeMap<&str, (Address, Option<B256>)> = BTreeMap::new();
-    for circuit in ceremony::CIRCUITS {
-        let name = circuit.factory_name()?;
+    // pinned circuits release, so the address is a pure function of which
+    // artifact it is — known here before the chain has anything on it. The
+    // libraries they link land at an address derived from their bytecode,
+    // known the same way; one deployment serves every verifier.
+    for (address, library) in circuits::library_addresses()? {
+        let component = format!("circuits.library.{library}");
+        let code = provider
+            .get_code_at(address)
+            .await
+            .map_err(|e| anyhow!("get_code({component}) failed: {e}"))?;
+        if code.is_empty() {
+            b.push(
+                component,
+                Status::Deploy,
+                format!(
+                    "{address:#x} has no code — apply would deploy it there, once, for \
+                     every verifier that links it"
+                ),
+            );
+        } else {
+            b.push(component, Status::Ok, format!("{address:#x}"));
+        }
+    }
+    let mut verifiers: BTreeMap<Circuit, (Address, Option<B256>)> = BTreeMap::new();
+    for circuit in Circuit::ALL {
+        let name = circuits::factory_name(circuit)?;
         let address = predict_address(declared_factory, &name);
         let code = provider
             .get_code_at(address)
             .await
             .map_err(|e| anyhow!("get_code({name}) failed: {e}"))?;
-        let component = format!("circuits.{}", circuit.name);
+        let component = format!("circuits.{}", circuit.name());
         let hash = if code.is_empty() {
             b.push(
                 &component,
@@ -346,13 +371,13 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
             );
             Some(hash)
         };
-        circuits.insert(circuit.name, (address, hash));
+        verifiers.insert(circuit, (address, hash));
     }
 
     // ── The Platform Verifiers ───────────────────────────────────────────
     for platform in platforms::LAUNCH {
-        let circuit = *circuits
-            .get(platform.circuit.name)
+        let circuit = *verifiers
+            .get(&platform.circuit())
             .ok_or_else(|| anyhow!("{} has no circuit plan", platform.label))?;
         plan_platform_verifier(
             &mut b,
@@ -548,7 +573,7 @@ async fn plan_platform_verifier<P: Provider>(
 
     let present = check_code(b, provider, &component, proxy).await?;
     if present {
-        let verifier = ceremony::TlsPlatformVerifier::new(proxy, provider);
+        let verifier = TlsNotaryPlatformVerifier::new(proxy, provider);
         let wired = verifier.honkVerifier().call().await;
         let wired_hash = verifier.honkVerifierCodehash().call().await;
         match (wired, wired_hash) {
@@ -558,7 +583,7 @@ async fn plan_platform_verifier<P: Provider>(
                 b.push(
                     format!("{component}.trust_roots"),
                     Status::Ok,
-                    format!("pins {addr:#x} ({})", platform.circuit.name),
+                    format!("pins {addr:#x} ({})", platform.circuit().name()),
                 );
             }
             (Ok(addr), Ok(_)) => b.push(
@@ -567,7 +592,7 @@ async fn plan_platform_verifier<P: Provider>(
                 format!(
                     "pins {addr:#x}, the pinned {} verifier is {circuit_address:#x} — \
                      apply sends setTrustRoots",
-                    platform.circuit.name
+                    platform.circuit().name()
                 ),
             ),
             _ => b.push(
