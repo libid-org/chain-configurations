@@ -26,14 +26,14 @@ The model is DECLARATIVE:
    therefore use identical config data regardless of which chain (or how
    little of the stack) exists yet.
 
-Contract bytecode is embedded in the binary: the core stack via the
-[`libid-contracts`](https://github.com/libid-org/libid-contracts) crate,
-the Platform Verifiers and the ceremony circuits' Honk verifiers from
-`bin/libid-deploy/artifacts/`, generated at build time (see below). There
-is no forge build, no bb and no artifact directory at runtime. The platform
-tables come from `libid-identity` and `libid-profiles`, generated from the
-same sources the contracts are, so nothing here restates a value the chain
-also holds.
+Contract bytecode is embedded in the binary through the
+[`libid-contracts`](https://github.com/libid-org/libid-contracts) crate —
+the core stack, the Platform Verifiers and the ceremony circuits' Honk
+verifiers alike, compiled once upstream from the pinned sources. There is
+no forge build, no bb and no artifact directory anywhere in this
+repository. The platform tables come from `libid-identity` and
+`libid-profiles`, generated from the same sources the contracts are, so
+nothing here restates a value the chain also holds.
 
 ## The stack
 
@@ -60,7 +60,8 @@ Then two steps `Deploy.s.sol` does not have:
 
 5. **A Honk verifier per ceremony circuit** — the bb-generated UltraHonk
    verifier each platform's proofs are checked under, deployed through the
-   factory under a CREATE3 name carrying the pinned circuits version.
+   factory under a CREATE3 name carrying the pinned circuits release, on
+   one shared deployment of each library it links.
 6. **A Platform Verifier per platform** — `XPlatformVerifier`,
    `GitHubPlatformVerifier`, `GooglePlatformVerifier` — deployed behind its
    own CREATE3 proxy, pinned to its circuit's verifier by address and code
@@ -74,48 +75,24 @@ Then two steps `Deploy.s.sol` does not have:
 
 ### Where the bytecode comes from
 
-`libid-contracts` embeds compiled bytecode only for the contracts its
-`COVERED` list names, and the Platform Verifiers are not among them — its
-own `script/Deploy.s.sol` registers none either. Nor does anything upstream
-ship a Honk verifier: one derives from a circuit's verification key, which
-[`libid-circuits`](https://github.com/libid-org/libid-circuits) publishes
-as a release asset. `scripts/vendor-artifacts.sh` builds all of them into
-`bin/libid-deploy/artifacts/` from two committed pins:
+Not from here. Each derivation runs once, in the repository that owns its
+tool: [`libid-circuits`](https://github.com/libid-org/libid-circuits) runs
+`bb` and publishes each circuit's generated verifier in its release
+tarball, `libid-contracts` vendors that Solidity from the release it pins
+(by sha256 literal, downloaded in its CI, never committed), compiles it
+beside the Platform Verifiers under one `foundry.toml`, and embeds the
+artifacts in the crate. This repository deploys them. The three `libid-*`
+pins in `bin/libid-deploy/Cargo.toml` are the one place every artifact
+moves from — the circuits release the Honk verifiers derive from included
+— and `Cargo.lock` is the only other file a bump touches.
 
-- the Platform Verifiers, from the `libid-contracts` tag `Cargo.toml` pins;
-- the Honk verifiers, from the `libid-circuits` release
-  `bin/libid-deploy/circuits-manifest.json` pins — that file is the
-  release's own manifest, committed verbatim, so the version the script
-  fetches and the sha256 it checks each asset against are one document. The
-  script runs `bb write_solidity_verifier` on the released `vk` (at the bb
-  version the manifest names), applies the two rewrites `libid-circuits`'
-  `scripts/gen-verifier.sh` applies, and compiles the result under the same
-  `foundry.toml` the Platform Verifiers build with.
-
-Both pins are **derived, never restated**, so vendored bytecode and typed
-bindings cannot come from different releases. Unit tests check every bound
-selector against the artifact's `methodIdentifiers`, that each circuit
-verifier exposes the `verify(bytes,bytes32[])` its Platform Verifier calls,
-and that both libraries a bb verifier links are vendored beside it.
-
-The directory is gitignored: CI regenerates it before every cargo step,
-and a local build runs the script first (see
-[Development](#development)). Generate, and regenerate after moving
-either pin:
-
-```sh
-scripts/vendor-artifacts.sh                            # both pins as committed
-scripts/vendor-artifacts.sh --contracts ../libid-contracts
-scripts/vendor-artifacts.sh --circuits 0.4.0           # move the circuits pin
-```
-
-`--circuits` rewrites `circuits-manifest.json`; commit that, it is the
-pin. The build is deterministic (`solc` pinned to 0.8.33, `via_ir`,
-`bytecode_hash = "none"`, and a `vk` taken from the release rather than a
-local circuit build), so every run from the same pins produces the same
-bytes on any machine, and two runs that differ mean the sources moved,
-not the build. Each CI run's summary lists the sha256 of every file the
-binary embedded.
+The circuits release the embedded verifiers came from is read back out of
+the crate (`libid_contracts::circuits::version`) and becomes part of each
+verifier's factory name below, so the name follows the pin and cannot be
+restated. The crate's own tests hold the bindings to the artifacts: every
+bound selector against `methodIdentifiers`, `verify(bytes,bytes32[])` on
+every circuit verifier, both libraries covered beside every verifier that
+links them.
 
 ### How the circuit verifier is wired
 
@@ -139,9 +116,19 @@ which artifact it is. That is what makes apply idempotent here: a second
 run finds code at the same address and sends nothing. It is also the
 rotation path — a circuits release is a new name, a new address and a
 `setTrustRoots`, while the Platform Verifier proxy and its registration do
-not move. A verifier links `RelationsLib` and `ZKTranscriptLib` (their
-functions are `external`), which apply deploys and substitutes in, once per
-run however many verifiers reference them.
+not move.
+
+A verifier links `RelationsLib` and `ZKTranscriptLib`: their functions are
+`external`, so they are deployed contracts, and bb writes a copy of both
+into every verifier it generates. The copies compile to identical
+bytecode, and apply deploys each distinct bytecode **once** — through the
+CREATE2 deployer under an empty salt, so a library's address is a function
+of its code (`libid_contracts::deploy::library_address`): the same on
+every chain, found rather than deployed again on a re-run, and shared by
+every verifier that links it. A fresh chain pays for two libraries and two
+verifiers, not six contracts. Because a verifier's runtime code carries
+those addresses, its code hash — the one the Platform Verifiers pin — is
+network-invariant too.
 
 Both verifiers are about 18 KiB of runtime code, comfortably under the
 EIP-170 limit of 24576; the anvil tests run the default code-size limit, so
@@ -175,13 +162,22 @@ entry = a NEW address, forever, on every network — names are frozen:
 | `contracts.google_platform_verifier` | `libid.GooglePlatformVerifier` | `0xf3d537022362d187715b28bc547f8b2532e6d0cf` |
 
 The circuit verifiers go through the same factory but are not in that
-table and not in any network file: their names carry the circuits pin, so
-they move when it does. At `libid-circuits` 0.3.0 they are
+table and not in any network file: their names carry the circuits release
+`libid-contracts` vendors, so they move when the contracts pin does. The
+libraries they link are not in it either: those land through the CREATE2
+deployer at an address derived from their bytecode, so they move only when
+the bytecode does. At `libid-circuits` 0.4.0 (`libid-contracts` 0.12.0)
+they are
 
 | Component | Name | Address (every network) |
 |---|---|---|
-| `circuits.bearer-link` | `libid.circuits.bearer-link.0.3.0` | `0x21c26fde6a3b481982edd755e535bbfb6e661879` |
-| `circuits.oidc-google` | `libid.circuits.oidc-google.0.3.0` | `0xfe6de589f4b15a652450c1088cfbbaee26c72ba6` |
+| `circuits.bearer-link` | `libid.circuits.bearer-link.0.4.0` | `0xab8c8aabbcd921a8bd944ca693cd2426369d702f` |
+| `circuits.oidc-google` | `libid.circuits.oidc-google.0.4.0` | `0xc1150bc7e095aa56654b5c9f6b4561c1751b8352` |
+| `circuits.library.RelationsLib` | — (CREATE2, bytecode-derived) | `0x306319f854a5596e1e9e2ec59f99f82ea48abeef` |
+| `circuits.library.ZKTranscriptLib` | — (CREATE2, bytecode-derived) | `0x7bb464aa25203cc5b199e0fd7a4258580d71d2a1` |
+
+`plan --print-addresses` prints all of them together with the canonical
+table.
 
 Implementations stay plain CREATE deploys: their addresses are referenced
 by a proxy slot, not canonical, and upgrades replace them **without moving
@@ -226,8 +222,9 @@ only secret in the flow is the KMS key, which never leaves AWS.
 | `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_names`, `google_jwt_roots`, `x_platform_verifier`, `github_platform_verifier`, `google_platform_verifier` — always present, pre-filled with the canonical table, validated against the prediction |
 
 The circuit verifiers are not in the file. They are a property of the
-binary's circuits pin, not of a network, and their addresses derive from it
-the same way the canonical table derives from its names.
+binary's contracts pin — which carries the circuits release — not of a
+network, and their addresses derive from it the same way the canonical
+table derives from its names.
 
 The `[accounts].owner` flow: the factory's genesis owner is the libID
 deployer KMS address baked into its frozen init code. `apply` needs factory
@@ -390,27 +387,20 @@ plan` first. The first apply on a virgin network needs
 
 ## Release process
 
-Publish a GitHub Release (tag `vX.Y.Z`). `release.yml` generates the
-embedded artifacts once from the pins, uncached, re-runs the CI checks on
-exactly those bytes, then builds `libid-deploy` for
-`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` (natively, on
-arm64 runners) and uploads `libid-deploy-<version>-<target>.tar.gz` as
-release assets. The apply workflow's default `source: release` consumes
-the newest x86_64 asset.
+Publish a GitHub Release (tag `vX.Y.Z`). `release.yml` re-runs the CI
+checks on the released ref, then builds `libid-deploy` for four targets —
+`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+`aarch64-apple-darwin` and `x86_64-apple-darwin`, each natively on a runner
+of its architecture — and uploads `libid-deploy-<version>-<target>.tar.gz`
+for each as a release asset. The apply workflow's default `source:
+release` consumes the newest Linux x86_64 asset.
 
 ## Development
 
-- The crate embeds artifacts that are generated, not committed. Before the
-  first cargo command, and again whenever either pin moves:
-
-  ```sh
-  scripts/vendor-artifacts.sh
-  ```
-
-  It needs `jq`, `curl`, `shasum`, `forge`, and `bb` at exactly the version
-  `bin/libid-deploy/circuits-manifest.json` names (`bbup --version <that
-  version>`); any other bb is refused. Without the artifacts every cargo
-  command fails at `include_str!`, naming the missing file.
+- The crate embeds nothing of its own: every contract artifact comes with
+  the `libid-contracts` crate, so `cargo build` needs no script, no forge
+  and no bb. Moving a contract, a circuit or a Platform Verifier is a bump
+  of the three `libid-*` pins in `bin/libid-deploy/Cargo.toml`.
 - `cargo +nightly fmt` only — stable rustfmt silently ignores the
   nightly-only options in `rustfmt.toml`.
 - `cargo clippy --all-targets --all-features -- -D warnings`
@@ -424,8 +414,10 @@ the newest x86_64 asset.
   declared canonical addresses, and the `--rpc-url` contract: the committed
   local-dev file, unmodified, converges an anvil the file does not name,
   while a wrong chain id or a dead override is refused. The circuit
-  verifier those tests pin is a
-  stand-in contract: what a deploy requires of one is that it HAS code
-  whose hash matches, so the wiring is exercised exactly while nothing
-  pretends to verify a real proof.
+  verifiers those tests deploy are the real Honk verifiers: each is handed
+  a wrong-length proof and must answer with its own circuit's `logN`, the
+  two must differ, and both must carry the one shared address of each
+  library, deployed exactly once. A stand-in contract with unrelated code
+  is used only to drift a trust root, so the pull-back is exercised on a
+  pin that could never verify a proof.
 - Every commit must be signed off (`git commit -s`); see CONTRIBUTING.md.
