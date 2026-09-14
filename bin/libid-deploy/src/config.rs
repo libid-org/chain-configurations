@@ -51,9 +51,12 @@ pub struct NetworkConfig {
 pub struct Network {
     /// Network name; also the GitHub environment the apply workflow uses.
     pub name: String,
-    /// Chain id `apply` refuses to run without matching on-chain.
+    /// Chain id `apply` refuses to run without matching on-chain — against
+    /// whichever endpoint answers, `--rpc-url` included.
     pub chain_id: u64,
-    /// JSON-RPC endpoint.
+    /// The JSON-RPC endpoint this file's own environment reaches. It is the
+    /// default, and the only thing `--rpc-url` replaces: see
+    /// [`crate::rpc`].
     pub rpc_url: String,
 }
 
@@ -202,11 +205,7 @@ impl NetworkConfig {
         if self.network.chain_id == 0 {
             bail!("network.chain_id must be nonzero");
         }
-        let _: url::Url = self
-            .network
-            .rpc_url
-            .parse()
-            .map_err(|e| anyhow!("invalid network.rpc_url: {e}"))?;
+        crate::rpc::parse_rpc_url(&self.network.rpc_url, "network.rpc_url")?;
         required_address(&self.accounts.notary, "accounts.notary")?;
         self.accounts.owner_address()?;
         self.notary_service.fee()?;
@@ -270,7 +269,7 @@ impl NetworkConfig {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn networks_dir() -> std::path::PathBuf {
@@ -278,7 +277,7 @@ mod tests {
     }
 
     /// A minimal file with every address pre-filled from the prediction.
-    fn canonical_toml() -> String {
+    pub(crate) fn canonical_toml() -> String {
         let artifacts = libid_contracts::Artifacts::embedded();
         let factory = predict_factory_address(&artifacts).unwrap();
         let addr = |name: &str| format!("{:#x}", predict_address(factory, name));

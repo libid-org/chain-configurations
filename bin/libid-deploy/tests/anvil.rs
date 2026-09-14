@@ -60,6 +60,7 @@ use libid_deploy::{
         VerifierKind,
         LAUNCH_VERIFIER_VERSION,
     },
+    rpc::RpcEndpoint,
     signer::SignerSource,
 };
 
@@ -158,11 +159,16 @@ async fn deploy_stand_in(rpc: &str, key: &str) -> Address {
     .expect("stand-in deploys")
 }
 
-/// Apply `path` against its chain with the anvil #0 key.
+/// The endpoint the file itself names — no `--rpc-url`.
+fn file_rpc(cfg: &NetworkConfig) -> RpcEndpoint {
+    RpcEndpoint::resolve(cfg, None).expect("the file's endpoint resolves")
+}
+
+/// Apply `path` against the chain it names with the anvil #0 key.
 async fn apply_with(path: &std::path::Path, opts: apply::Options) -> apply::Summary {
     let cfg = NetworkConfig::load(path).expect("config loads");
     let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
-    apply::run(path, &cfg, &signer, &opts)
+    apply::run(path, &cfg, &file_rpc(&cfg), &signer, &opts)
         .await
         .expect("apply converges")
 }
@@ -234,7 +240,9 @@ async fn declarative_apply_cycle_never_touches_the_config() {
     let cfg = NetworkConfig::load(&path).expect("config loads");
 
     // Virgin chain: the plan wants everything, including the onboarding gate.
-    let virgin = plan::build(&cfg).await.expect("plan on a virgin chain");
+    let virgin = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan on a virgin chain");
     assert_eq!(virgin.status_of("create2_deployer"), Some(Status::Deploy));
     assert_eq!(virgin.status_of("contracts.factory"), Some(Status::Deploy));
     assert_eq!(
@@ -246,7 +254,14 @@ async fn declarative_apply_cycle_never_touches_the_config() {
     // A fresh deploy without the flag is refused: the guard reads chain
     // state, and a virgin chain means this apply publishes the whole stack.
     let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
-    let refused = apply::run(&path, &cfg, &signer, &apply::Options::default()).await;
+    let refused = apply::run(
+        &path,
+        &cfg,
+        &file_rpc(&cfg),
+        &signer,
+        &apply::Options::default(),
+    )
+    .await;
     assert!(
         refused
             .expect_err("a virgin chain needs the flag")
@@ -348,7 +363,9 @@ async fn declarative_apply_cycle_never_touches_the_config() {
         "the second apply deployed {:?}",
         again.deployed
     );
-    let settled = plan::build(&cfg).await.expect("plan after apply");
+    let settled = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan after apply");
     assert!(
         !settled.has_deploys(),
         "the settled plan still wants deploys:\n{}",
@@ -434,7 +451,9 @@ async fn apply_converges_drifted_wiring_without_redeploying() {
         .await
         .unwrap();
 
-    let drifted = plan::build(&cfg).await.expect("plan sees the drift");
+    let drifted = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan sees the drift");
     assert_eq!(
         drifted.status_of("identity_names.proof_verifier"),
         Some(Status::Configure)
@@ -706,7 +725,9 @@ async fn platform_verifiers_deploy_wire_and_register() {
     let again = apply_with(&path, apply::Options::default()).await;
     assert!(again.deployed.is_empty(), "{:?}", again.deployed);
     assert!(again.configured.is_empty(), "{:?}", again.configured);
-    let settled = plan::build(&cfg).await.expect("plan after apply");
+    let settled = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan after apply");
     assert!(
         !settled.has_deploys(),
         "the settled plan still wants deploys:\n{}",
@@ -815,7 +836,9 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
         .await
         .unwrap();
 
-    let drifted = plan::build(&cfg).await.expect("plan sees the pin drift");
+    let drifted = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan sees the pin drift");
     assert_eq!(
         drifted.status_of("contracts.x_platform_verifier.trust_roots"),
         Some(Status::Configure)
@@ -873,6 +896,7 @@ async fn the_committed_local_dev_file_converges_an_anvil() {
     apply::run(
         &path,
         &cfg,
+        &file_rpc(&cfg),
         &signer,
         &apply::Options {
             confirm_fresh_deploy: true,

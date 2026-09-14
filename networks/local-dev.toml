@@ -1,10 +1,19 @@
-# Local dev — the stack as a docker-compose CI brings it up.
+# Local dev — the stack on a throwaway anvil, whether a docker-compose
+# service or a bare process on a host or CI runner.
 #
-# Point it at an `anvil` service on the compose network and apply:
+# `rpc_url` below is the compose service name, reachable only from inside
+# that network. From anywhere else, keep this file as it is and name the
+# endpoint on the command line: `--rpc-url` replaces the transport and
+# nothing more — the chain id and every address declared here are the same
+# either way.
 #
 #   docker compose up -d anvil
 #   libid-deploy apply --network networks/local-dev.toml --yes \
 #     --confirm-fresh-deploy --dev
+#
+#   anvil --host 127.0.0.1 --port 8545 &
+#   libid-deploy apply --network networks/local-dev.toml \
+#     --rpc-url http://127.0.0.1:8545 --yes --confirm-fresh-deploy --dev
 #
 # Anvil ships the CREATE2 deployer predeployed, so the factory bootstrap is
 # one transaction; start it with `--disable-default-create2-deployer` to
@@ -21,8 +30,9 @@
 [network]
 name = "local-dev"
 chain_id = 31337
-# The compose service name. From the host instead, use
-# http://127.0.0.1:8545.
+# The endpoint this file's own environment reaches: the compose service
+# name. Every other caller passes `--rpc-url` and this value is not read;
+# nothing else in the file depends on it.
 rpc_url = "http://anvil:8545"
 
 [aws]

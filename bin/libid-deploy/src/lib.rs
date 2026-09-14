@@ -18,4 +18,5 @@ pub mod config;
 pub mod names;
 pub mod plan;
 pub mod platforms;
+pub mod rpc;
 pub mod signer;
