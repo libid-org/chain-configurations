@@ -4,28 +4,38 @@
 //!
 //! Nothing here is retyped. The platform domains and normalization rules
 //! come from `libid-identity`'s generated table — the same one Solidity and
-//! TypeScript read — and the profile shape from `libid-profiles`, generated
-//! from `CeremonyProfile.sol`'s source. A value restated here would key
-//! handles differently from every deployed reader.
+//! TypeScript read — the profile shape from `libid-profiles`, generated
+//! from `CeremonyProfile.sol`'s source, and which contract serves a
+//! platform and which circuit it proves under from `libid-contracts`. A
+//! value restated here would key handles differently from every deployed
+//! reader.
 
 use alloy::primitives::{
     keccak256,
+    Address,
     FixedBytes,
 };
-use libid_contracts::bindings::identity::IdentityNames;
+use anyhow::{
+    bail,
+    Result,
+};
+use libid_contracts::{
+    bindings::identity::IdentityNames,
+    circuits::Circuit,
+    platform_verifier::{
+        GoogleRoots,
+        Initializer,
+        PlatformVerifier,
+        TlsNotaryRoots,
+    },
+};
 use libid_identity::{
     handle_vectors as vectors,
     Rules,
 };
 use libid_profiles as profiles;
 
-use crate::{
-    ceremony::{
-        self,
-        Circuit,
-    },
-    names,
-};
+use crate::names;
 
 /// The verifier version the launch profile is registered under.
 ///
@@ -74,12 +84,75 @@ pub struct Platform {
     pub contracts_key: &'static str,
     /// The canonical CREATE3 name of that proxy.
     pub canonical_name: &'static str,
-    /// The vendored contract the proxy points at.
-    pub contract: &'static str,
+    /// Which launch Platform Verifier serves it: the contract the proxy
+    /// points at and the ceremony circuit its proofs are checked under
+    /// both follow from this.
+    pub verifier: PlatformVerifier,
+}
+
+impl Platform {
+    /// The compiled contract the Platform Verifier proxy points at.
+    pub const fn contract(&self) -> &'static str {
+        self.verifier.contract()
+    }
+
     /// The ceremony circuit whose Honk verifier this platform's proofs are
     /// checked under. X and GitHub share one: their statements are
     /// byte-identical, so one circuit proves both.
-    pub circuit: Circuit,
+    pub const fn circuit(&self) -> Circuit {
+        self.verifier.circuit()
+    }
+
+    /// What the Platform Verifier initializes with, shaped by what the
+    /// profile notarizes. `Initializer::check` refuses what the contract
+    /// would refuse — a Notary Service on Google, none on a TLSNotary
+    /// profile, a parameter over its ceiling — before anything is sent.
+    pub fn initializer(
+        &self,
+        owner: Address,
+        notary_service: Address,
+        honk_verifier: Address,
+        jwt_roots: Address,
+    ) -> Result<Initializer> {
+        Ok(match (self.verifier, self.kind) {
+            (
+                verifier @ (PlatformVerifier::X | PlatformVerifier::GitHub),
+                VerifierKind::TlsNotary {
+                    proof_lifetime,
+                    max_future_attestation_skew,
+                },
+            ) => {
+                let roots = TlsNotaryRoots {
+                    owner,
+                    notary_service,
+                    honk_verifier,
+                    proof_lifetime,
+                    max_future_attestation_skew,
+                    future_observation_allowance: self.future_observation_allowance,
+                };
+                if verifier == PlatformVerifier::X {
+                    Initializer::X(roots)
+                } else {
+                    Initializer::GitHub(roots)
+                }
+            }
+            (PlatformVerifier::Google, VerifierKind::GoogleJwt) => {
+                Initializer::Google(GoogleRoots {
+                    owner,
+                    honk_verifier,
+                    future_observation_allowance: self.future_observation_allowance,
+                    jwt_roots,
+                })
+            }
+            // Pinned apart at compile time below; kept as an error rather
+            // than a panic because the wrong initializer on a contract
+            // encodes arguments it reads as other arguments.
+            (verifier, kind) => bail!(
+                "{} pairs the {verifier:?} contract with the {kind:?} shape",
+                self.label
+            ),
+        })
+    }
 }
 
 /// Widen a generated rule table into the contract's struct. `const` so a
@@ -107,8 +180,7 @@ pub const X: Platform = Platform {
     },
     contracts_key: "x_platform_verifier",
     canonical_name: names::X_PLATFORM_VERIFIER,
-    contract: "XPlatformVerifier",
-    circuit: ceremony::BEARER_LINK,
+    verifier: PlatformVerifier::X,
 };
 
 /// GitHub: letters, digits and hyphen.
@@ -123,8 +195,7 @@ pub const GITHUB: Platform = Platform {
     },
     contracts_key: "github_platform_verifier",
     canonical_name: names::GITHUB_PLATFORM_VERIFIER,
-    contract: "GitHubPlatformVerifier",
-    circuit: ceremony::BEARER_LINK,
+    verifier: PlatformVerifier::GitHub,
 };
 
 /// Google: an email address, used exactly as proved. The OIDC circuit
@@ -138,8 +209,7 @@ pub const GOOGLE: Platform = Platform {
     kind: VerifierKind::GoogleJwt,
     contracts_key: "google_platform_verifier",
     canonical_name: names::GOOGLE_PLATFORM_VERIFIER,
-    contract: "GooglePlatformVerifier",
-    circuit: ceremony::OIDC_GOOGLE,
+    verifier: PlatformVerifier::Google,
 };
 
 /// The closed launch list, in deploy order. A platform outside it has no
@@ -159,15 +229,26 @@ pub fn platform_id(domain: &str) -> FixedBytes<32> {
 // The verifier shape is a property of the profile, not a choice made here:
 // `PlatformVerifierBase._setTrustRoots` rejects a Notary Service on a
 // profile that notarizes nothing, and rejects its absence on one that does.
-// Checked where a mistake cannot run.
+// The contract table agrees (`PlatformVerifier::notarizes`), and the kind
+// here must agree with both. Checked where a mistake cannot run.
 const _: () = {
     assert!(profiles::LAUNCH.len() == LAUNCH.len());
+    assert!(PlatformVerifier::ALL.len() == LAUNCH.len());
     assert!(matches!(X.kind, VerifierKind::TlsNotary { .. }));
+    assert!(X.verifier.notarizes());
     assert!(profiles::X.attestation_count() == 2);
     assert!(matches!(GITHUB.kind, VerifierKind::TlsNotary { .. }));
+    assert!(GITHUB.verifier.notarizes());
     assert!(profiles::GITHUB.attestation_count() == 2);
     assert!(matches!(GOOGLE.kind, VerifierKind::GoogleJwt));
+    assert!(!GOOGLE.verifier.notarizes());
     assert!(profiles::GOOGLE.attestation_count() == 0);
+    // Each platform pairs with the contract written for it: the TLSNotary
+    // initializer on the Google contract would encode arguments the
+    // contract reads as other arguments.
+    assert!(matches!(X.verifier, PlatformVerifier::X));
+    assert!(matches!(GITHUB.verifier, PlatformVerifier::GitHub));
+    assert!(matches!(GOOGLE.verifier, PlatformVerifier::Google));
     // The launch slot is the launch profile's own version. They are
     // different numbers for different jobs and happen to agree at launch;
     // a profile bump that left this behind would register a `v2` verifier
@@ -182,17 +263,26 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
+    use libid_contracts::Artifacts;
+
     use super::*;
 
     /// The platform ids come from the generated domains — a mistyped
     /// domain would key every handle differently from every deployed
-    /// reader.
+    /// reader — and the contract table spells each platform the same way.
     #[test]
     fn platform_ids_come_from_the_generated_domains() {
         assert_eq!(platform_id(X.domain), keccak256(b"x"));
         assert_eq!(platform_id(GITHUB.domain), keccak256(b"github"));
         assert_eq!(platform_id(GOOGLE.domain), keccak256(b"google"));
         assert_ne!(platform_id(X.domain), platform_id(GITHUB.domain));
+        for platform in LAUNCH {
+            assert_eq!(platform.domain, platform.verifier.platform());
+            assert_eq!(
+                platform_id(platform.domain),
+                platform.verifier.platform_id()
+            );
+        }
     }
 
     /// The rules written on chain are the generated ones, field for field.
@@ -224,28 +314,23 @@ mod tests {
         assert!(by_domain("discord").is_none());
     }
 
-    /// Every launch platform's circuit is one this repository vendors a
-    /// verifier for — a platform pointed at a circuit with no artifact
-    /// could be deployed but never wired.
+    /// One circuit for both TLSNotary platforms, a separate one for
+    /// Google: the statement, not the platform, decides.
     #[test]
-    fn every_platform_verifies_under_a_vendored_circuit() {
+    fn the_circuits_follow_the_statements() {
+        assert_eq!(X.circuit(), GITHUB.circuit());
+        assert_ne!(X.circuit(), GOOGLE.circuit());
         for platform in LAUNCH {
-            assert!(
-                ceremony::CIRCUITS.contains(&platform.circuit),
-                "{} verifies under an unvendored circuit",
-                platform.label
-            );
+            assert!(Circuit::ALL.contains(&platform.circuit()));
         }
-        // One circuit for both TLSNotary platforms, a separate one for
-        // Google: the statement, not the platform, decides.
-        assert_eq!(X.circuit, GITHUB.circuit);
-        assert_ne!(X.circuit, GOOGLE.circuit);
     }
 
     /// Every platform's Platform Verifier is a canonical contract with its
-    /// own name and its own `[contracts]` key.
+    /// own name and its own `[contracts]` key, and its implementation is
+    /// one the contracts crate embeds.
     #[test]
-    fn every_platform_verifier_is_canonical() {
+    fn every_platform_verifier_is_canonical_and_embedded() {
+        let artifacts = Artifacts::embedded();
         for platform in LAUNCH {
             assert_eq!(
                 names::canonical_name(platform.contracts_key),
@@ -253,7 +338,31 @@ mod tests {
                 "{} is not in the canonical table",
                 platform.label
             );
-            assert!(ceremony::creation_code(platform.contract).is_ok());
+            assert!(artifacts.bytecode(platform.contract()).is_ok());
+        }
+    }
+
+    /// The initializer each platform builds passes the contract's own
+    /// rules with the generated parameters, and takes the shape its
+    /// profile demands.
+    #[test]
+    fn every_initializer_passes_the_contracts_checks() {
+        let some = Address::repeat_byte(0x11);
+        for platform in LAUNCH {
+            let init = platform
+                .initializer(some, some, some, some)
+                .unwrap_or_else(|e| panic!("{}: {e}", platform.label));
+            init.check()
+                .unwrap_or_else(|e| panic!("{}: {e}", platform.label));
+            assert_eq!(init.verifier(), platform.verifier);
+            match (platform.kind, init) {
+                (
+                    VerifierKind::TlsNotary { .. },
+                    Initializer::X(_) | Initializer::GitHub(_),
+                ) => {}
+                (VerifierKind::GoogleJwt, Initializer::Google(_)) => {}
+                (kind, init) => panic!("{}: {kind:?} built {init:?}", platform.label),
+            }
         }
     }
 }

@@ -9,15 +9,18 @@
 //! network. Names are append-only; a name already deployed on any real
 //! network must never change.
 //!
-//! Two kinds of contract are deliberately NOT in this table. Proxy
+//! Three kinds of contract are deliberately NOT in this table. Proxy
 //! implementations deploy via plain CREATE: their addresses are referenced
 //! by a proxy slot, and an upgrade replaces one without moving any entry
 //! address. The ceremony circuits' Honk verifiers do go through the
-//! factory — see [`crate::ceremony::Circuit::factory_name`] — but under a
-//! name carrying the circuits version rather than a frozen one, because a
-//! Honk verifier IS its verification key: a new circuits release must be a
-//! new address, not a silent replacement. Neither kind is declared in a
-//! network file.
+//! factory — see [`crate::circuits::factory_name`] — but under a name
+//! carrying the circuits release rather than a frozen one, because a Honk
+//! verifier IS its verification key: a new circuits release must be a new
+//! address, not a silent replacement. The libraries those verifiers link
+//! deploy through the CREATE2 deployer at an address derived from their
+//! bytecode — see [`crate::circuits::library_addresses`] — so identical
+//! code is one deployment. None of the three is declared in a network
+//! file.
 
 use libid_contracts::factory::predict_address;
 
@@ -124,17 +127,27 @@ pub fn render_address_table() -> anyhow::Result<String> {
             c.name
         );
     }
-    // Not declared in any network file, but deployed through the same
-    // factory and just as network-invariant: an operator reading this table
-    // is reading every address apply will land on.
-    for circuit in crate::ceremony::CIRCUITS {
-        let name = circuit.factory_name()?;
+    // Not declared in any network file, but just as network-invariant: an
+    // operator reading this table is reading every address apply will land
+    // on. The verifiers through the same factory, under a name carrying
+    // the circuits release; the libraries they link through the CREATE2
+    // deployer, at an address derived from their bytecode.
+    for circuit in crate::circuits::Circuit::ALL {
+        let name = crate::circuits::factory_name(circuit)?;
         let addr = predict_address(factory, &name);
         let _ = writeln!(
             out,
             "  {:<34} {:<34} {addr:#x}",
-            format!("circuits.{}", circuit.name),
+            format!("circuits.{}", circuit.name()),
             name
+        );
+    }
+    for (addr, library) in crate::circuits::library_addresses()? {
+        let _ = writeln!(
+            out,
+            "  {:<34} {:<34} {addr:#x}",
+            format!("circuits.library.{library}"),
+            "(CREATE2, bytecode-derived)"
         );
     }
     Ok(out)

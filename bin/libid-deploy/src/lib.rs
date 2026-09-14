@@ -8,12 +8,14 @@
 //!
 //! Everything on-chain goes through the `libid-contracts` crate: typed
 //! bindings, embedded forge artifacts (zero filesystem dependencies at
-//! runtime), and the deploy/upgrade primitives. The platform tables come
-//! from `libid-identity` and `libid-profiles`, generated from the same
-//! sources the contracts are.
+//! runtime, the ceremony circuits' Honk verifiers included), and the
+//! deploy/upgrade primitives. The platform tables come from
+//! `libid-identity` and `libid-profiles`, generated from the same sources
+//! the contracts are. What this crate adds is WHERE things land
+//! ([`names`], [`circuits`]) and the convergence that puts them there.
 
 pub mod apply;
-pub mod ceremony;
+pub mod circuits;
 pub mod config;
 pub mod names;
 pub mod plan;

@@ -24,9 +24,10 @@
 //! naming system dispatches claims through, the naming system itself with
 //! a keyspace per platform, and the Google JWT root list that pays the
 //! Notary Service for each rotation. Then one step that script does not
-//! have: the ceremony circuits' Honk verifiers, and a Platform Verifier
-//! per platform pinned to one of them and registered into the Supported
-//! Version Set — without which a platform owns a keyspace and can verify
+//! have: the ceremony circuits' Honk verifiers — the two libraries every
+//! one links deployed once and shared — and a Platform Verifier per
+//! platform pinned to one of them and registered into the Supported
+//! Version Set, without which a platform owns a keyspace and can verify
 //! nothing.
 
 use std::{
@@ -35,10 +36,8 @@ use std::{
 };
 
 use alloy::{
-    hex,
     network::TransactionBuilder,
     primitives::{
-        keccak256,
         Address,
         Bytes,
         B256,
@@ -64,19 +63,26 @@ use libid_contracts::{
         ceremony::{
             CeremonyProofVerifier,
             GoogleJwtRoots,
+            GooglePlatformVerifier,
             NotaryService,
+            TlsNotaryPlatformVerifier,
         },
         factory::LibidFactory,
         identity::IdentityNames,
         proxy::IUUPSUpgradeable,
     },
-    deploy::deploy_contract_from,
+    circuits::LIBRARIES,
+    deploy::{
+        deploy_contract_from,
+        Libraries,
+    },
     factory::{
         ensure_create2_deployer,
         ensure_factory,
         predict_address,
         predict_factory_address,
     },
+    platform_verifier::codehash_at,
     send_with_nonce_retry,
     Artifacts,
 };
@@ -86,7 +92,7 @@ use tracing::{
 };
 
 use crate::{
-    ceremony::{
+    circuits::{
         self,
         Circuit,
     },
@@ -149,22 +155,16 @@ impl Upgrade {
             Self::ProofVerifier => "CeremonyProofVerifier",
             Self::IdentityNames => "IdentityNames",
             Self::GoogleJwtRoots => "GoogleJwtRoots",
-            Self::XPlatformVerifier => platforms::X.contract,
-            Self::GitHubPlatformVerifier => platforms::GITHUB.contract,
-            Self::GooglePlatformVerifier => platforms::GOOGLE.contract,
+            Self::XPlatformVerifier => platforms::X.contract(),
+            Self::GitHubPlatformVerifier => platforms::GITHUB.contract(),
+            Self::GooglePlatformVerifier => platforms::GOOGLE.contract(),
         }
     }
 
-    /// The implementation creation code. The Platform Verifiers come from
-    /// this crate's vendored artifacts; everything else from the bytecode
+    /// The implementation creation code, from the bytecode
     /// `libid-contracts` embeds.
     fn implementation_code(self, artifacts: &Artifacts) -> Result<Bytes> {
-        match self {
-            Self::XPlatformVerifier
-            | Self::GitHubPlatformVerifier
-            | Self::GooglePlatformVerifier => ceremony::creation_code(self.contract()),
-            _ => Ok(artifacts.bytecode(self.contract())?),
-        }
+        Ok(artifacts.bytecode(self.contract())?)
     }
 
     /// Every value `--upgrade` accepts, for the CLI help and the error.
@@ -379,9 +379,10 @@ pub async fn run(
         needs_factory_deploy |= !code_present(&provider, declared).await?;
     }
     // The circuit verifiers deploy through the factory too, under a name
-    // carrying the pinned circuits version.
-    for circuit in ceremony::CIRCUITS {
-        let predicted = predict_address(libid_factory, &circuit.factory_name()?);
+    // carrying the pinned circuits release. Their libraries do not: those
+    // go through the CREATE2 deployer, which anyone may call.
+    for circuit in Circuit::ALL {
+        let predicted = predict_address(libid_factory, &circuits::factory_name(circuit)?);
         needs_factory_deploy |= !code_present(&provider, predicted).await?;
     }
     if needs_factory_deploy {
@@ -397,11 +398,13 @@ pub async fn run(
             names::NOTARY_SERVICE,
             "NotaryService",
             artifacts.bytecode("NotaryService")?,
-            &NotaryService::initializeCall {
+            NotaryService::initializeCall {
                 owner_: sender,
                 notary_: notary_signer,
                 fee_: notary_fee,
-            },
+            }
+            .abi_encode()
+            .into(),
             sender,
         )
         .await?;
@@ -465,7 +468,9 @@ pub async fn run(
             names::CEREMONY_PROOF_VERIFIER,
             "CeremonyProofVerifier",
             artifacts.bytecode("CeremonyProofVerifier")?,
-            &CeremonyProofVerifier::initializeCall { owner_: sender },
+            CeremonyProofVerifier::initializeCall { owner_: sender }
+                .abi_encode()
+                .into(),
             sender,
         )
         .await?;
@@ -488,7 +493,9 @@ pub async fn run(
             names::IDENTITY_NAMES,
             "IdentityNames",
             artifacts.bytecode("IdentityNames")?,
-            &IdentityNames::initializeCall { owner_: sender },
+            IdentityNames::initializeCall { owner_: sender }
+                .abi_encode()
+                .into(),
             sender,
         )
         .await?;
@@ -548,10 +555,12 @@ pub async fn run(
             names::GOOGLE_JWT_ROOTS,
             "GoogleJwtRoots",
             artifacts.bytecode("GoogleJwtRoots")?,
-            &GoogleJwtRoots::initializeCall {
+            GoogleJwtRoots::initializeCall {
                 owner_: sender,
                 notary_: notary_service,
-            },
+            }
+            .abi_encode()
+            .into(),
             sender,
         )
         .await?;
@@ -945,17 +954,17 @@ pub(crate) async fn factory_deploy_named<P: Provider>(
 
 /// Deploy `contract`'s implementation via plain CREATE (its address is
 /// referenced, not canonical), then CREATE3-deploy an ERC1967 proxy for it
-/// under `name` through the factory. The named-proxy shape of every UUPS
-/// entry contract.
+/// under `name` through the factory, initialized with the ABI-encoded
+/// `init_data`. The named-proxy shape of every UUPS entry contract.
 #[allow(clippy::too_many_arguments)]
-async fn deploy_named_proxy<P: Provider, C: SolCall>(
+async fn deploy_named_proxy<P: Provider>(
     provider: &P,
     artifacts: &Artifacts,
     factory: Address,
     name: &str,
     contract: &str,
     implementation_code: Bytes,
-    init_call: &C,
+    init_data: Bytes,
     sender: Address,
 ) -> Result<Address> {
     // Reuse before paying for an implementation nobody will point at.
@@ -975,7 +984,7 @@ async fn deploy_named_proxy<P: Provider, C: SolCall>(
         Some(sender),
     )
     .await?;
-    let creation_code = proxy_creation_code(artifacts, implementation, init_call)?;
+    let creation_code = proxy_creation_code(artifacts, implementation, init_data)?;
     factory_deploy_named(provider, factory, name, creation_code, sender).await
 }
 
@@ -991,22 +1000,23 @@ fn declared_verifier(cfg: &NetworkConfig, platform: &Platform) -> Result<Address
 
 /// What this run has already put on the chain for the ceremony circuits.
 ///
-/// Two platforms share `bearer-link` and both circuits link the same two
-/// libraries, so without this a single apply would deploy the same code
-/// several times and wire the platforms to different copies of it.
+/// Two platforms share `bearer-link`, so without this a single apply would
+/// resolve the same verifier twice. The libraries need no cache of their
+/// own: each lands at an address derived from its bytecode, so a second
+/// resolve finds it there.
 #[derive(Debug, Default)]
 struct CircuitCache {
-    /// Circuit name -> its verifier's address and on-chain code hash.
-    verifiers: BTreeMap<&'static str, (Address, B256)>,
-    /// Library creation code -> where this run deployed it.
-    libraries: BTreeMap<Bytes, Address>,
+    /// Circuit -> its verifier's address and on-chain code hash.
+    verifiers: BTreeMap<Circuit, (Address, B256)>,
+    /// The shared libraries, once any verifier has needed them.
+    libraries: Option<Libraries>,
 }
 
 /// The circuit verifier for `circuit`: deployed if the chain lacks it, and
 /// its code hash read back off the chain either way.
 ///
 /// The verifier goes through the factory under
-/// [`Circuit::factory_name`], so its address is a pure function of which
+/// [`circuits::factory_name`], so its address is a pure function of which
 /// artifact it is. That is what makes this idempotent: a second apply
 /// finds code at the same address and sends nothing, and a circuits
 /// release is a different name, a different address and a rotation rather
@@ -1017,120 +1027,88 @@ struct CircuitCache {
 /// the Platform Verifier checks is the one the chain holds.
 async fn ensure_circuit_verifier<P: Provider>(
     provider: &P,
+    artifacts: &Artifacts,
     factory: Address,
     sender: Address,
-    circuit: &Circuit,
+    circuit: Circuit,
     cache: &mut CircuitCache,
     summary: &mut Summary,
 ) -> Result<(Address, B256)> {
-    if let Some(known) = cache.verifiers.get(circuit.name) {
+    if let Some(known) = cache.verifiers.get(&circuit) {
         return Ok(*known);
     }
-    let name = circuit.factory_name()?;
+    let name = circuits::factory_name(circuit)?;
     let address = predict_address(factory, &name);
     if !code_present(provider, address).await? {
+        let libraries =
+            ensure_libraries(provider, artifacts, sender, cache, summary).await?;
+        // The placeholders substituted with the shared addresses; deploying
+        // them unresolved would produce a contract that reverts on every
+        // proof.
         let creation_code =
-            link_creation_code(provider, circuit.contract, sender, &mut cache.libraries)
-                .await?;
+            libraries.link(artifacts, circuit.contract(), circuit.contract())?;
         let deployed =
             factory_deploy_named(provider, factory, &name, creation_code, sender).await?;
         info!(
             "{} circuit verifier deployed at {deployed:#x} ({name})",
-            circuit.name
+            circuit.name()
         );
         debug_assert_eq!(deployed, address);
         summary
             .deployed
-            .push((format!("circuits.{}", circuit.name), deployed));
+            .push((format!("circuits.{}", circuit.name()), deployed));
     }
 
-    let code = provider
-        .get_code_at(address)
-        .await
-        .map_err(|e| anyhow!("get_code({address:#x}) failed: {e}"))?;
-    if code.is_empty() {
-        bail!(
-            "the {} circuit verifier has no code at {address:#x} after deploy — the \
-             Platform Verifier pins it by code hash and would refuse it",
-            circuit.name
-        );
-    }
-    let codehash = keccak256(&code);
-    cache.verifiers.insert(circuit.name, (address, codehash));
+    let codehash = codehash_at(provider, address).await.map_err(|e| {
+        anyhow!(
+            "the {} circuit verifier at {address:#x}: {e} — the Platform Verifier pins \
+             it by code hash and would refuse it",
+            circuit.name()
+        )
+    })?;
+    cache.verifiers.insert(circuit, (address, codehash));
     Ok((address, codehash))
 }
 
-/// The creation bytecode of `contract`, with every library it links
-/// deployed (once per distinct library, across the whole run) and its
-/// address substituted into the placeholder slots.
-///
-/// The bb verifiers hold `external` library functions, so `RelationsLib`
-/// and `ZKTranscriptLib` are real deployed contracts rather than inlined
-/// code; the placeholder left in would revert on every proof.
-async fn link_creation_code<P: Provider>(
+/// The libraries every embedded verifier links, deployed once per distinct
+/// bytecode across the whole run — and across runs: each lands at an
+/// address derived from its creation code through the CREATE2 deployer, so
+/// one already on the chain is found and linked rather than deployed again.
+/// Resolved for ALL circuits at once, so that whichever verifier asks first
+/// shares with every one that follows.
+async fn ensure_libraries<'a, P: Provider>(
     provider: &P,
-    contract: &str,
+    artifacts: &Artifacts,
     sender: Address,
-    cache: &mut BTreeMap<Bytes, Address>,
-) -> Result<Bytes> {
-    let mut code = ceremony::creation_code_hex(contract)?;
-    for (path, libs) in ceremony::link_references(contract)? {
-        let file = Path::new(&path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| anyhow!("{contract} names a bad library path {path}"))?;
-        for (library, refs) in libs.as_object().into_iter().flatten() {
-            // A library that linked one of its own would need the same
-            // treatment; none does, so this stays a flat resolve rather
-            // than a recursion nothing exercises.
-            let library_code = ceremony::library_creation_code(file, library)?;
-            let address = match cache.get(&library_code) {
-                Some(address) => *address,
-                None => {
-                    let address = deploy_contract_from(
-                        provider,
-                        library_code.clone(),
-                        &format!("{library} (library)"),
-                        Some(sender),
-                    )
-                    .await?;
-                    cache.insert(library_code, address);
-                    address
-                }
-            };
-            let address_hex = hex::encode(address.as_slice());
-            for r in refs.as_array().into_iter().flatten() {
-                let start = r["start"]
-                    .as_u64()
-                    .and_then(|v| usize::try_from(v).ok())
-                    .ok_or_else(|| anyhow!("bad linkReference start for {library}"))?;
-                let length = r["length"]
-                    .as_u64()
-                    .and_then(|v| usize::try_from(v).ok())
-                    .ok_or_else(|| {
-                    anyhow!("bad linkReference length for {library}")
+    cache: &'a mut CircuitCache,
+    summary: &mut Summary,
+) -> Result<&'a Libraries> {
+    if cache.libraries.is_none() {
+        let contracts: Vec<(&str, &str)> = Circuit::ALL
+            .iter()
+            .map(|c| (c.contract(), c.contract()))
+            .collect();
+        let libraries =
+            Libraries::deploy(provider, artifacts, &contracts, Some(sender)).await?;
+        for deployed in libraries.deployed() {
+            // The name it answers to in a verifier's link references — the
+            // same for every file that links this bytecode.
+            let library = Circuit::ALL
+                .iter()
+                .flat_map(|c| LIBRARIES.iter().map(move |l| (c.contract(), *l)))
+                .find(|(file, l)| libraries.address(file, l) == Some(deployed))
+                .map(|(_, l)| l)
+                .ok_or_else(|| {
+                    anyhow!("library deployed at {deployed:#x} is linked by nothing")
                 })?;
-                // Byte offsets -> hex-character offsets.
-                let end = start
-                    .checked_add(length)
-                    .and_then(|v| v.checked_mul(2))
-                    .ok_or_else(|| anyhow!("linkReference overflow for {library}"))?;
-                let begin = start
-                    .checked_mul(2)
-                    .ok_or_else(|| anyhow!("linkReference overflow for {library}"))?;
-                if end > code.len() || address_hex.len() != end - begin {
-                    bail!("linkReference for {library} does not fit {contract}");
-                }
-                code.replace_range(begin..end, &address_hex);
-            }
+            info!("{library} deployed at {deployed:#x}, shared by every verifier");
+            summary
+                .deployed
+                .push((format!("circuits.library.{library}"), deployed));
         }
+        cache.libraries = Some(libraries);
     }
-    if code.contains("__$") {
-        bail!("{contract} still has unresolved link references after linking");
-    }
-    let bytes = hex::decode(&code)
-        .map_err(|e| anyhow!("invalid bytecode hex after linking {contract}: {e}"))?;
-    Ok(Bytes::from(bytes))
+    Ok(cache.libraries.as_ref().expect("just populated"))
 }
 
 /// Deploy, wire and register one platform's Platform Verifier, on the
@@ -1152,68 +1130,41 @@ async fn apply_platform_verifier<P: Provider>(
     let proxy = declared_verifier(cfg, platform)?;
     let (circuit, codehash) = ensure_circuit_verifier(
         provider,
+        artifacts,
         factory,
         sender,
-        &platform.circuit,
+        platform.circuit(),
         circuits,
         summary,
     )
     .await?;
 
     if !code_present(provider, proxy).await? {
-        let implementation_code = ceremony::creation_code(platform.contract)?;
-        let deployed = match platform.kind {
-            VerifierKind::TlsNotary {
-                proof_lifetime,
-                max_future_attestation_skew,
-            } => {
-                deploy_named_proxy(
-                    provider,
-                    artifacts,
-                    factory,
-                    platform.canonical_name,
-                    platform.contract,
-                    implementation_code,
-                    &ceremony::TlsPlatformVerifier::initializeCall {
-                        owner_: sender,
-                        notary_: notary_service,
-                        honkVerifier_: circuit,
-                        honkVerifierCodehash_: codehash,
-                        proofLifetime_: proof_lifetime,
-                        maxFutureAttestationSkew_: max_future_attestation_skew,
-                        futureObservationAllowance_: platform
-                            .future_observation_allowance,
-                    },
-                    sender,
-                )
-                .await?
-            }
-            VerifierKind::GoogleJwt => {
-                deploy_named_proxy(
-                    provider,
-                    artifacts,
-                    factory,
-                    platform.canonical_name,
-                    platform.contract,
-                    implementation_code,
-                    &ceremony::GooglePlatformVerifier::initializeCall {
-                        owner_: sender,
-                        // A profile that notarizes nothing must hold no
-                        // Notary Service: the base contract rejects one,
-                        // and `notaryService()` would otherwise report a
-                        // collaborator nothing on this path calls.
-                        notary_: Address::ZERO,
-                        honkVerifier_: circuit,
-                        honkVerifierCodehash_: codehash,
-                        futureObservationAllowance_: platform
-                            .future_observation_allowance,
-                        jwtRoots_: jwt_roots,
-                    },
-                    sender,
-                )
-                .await?
-            }
-        };
+        // The initializer knows the contract's rules — a Notary Service
+        // exactly where the profile notarizes, every parameter under its
+        // ceiling — and reads the code hash it pins off the chain, so a
+        // mis-wiring fails here rather than at the proxy's constructor.
+        let init = platform
+            .initializer(sender, notary_service, circuit, jwt_roots)?
+            .call(provider)
+            .await?;
+        if init.honk_verifier_codehash() != codehash {
+            bail!(
+                "the {} circuit verifier at {circuit:#x} changed code between reads",
+                platform.circuit().name()
+            );
+        }
+        let deployed = deploy_named_proxy(
+            provider,
+            artifacts,
+            factory,
+            platform.canonical_name,
+            platform.contract(),
+            artifacts.bytecode(platform.contract())?,
+            init.abi_encode().into(),
+            sender,
+        )
+        .await?;
         info!(
             "{} Platform Verifier deployed at {deployed:#x} ({})",
             platform.label, platform.canonical_name
@@ -1235,9 +1186,10 @@ async fn apply_platform_verifier<P: Provider>(
 }
 
 /// Point a Platform Verifier at its circuit's verifier when the two have
-/// drifted. Moving the circuits pin and re-applying IS the rotation path:
-/// a new circuits release is a new artifact under a new factory name, and
-/// the verifier must be told which one it answers for.
+/// drifted. Moving the contracts pin to a new circuits release and
+/// re-applying IS the rotation path: the release is a new artifact under a
+/// new factory name, and the verifier must be told which one it answers
+/// for.
 ///
 /// The reads and the write go through the TLSNotary binding for both kinds
 /// — this surface is `PlatformVerifierBase`'s, identical in every Platform
@@ -1252,7 +1204,7 @@ async fn converge_trust_roots<P: Provider>(
     sender: Address,
     summary: &mut Summary,
 ) -> Result<()> {
-    let verifier = ceremony::TlsPlatformVerifier::new(proxy, provider);
+    let verifier = TlsNotaryPlatformVerifier::new(proxy, provider);
     let wired = verifier
         .honkVerifier()
         .call()
@@ -1298,7 +1250,7 @@ async fn converge_jwt_roots<P: Provider>(
     sender: Address,
     summary: &mut Summary,
 ) -> Result<()> {
-    let verifier = ceremony::GooglePlatformVerifier::new(proxy, provider);
+    let verifier = GooglePlatformVerifier::new(proxy, provider);
     let wired = verifier
         .jwtRoots()
         .call()
@@ -1386,15 +1338,13 @@ async fn upgrade_proxy<P: Provider>(
 
 /// ERC1967Proxy creation code ++ `abi.encode(implementation, initData)` —
 /// the bytes a CREATE3 name is deployed from.
-pub(crate) fn proxy_creation_code<C: SolCall>(
+pub(crate) fn proxy_creation_code(
     artifacts: &Artifacts,
     implementation: Address,
-    init_call: &C,
+    init_data: Bytes,
 ) -> Result<Bytes> {
     let mut code = artifacts.bytecode("ERC1967Proxy")?.to_vec();
-    code.extend_from_slice(
-        &(implementation, Bytes::from(init_call.abi_encode())).abi_encode_params(),
-    );
+    code.extend_from_slice(&(implementation, init_data).abi_encode_params());
     Ok(code.into())
 }
 
