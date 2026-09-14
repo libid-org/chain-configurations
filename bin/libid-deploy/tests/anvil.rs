@@ -833,3 +833,71 @@ async fn a_circuit_verifier_without_code_is_refused_by_name() {
         .unwrap()
         .is_empty());
 }
+
+/// The committed local-dev file is not just parseable: it converges a real
+/// anvil, signing with the deployer spec it carries. Only the RPC endpoint
+/// is substituted, because the compose service name does not resolve here.
+#[tokio::test]
+async fn the_committed_local_dev_file_converges_an_anvil() {
+    let anvil = spawn_anvil();
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../networks/local-dev.toml");
+    let body = std::fs::read_to_string(&source)
+        .expect("networks/local-dev.toml readable")
+        .replace(
+            "rpc_url = \"http://anvil:8545\"",
+            &format!("rpc_url = \"{}\"", anvil.endpoint()),
+        );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("local-dev.toml");
+    std::fs::write(&path, &body).expect("write config");
+
+    let cfg = NetworkConfig::load(&path).expect("local-dev loads");
+    // The signer spec in the file is what apply uses by default — no
+    // --signer, no AWS.
+    let signer = SignerSource::from_spec(&cfg.aws.kms_deployer).expect("signer spec");
+    assert_eq!(signer.describe(), "local private key");
+    apply::run(
+        &path,
+        &cfg,
+        &signer,
+        &apply::Options {
+            confirm_fresh_deploy: true,
+            dev: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("local-dev converges");
+
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    assert_declared_and_present(&provider, &cfg).await;
+
+    // The roles the file separates stay separate on chain: the notary
+    // signer is anvil #1, the owner is anvil #0.
+    let notary_service: Address = cfg.contracts.notary_service.parse().unwrap();
+    let service = NotaryService::new(notary_service, &provider);
+    assert!(service
+        .isTrustedNotary(ANVIL_NOTARY.parse().unwrap())
+        .call()
+        .await
+        .unwrap());
+    assert!(!service
+        .isTrustedNotary(ANVIL_OWNER.parse().unwrap())
+        .call()
+        .await
+        .unwrap());
+    assert_eq!(
+        service.fee().call().await.unwrap(),
+        U256::from(NOTARY_FEE_WEI),
+        "the local fee must stay non-zero so a wrong-value client fails here"
+    );
+    assert_eq!(
+        LibidFactory::new(cfg.contracts.factory.parse().unwrap(), &provider)
+            .owner()
+            .call()
+            .await
+            .unwrap(),
+        ANVIL_OWNER.parse::<Address>().unwrap()
+    );
+}

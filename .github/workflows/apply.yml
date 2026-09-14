@@ -24,7 +24,8 @@ on:
         description: "Network file under networks/ (add new networks to this list)"
         type: choice
         # eden-testnet's FIRST apply needs confirm_fresh_deploy: the
-        # factory is virgin on that chain.
+        # factory is virgin on that chain. local-dev is deliberately absent:
+        # it has no KMS key and its chain exists only inside a CI run.
         options: [eden-testnet]
         default: eden-testnet
       mode:

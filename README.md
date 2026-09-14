@@ -309,6 +309,26 @@ a half-applied upgrade is worse than a queued one). The job runs in the
 GitHub **environment named after the network**, so production networks can
 demand reviewers.
 
+## Local development chain
+
+`networks/local-dev.toml` is the stack as a docker-compose CI brings it up:
+chain 31337 at `http://anvil:8545`, anvil account #0 as deployer and
+operational owner, anvil account #1 as the notary signer, and a **non-zero**
+Notary Fee — a local stack that meters at no charge lets a client attaching
+the wrong value pass, and `WrongValue` is then first seen where it costs
+something. The deployer spec in the file is anvil's own published test key:
+`--signer` specs are classified by shape, so 64 hex characters is a local
+key and no AWS call happens.
+
+```sh
+docker compose up -d anvil
+libid-deploy apply --network networks/local-dev.toml --yes \
+  --confirm-fresh-deploy --dev
+```
+
+An integration test applies the committed file against a real anvil, so it
+cannot rot into something that only parses.
+
 ## Adding a network
 
 Copy `networks/mainnet.toml.example` — it ships FULLY pre-filled with the
