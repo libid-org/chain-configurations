@@ -27,7 +27,7 @@ The model is DECLARATIVE:
    little of the stack) exists yet.
 
 Contract bytecode is embedded in the binary through the
-[`libid-contracts`](https://github.com/libid-org/libid-contracts) crate —
+[`libID-contracts`](https://github.com/libid-org/libID-contracts) crate —
 the core stack, the Platform Verifiers and the ceremony circuits' Honk
 verifiers alike, compiled once upstream from the pinned sources. There is
 no forge build, no bb and no artifact directory anywhere in this
@@ -76,7 +76,7 @@ Then two steps `Deploy.s.sol` does not have:
 ### Where the bytecode comes from
 
 Not from here. Each derivation runs once, in the repository that owns its
-tool: [`libid-circuits`](https://github.com/libid-org/libid-circuits) runs
+tool: [`libID-circuits`](https://github.com/libid-org/libID-circuits) runs
 `bb` and publishes each circuit's generated verifier in its release
 tarball, `libid-contracts` vendors that Solidity from the release it pins
 (by sha256 literal, downloaded in its CI, never committed), compiles it
