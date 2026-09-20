@@ -3284,9 +3284,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libid-contracts"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15c8ff4067663b7973684a9178640e5ab348b96624576a18a7f8e0063dbeb234"
+checksum = "73d368cfec1317d28535f7cbf3503bdf105a62603507988ae4452dbc0e5c4cdf"
 dependencies = [
  "alloy",
  "include_dir",
@@ -3320,15 +3320,15 @@ dependencies = [
 
 [[package]]
 name = "libid-identity"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7d0861bfbd43919ca06a767648b805f926af61caf89110aaf4b1237e18fbe4f"
+checksum = "e34cb1cfbc917ed962fe7804f333912a3c55bd3970ee7f3f42bdfe44f916a107"
 
 [[package]]
 name = "libid-profiles"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3df895fb021792e3be1956b4901ef2ced113e933561076f48708f00dda4d5f3"
+checksum = "76e8c3d3739085340d1dbc805d30d5c3f2c3967428fe0c51e5057a82dc459a9b"
 
 [[package]]
 name = "libm"

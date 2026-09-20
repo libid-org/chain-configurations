@@ -9,16 +9,16 @@ description = "Applies per-network declarative configuration to chains: every ca
 publish = false
 
 [dependencies]
-libid-contracts = "0.12.0"
+libid-contracts = "0.13.0"
 # The handle transform's generated table: platform domains (whose keccak256
 # is the on-chain platform id), the normalization rules `setPlatform` stores,
 # and each profile's future-observation allowance. Retyping any of them here
 # would key handles differently from every deployed reader.
-libid-identity = "0.12.0"
+libid-identity = "0.13.0"
 # The ceremony profile table: which sessions a platform notarizes (hence
 # whether its Platform Verifier holds a Notary Service at all) and the launch
 # protocol parameters.
-libid-profiles = "0.12.0"
+libid-profiles = "0.13.0"
 alloy = { version = "1", features = [
     "contract",
     "providers",
