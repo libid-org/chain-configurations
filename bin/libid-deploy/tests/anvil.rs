@@ -41,6 +41,7 @@ use libid_contracts::{
         circuits::HonkVerifier,
         factory::LibidFactory,
         identity::IdentityNames,
+        proxy::IUUPSUpgradeable,
     },
     circuits::LIBRARIES,
     deploy::deploy_contract_from,
@@ -511,6 +512,123 @@ async fn apply_converges_drifted_wiring_without_redeploying() {
             .await
             .unwrap(),
         U256::from(NOTARY_FEE_WEI)
+    );
+}
+
+/// A proxy whose running implementation predates a getter the wiring reads
+/// — eden's IdentityNames, deployed before `proofVerifier()` existed — is
+/// converged by the SAME run that upgrades it: the upgrade lands inside the
+/// component's step, ahead of the read, so `apply --upgrade identity-names`
+/// finishes instead of aborting at `proofVerifier read failed`. Without the
+/// upgrade apply still stops there, and plan says which flag lifts it.
+///
+/// The stale implementation is stood in for by the Notary Service's: the
+/// same UUPS + Ownable2Step storage, so the owner survives the swap and can
+/// upgrade back, and no `proofVerifier()` selector, so the read reverts.
+#[tokio::test]
+async fn apply_upgrades_a_proxy_before_reading_through_it() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prefilled_network_file(dir.path(), &anvil.endpoint());
+    apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            dev: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let proof_verifier: Address = cfg.contracts.ceremony_proof_verifier.parse().unwrap();
+    let identity_names: Address = cfg.contracts.identity_names.parse().unwrap();
+
+    let key: alloy::signers::local::PrivateKeySigner = ANVIL_KEY.parse().unwrap();
+    let owned = ProviderBuilder::new()
+        .wallet(alloy::network::EthereumWallet::from(key))
+        .connect_http(anvil.endpoint_url());
+    let stale_impl = deploy_contract_from(
+        &owned,
+        Artifacts::embedded().bytecode("NotaryService").unwrap(),
+        "an implementation without proofVerifier()",
+        None,
+    )
+    .await
+    .expect("stand-in implementation deploys");
+    IUUPSUpgradeable::new(identity_names, &owned)
+        .upgradeToAndCall(stale_impl, Bytes::new())
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    assert!(
+        IdentityNames::new(identity_names, &owned)
+            .proofVerifier()
+            .call()
+            .await
+            .is_err(),
+        "the stand-in must not answer proofVerifier()"
+    );
+
+    // Plan warns and names the flag that lets apply through.
+    let stale = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan on the stale implementation");
+    let item = stale
+        .items
+        .iter()
+        .find(|i| i.component == "identity_names.proof_verifier")
+        .expect("the wiring item is planned");
+    assert_eq!(item.status, Status::Warn);
+    assert!(
+        item.detail.contains("--upgrade identity-names"),
+        "got: {}",
+        item.detail
+    );
+
+    // Without the upgrade, apply stops at that read.
+    let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
+    let err = apply::run(
+        &path,
+        &cfg,
+        &file_rpc(&cfg),
+        &signer,
+        &apply::Options::default(),
+    )
+    .await
+    .expect_err("the stale getter aborts a plain apply")
+    .to_string();
+    assert!(err.contains("proofVerifier read failed"), "got: {err}");
+
+    // With it, the same run upgrades first and converges the rest.
+    let upgraded = apply_with(
+        &path,
+        apply::Options {
+            upgrades: vec!["identity-names".parse().unwrap()],
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(upgraded.upgraded.len(), 1);
+    assert!(upgraded.deployed.is_empty());
+    assert_eq!(
+        IdentityNames::new(identity_names, &owned)
+            .proofVerifier()
+            .call()
+            .await
+            .unwrap(),
+        proof_verifier,
+        "the binding to the proof verifier survives the round trip"
+    );
+    let settled = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan after the upgrade");
+    assert_eq!(
+        settled.status_of("identity_names.proof_verifier"),
+        Some(Status::Ok)
     );
 }
 

@@ -498,7 +498,10 @@ async fn plan_identity_names<P: Provider>(
         Err(e) => b.push(
             "identity_names.proof_verifier",
             Status::Warn,
-            format!("proofVerifier read failed: {e}"),
+            format!(
+                "proofVerifier read failed: {e} — apply STOPS at this read unless \
+                 it upgrades the implementation first (--upgrade identity-names)"
+            ),
         ),
     }
 }
