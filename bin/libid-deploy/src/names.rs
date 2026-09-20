@@ -40,7 +40,11 @@ pub const NOTARY_SERVICE: &str = "libid.NotaryService";
 /// dispatches claims through.
 pub const CEREMONY_PROOF_VERIFIER: &str = "libid.CeremonyProofVerifier";
 /// The IdentityNames proxy — the contract consumers resolve against.
-pub const IDENTITY_NAMES: &str = "libid.IdentityNames";
+/// `.2`: the first `libid.IdentityNames` on eden-testnet was deployed from the
+/// pre-ceremony contract set and keeps its storage. A name nothing has used
+/// gives the naming system an address with no history on any network, rather
+/// than an in-place upgrade over a layout this repository no longer builds.
+pub const IDENTITY_NAMES: &str = "libid.IdentityNames.2";
 /// The Google JWT root list proxy, read by the Google Platform Verifier.
 pub const GOOGLE_JWT_ROOTS: &str = "libid.GoogleJwtRoots";
 /// The `x/v1` Platform Verifier proxy.

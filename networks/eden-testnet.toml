@@ -63,7 +63,7 @@ fee_wei = "0"
 factory = "0xa92244c3f4462aad08bd1a33c3940b9b936321ad"
 notary_service = "0xbb5871167b0128939cab6850877981421e8dcbf5"
 ceremony_proof_verifier = "0x76bdc18f21c2db0ff796c7cc50348528b2899275"
-identity_names = "0xd467d48769c26faee36ba6b6fc9228f14aef6dd2"
+identity_names = "0xe78b53a183dd51763df44beb2500ddab9bb0329e"
 # Deploys EMPTY. Until a keeper lands a notarized reading of Google's live JWKS,
 # every Google claim reverts with UntrustedModulus(). The deployment repo runs
 # the keeper hourly; the first tick has to be run deliberately, right after this
