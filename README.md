@@ -308,7 +308,11 @@ Upgrade components: `notary-service`, `proof-verifier`, `identity-names`,
 `google-jwt-roots`, `x-platform-verifier`, `github-platform-verifier`,
 `google-platform-verifier`. Each is a UUPS `upgradeToAndCall`: the entry
 address, its storage and its owner all survive, so an upgrade never moves a
-canonical address and never disturbs a registration.
+canonical address and never disturbs a registration. Each upgrade runs
+inside its component's own step, before apply reads or wires that
+component: a proxy whose running implementation predates a getter the
+wiring reads (`plan` flags it as `WARN ... read failed`) converges in the
+same `apply --upgrade` run instead of aborting at the read.
 
 For anvil rehearsal, `apply --dev` (or just letting apply detect anvil)
 covers the factory-ownership wrinkle: the local signer is not the baked

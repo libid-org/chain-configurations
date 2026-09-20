@@ -418,6 +418,17 @@ pub async fn run(
             .push(("contracts.notary_service".into(), addr));
     }
 
+    upgrade_if_requested(
+        &provider,
+        &artifacts,
+        opts,
+        "notary_service",
+        notary_service,
+        sender,
+        &mut summary,
+    )
+    .await?;
+
     // Declarative key trust: the file says which signer the stack accepts.
     // Only the ADDITION is inferable — the service holds a SET so a
     // rotation can overlap, and which outgoing key to stop trusting is a
@@ -484,6 +495,17 @@ pub async fn run(
             .push(("contracts.ceremony_proof_verifier".into(), addr));
     }
 
+    upgrade_if_requested(
+        &provider,
+        &artifacts,
+        opts,
+        "ceremony_proof_verifier",
+        proof_verifier,
+        sender,
+        &mut summary,
+    )
+    .await?;
+
     // ── 3. The naming system, with a keyspace per platform ───────────────
     if !identity_names_present {
         let addr = deploy_named_proxy(
@@ -508,6 +530,17 @@ pub async fn run(
             .deployed
             .push(("contracts.identity_names".into(), addr));
     }
+
+    upgrade_if_requested(
+        &provider,
+        &artifacts,
+        opts,
+        "identity_names",
+        identity_names,
+        sender,
+        &mut summary,
+    )
+    .await?;
 
     let names_contract = IdentityNames::new(identity_names, &provider);
     let wired = names_contract
@@ -575,6 +608,17 @@ pub async fn run(
             .push(("contracts.google_jwt_roots".into(), addr));
     }
 
+    upgrade_if_requested(
+        &provider,
+        &artifacts,
+        opts,
+        "google_jwt_roots",
+        jwt_roots,
+        sender,
+        &mut summary,
+    )
+    .await?;
+
     let roots = GoogleJwtRoots::new(jwt_roots, &provider);
     let roots_notary = roots
         .notaryService()
@@ -601,6 +645,7 @@ pub async fn run(
             &provider,
             &artifacts,
             cfg,
+            opts,
             libid_factory,
             sender,
             platform,
@@ -613,30 +658,15 @@ pub async fn run(
         .await?;
     }
 
-    // ── Explicit upgrades ────────────────────────────────────────────────
-    for upgrade in &opts.upgrades {
-        let key = upgrade.contracts_key();
-        let proxy = required_address(
-            cfg.contracts
-                .raw(key)
-                .ok_or_else(|| anyhow!("{key} is not a canonical contract"))?,
-            &format!("contracts.{key}"),
-        )?;
-        let new_impl = upgrade_proxy(
-            &provider,
-            proxy,
-            upgrade.implementation_code(&artifacts)?,
-            upgrade.contract(),
-            sender,
-        )
-        .await?;
-        info!(
-            "{} upgraded: proxy {proxy:#x} now points at {new_impl:#x}",
-            upgrade.contract()
+    // Every requested upgrade ran inside its component's section above; a
+    // component none of them owns would have been silently dropped.
+    if summary.upgraded.len() != opts.upgrades.len() {
+        bail!(
+            "{} upgrade(s) requested, {} applied — a requested component has \
+             no section in apply",
+            opts.upgrades.len(),
+            summary.upgraded.len()
         );
-        summary
-            .upgraded
-            .push(format!("{} -> {new_impl:#x}", upgrade.contract()));
     }
 
     // ── Factory ownership converges to the declared operational owner ────
@@ -1118,6 +1148,7 @@ async fn apply_platform_verifier<P: Provider>(
     provider: &P,
     artifacts: &Artifacts,
     cfg: &NetworkConfig,
+    opts: &Options,
     factory: Address,
     sender: Address,
     platform: &Platform,
@@ -1174,6 +1205,17 @@ async fn apply_platform_verifier<P: Provider>(
             .deployed
             .push((format!("contracts.{}", platform.contracts_key), deployed));
     }
+
+    upgrade_if_requested(
+        provider,
+        artifacts,
+        opts,
+        platform.contracts_key,
+        proxy,
+        sender,
+        summary,
+    )
+    .await?;
 
     converge_trust_roots(
         provider, platform, proxy, circuit, codehash, sender, summary,
@@ -1334,6 +1376,41 @@ async fn upgrade_proxy<P: Provider>(
         sender
     )?;
     Ok(new_impl)
+}
+
+/// Run the `--upgrade`s that name the proxy under `[contracts].<key>`.
+/// Called from the component's own section, once its proxy has code and
+/// BEFORE anything reads or writes through it: the implementation running
+/// today may predate a getter the wiring reads (eden's IdentityNames
+/// predates `proofVerifier()`), and the upgrade is what makes that read
+/// answer. Nothing to do when no upgrade names the component.
+async fn upgrade_if_requested<P: Provider>(
+    provider: &P,
+    artifacts: &Artifacts,
+    opts: &Options,
+    key: &str,
+    proxy: Address,
+    sender: Address,
+    summary: &mut Summary,
+) -> Result<()> {
+    for upgrade in opts.upgrades.iter().filter(|u| u.contracts_key() == key) {
+        let new_impl = upgrade_proxy(
+            provider,
+            proxy,
+            upgrade.implementation_code(artifacts)?,
+            upgrade.contract(),
+            sender,
+        )
+        .await?;
+        info!(
+            "{} upgraded: proxy {proxy:#x} now points at {new_impl:#x}",
+            upgrade.contract()
+        );
+        summary
+            .upgraded
+            .push(format!("{} -> {new_impl:#x}", upgrade.contract()));
+    }
+    Ok(())
 }
 
 /// ERC1967Proxy creation code ++ `abi.encode(implementation, initData)` —
