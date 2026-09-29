@@ -24,8 +24,7 @@
 //! naming system dispatches claims through, the naming system itself with
 //! a keyspace per platform, and the Google JWT root list that pays the
 //! Notary Service for each rotation. Then one step that script does not
-//! have: the ceremony circuits' Honk verifiers — the two libraries every
-//! one links deployed once and shared — and a Platform Verifier per
+//! have: the ceremony circuits' Honk verifiers and a Platform Verifier per
 //! platform pinned to one of them and registered into the Supported
 //! Version Set, without which a platform owns a keyspace and can verify
 //! nothing.
@@ -71,11 +70,7 @@ use libid_contracts::{
         identity::IdentityNames,
         proxy::IUUPSUpgradeable,
     },
-    circuits::LIBRARIES,
-    deploy::{
-        deploy_contract_from,
-        Libraries,
-    },
+    deploy::deploy_contract_from,
     factory::{
         ensure_create2_deployer,
         ensure_factory,
@@ -379,8 +374,7 @@ pub async fn run(
         needs_factory_deploy |= !code_present(&provider, declared).await?;
     }
     // The circuit verifiers deploy through the factory too, under a name
-    // carrying the pinned circuits release. Their libraries do not: those
-    // go through the CREATE2 deployer, which anyone may call.
+    // carrying the pinned circuits release.
     for circuit in Circuit::ALL {
         let predicted = predict_address(libid_factory, &circuits::factory_name(circuit)?);
         needs_factory_deploy |= !code_present(&provider, predicted).await?;
@@ -1031,15 +1025,11 @@ fn declared_verifier(cfg: &NetworkConfig, platform: &Platform) -> Result<Address
 /// What this run has already put on the chain for the ceremony circuits.
 ///
 /// Two platforms share `bearer-link`, so without this a single apply would
-/// resolve the same verifier twice. The libraries need no cache of their
-/// own: each lands at an address derived from its bytecode, so a second
-/// resolve finds it there.
+/// resolve the same verifier twice.
 #[derive(Debug, Default)]
 struct CircuitCache {
     /// Circuit -> its verifier's address and on-chain code hash.
     verifiers: BTreeMap<Circuit, (Address, B256)>,
-    /// The shared libraries, once any verifier has needed them.
-    libraries: Option<Libraries>,
 }
 
 /// The circuit verifier for `circuit`: deployed if the chain lacks it, and
@@ -1052,9 +1042,9 @@ struct CircuitCache {
 /// release is a different name, a different address and a rotation rather
 /// than a silent replacement.
 ///
-/// The code hash is READ, never computed: a bb verifier links two
-/// libraries, so its runtime code carries their addresses, and the hash
-/// the Platform Verifier checks is the one the chain holds.
+/// The code hash is READ, never computed: the hash the Platform Verifier
+/// checks is the one the chain holds, and the crate embeds only creation
+/// code.
 async fn ensure_circuit_verifier<P: Provider>(
     provider: &P,
     artifacts: &Artifacts,
@@ -1070,13 +1060,7 @@ async fn ensure_circuit_verifier<P: Provider>(
     let name = circuits::factory_name(circuit)?;
     let address = predict_address(factory, &name);
     if !code_present(provider, address).await? {
-        let libraries =
-            ensure_libraries(provider, artifacts, sender, cache, summary).await?;
-        // The placeholders substituted with the shared addresses; deploying
-        // them unresolved would produce a contract that reverts on every
-        // proof.
-        let creation_code =
-            libraries.link(artifacts, circuit.contract(), circuit.contract())?;
+        let creation_code = artifacts.bytecode(circuit.contract())?;
         let deployed =
             factory_deploy_named(provider, factory, &name, creation_code, sender).await?;
         info!(
@@ -1098,47 +1082,6 @@ async fn ensure_circuit_verifier<P: Provider>(
     })?;
     cache.verifiers.insert(circuit, (address, codehash));
     Ok((address, codehash))
-}
-
-/// The libraries every embedded verifier links, deployed once per distinct
-/// bytecode across the whole run — and across runs: each lands at an
-/// address derived from its creation code through the CREATE2 deployer, so
-/// one already on the chain is found and linked rather than deployed again.
-/// Resolved for ALL circuits at once, so that whichever verifier asks first
-/// shares with every one that follows.
-async fn ensure_libraries<'a, P: Provider>(
-    provider: &P,
-    artifacts: &Artifacts,
-    sender: Address,
-    cache: &'a mut CircuitCache,
-    summary: &mut Summary,
-) -> Result<&'a Libraries> {
-    if cache.libraries.is_none() {
-        let contracts: Vec<(&str, &str)> = Circuit::ALL
-            .iter()
-            .map(|c| (c.contract(), c.contract()))
-            .collect();
-        let libraries =
-            Libraries::deploy(provider, artifacts, &contracts, Some(sender)).await?;
-        for deployed in libraries.deployed() {
-            // The name it answers to in a verifier's link references — the
-            // same for every file that links this bytecode.
-            let library = Circuit::ALL
-                .iter()
-                .flat_map(|c| LIBRARIES.iter().map(move |l| (c.contract(), *l)))
-                .find(|(file, l)| libraries.address(file, l) == Some(deployed))
-                .map(|(_, l)| l)
-                .ok_or_else(|| {
-                    anyhow!("library deployed at {deployed:#x} is linked by nothing")
-                })?;
-            info!("{library} deployed at {deployed:#x}, shared by every verifier");
-            summary
-                .deployed
-                .push((format!("circuits.library.{library}"), deployed));
-        }
-        cache.libraries = Some(libraries);
-    }
-    Ok(cache.libraries.as_ref().expect("just populated"))
 }
 
 /// Deploy, wire and register one platform's Platform Verifier, on the

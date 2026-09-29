@@ -43,7 +43,6 @@ use libid_contracts::{
         identity::IdentityNames,
         proxy::IUUPSUpgradeable,
     },
-    circuits::LIBRARIES,
     deploy::deploy_contract_from,
     factory::{
         predict_address,
@@ -679,11 +678,11 @@ async fn fresh_apply_addresses_are_network_invariant() {
 }
 
 /// The Platform Verifiers, end to end on a virgin chain: one apply deploys
-/// the two ceremony circuits' Honk verifiers from the embedded artifacts on
-/// ONE shared copy of each library, deploys a Platform Verifier per
-/// platform pinned to the right one — by address AND by the code hash the
-/// chain reports — registers each into the Supported Version Set, and
-/// leaves the naming system resolving and quoting for all three.
+/// the two ceremony circuits' Honk verifiers from the embedded artifacts,
+/// deploys a Platform Verifier per platform pinned to the right one — by
+/// address AND by the code hash the chain reports — registers each into
+/// the Supported Version Set, and leaves the naming system resolving and
+/// quoting for all three.
 #[tokio::test]
 async fn platform_verifiers_deploy_wire_and_register() {
     let anvil = spawn_anvil();
@@ -705,40 +704,25 @@ async fn platform_verifiers_deploy_wire_and_register() {
     let cfg = NetworkConfig::load(&path).expect("config loads");
     assert_declared_and_present(&provider, &cfg).await;
 
-    // Each library deployed exactly once, at the address its bytecode
-    // derives — the same on every chain — however many verifiers link it.
-    let libraries = circuits::library_addresses().unwrap();
-    assert_eq!(libraries.len(), LIBRARIES.len());
-    let deployed_libraries: Vec<(&str, Address)> = fresh
+    // The circuit verifiers are the only circuit components apply deploys:
+    // bb's optimized verifier links nothing.
+    let circuit_components: Vec<&str> = fresh
         .deployed
         .iter()
-        .filter_map(|(component, addr)| {
-            component
-                .strip_prefix("circuits.library.")
-                .map(|library| (library, *addr))
-        })
+        .filter_map(|(component, _)| component.strip_prefix("circuits."))
         .collect();
     assert_eq!(
-        deployed_libraries.len(),
-        LIBRARIES.len(),
+        circuit_components.len(),
+        Circuit::ALL.len(),
         "{:?}",
         fresh.deployed
     );
-    for (library, addr) in &deployed_libraries {
-        assert_eq!(libraries.get(addr), Some(library), "{library} at {addr:#x}");
-        assert!(
-            !provider.get_code_at(*addr).await.unwrap().is_empty(),
-            "{library} has no code at {addr:#x}"
-        );
-    }
 
     // Both circuit verifiers are real Honk verifiers at their CREATE3
     // addresses, over DIFFERENT circuits. A bb verifier has no getter for
     // its verification key; the one thing it says about itself is the logN
     // a wrong-length proof comes back with, so that is what separates a
-    // real verifier from a contract that merely has code. And each one's
-    // runtime code carries the SHARED library addresses: that is what
-    // links them, and what the pinned code hash covers.
+    // real verifier from a contract that merely has code.
     let mut log_n = Vec::new();
     for circuit in Circuit::ALL {
         let address = circuit_verifier_address(circuit);
@@ -756,13 +740,6 @@ async fn platform_verifiers_deploy_wire_and_register() {
             circuit.name(),
             code.len()
         );
-        for (addr, library) in &libraries {
-            assert!(
-                code.windows(20).any(|w| w == addr.as_slice()),
-                "the {} circuit verifier does not link the shared {library} at {addr:#x}",
-                circuit.name()
-            );
-        }
         let reported = honk_log_n(&provider, address).await;
         assert!(reported > 0, "{} reports no circuit size", circuit.name());
         log_n.push(reported);
@@ -904,8 +881,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
     assert_ne!(pinned[0], pinned[2], "Google shares X's circuit");
 
     // A second apply deploys and configures nothing more: the circuit
-    // verifiers are CREATE3-named and the libraries bytecode-addressed, so
-    // a converged chain is recognised.
+    // verifiers are CREATE3-named, so a converged chain is recognised.
     let again = apply_with(&path, apply::Options::default()).await;
     assert!(again.deployed.is_empty(), "{:?}", again.deployed);
     assert!(again.configured.is_empty(), "{:?}", again.configured);
@@ -920,12 +896,6 @@ async fn platform_verifiers_deploy_wire_and_register() {
     for circuit in Circuit::ALL {
         assert_eq!(
             settled.status_of(&format!("circuits.{}", circuit.name())),
-            Some(Status::Ok)
-        );
-    }
-    for library in LIBRARIES {
-        assert_eq!(
-            settled.status_of(&format!("circuits.library.{library}")),
             Some(Status::Ok)
         );
     }
