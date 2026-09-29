@@ -19,7 +19,7 @@ libid-identity = "0.13.0"
 # whether its Platform Verifier holds a Notary Service at all) and the launch
 # protocol parameters.
 libid-profiles = "0.13.0"
-alloy = { version = "1", features = [
+alloy = { version = "2", features = [
     "contract",
     "providers",
     "network",
@@ -38,12 +38,12 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
 [dev-dependencies]
-alloy = { version = "1", features = ["node-bindings"] }
+alloy = { version = "2", features = ["node-bindings"] }
 tempfile = "3"
