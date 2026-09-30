@@ -33,7 +33,7 @@ pub struct CanonicalContract {
 /// authenticated through it.
 pub const NOTARY_SERVICE: &str = "libid.NotaryService";
 /// The Proof Verifier proxy: the Supported Version Set the naming system
-/// dispatches claims through.
+/// dispatches bindings through.
 pub const CEREMONY_PROOF_VERIFIER: &str = "libid.CeremonyProofVerifier";
 /// The IdentityNames proxy — the contract consumers resolve against.
 /// `.2`: the first `libid.IdentityNames` on eden-testnet was deployed from the

@@ -21,8 +21,8 @@
 //!
 //! The stack order is `script/Deploy.s.sol`'s: the Notary Service every
 //! notarized session is authenticated through, the Proof Verifier the
-//! naming system dispatches claims through, the naming system itself with
-//! a keyspace per platform, and the Google JWT root list that pays the
+//! naming system dispatches bindings through, the naming system itself
+//! with a keyspace per platform, and the Google JWT root list that pays the
 //! Notary Service for each rotation. Then one step that script does not
 //! have: the ceremony circuits' Honk verifiers and a Platform Verifier per
 //! platform pinned to one of them and registered into the Supported
@@ -1258,7 +1258,7 @@ async fn converge_jwt_roots<P: Provider>(
 }
 
 /// Register the verifier in the Supported Version Set. Until this lands,
-/// `IdentityNames.claim` reverts `UnknownVersion` and every resolver for
+/// `IdentityNames.bind` reverts `UnknownVersion` and every resolver for
 /// the platform reverts `UnknownPlatform`.
 async fn register_verifier<P: Provider>(
     provider: &P,

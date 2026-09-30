@@ -451,8 +451,8 @@ async fn plan_notary_service<P: Provider>(
     }
 }
 
-/// The naming system dispatches every claim through the Proof Verifier;
-/// without that pointer `quoteClaim` calls the zero address.
+/// The naming system dispatches every binding through the Proof Verifier;
+/// without that pointer `quoteBind` calls the zero address.
 async fn plan_identity_names<P: Provider>(
     b: &mut Builder,
     provider: &P,
@@ -515,7 +515,7 @@ async fn plan_jwt_roots<P: Provider>(
         Ok(true) => b.push(
             "google_jwt_roots.rotation",
             Status::Warn,
-            "the trust list wants a rotation — every Google claim reverts \
+            "the trust list wants a rotation — every Google binding reverts \
              UntrustedModulus until a keeper lands one. Not apply's job",
         ),
         Ok(false) => b.push("google_jwt_roots.rotation", Status::Ok, "trusted and fresh"),

@@ -54,7 +54,7 @@ Four UUPS proxies, in dependency order — the order
 4. **GoogleJwtRoots** — the Google signing keys the `google/v1` Platform
    Verifier trusts, verified through the Notary Service like any other
    notarized session. It deploys **EMPTY**: point a keeper at it before
-   Google names work, or every Google claim reverts `UntrustedModulus`.
+   Google names work, or every Google binding reverts `UntrustedModulus`.
 
 Then two steps `Deploy.s.sol` does not have:
 
@@ -67,7 +67,7 @@ Then two steps `Deploy.s.sol` does not have:
    hash, and registered into the Supported Version Set with
    `CeremonyProofVerifier.setVerifier(platformId, 1, verifier)`. Until that
    registration lands, a platform owns a keyspace and can verify nothing:
-   `claim` reverts `UnknownVersion` and every resolver reverts
+   `bind` reverts `UnknownVersion` and every resolver reverts
    `UnknownPlatform`.
 
 ## The ceremony contracts
