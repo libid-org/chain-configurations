@@ -154,12 +154,12 @@ entry = a NEW address, forever, on every network — names are frozen:
 The circuit verifiers go through the same factory but are not in that
 table and not in any network file: their names carry the circuits release
 `libid-contracts` vendors, so they move when the contracts pin does. At
-`libid-circuits` 0.4.0 (`libid-contracts` 0.12.0) they are
+`libid-circuits` 0.5.0 (`libid-contracts` 0.14.0) they are
 
 | Component | Name | Address (every network) |
 |---|---|---|
-| `circuits.bearer-link` | `libid.circuits.bearer-link.0.4.0` | `0xab8c8aabbcd921a8bd944ca693cd2426369d702f` |
-| `circuits.oidc-google` | `libid.circuits.oidc-google.0.4.0` | `0xc1150bc7e095aa56654b5c9f6b4561c1751b8352` |
+| `circuits.bearer-link` | `libid.circuits.bearer-link.0.5.0` | `0x8373cb5ce354ea975c11c406ee5fc639efe0a3cc` |
+| `circuits.oidc-google` | `libid.circuits.oidc-google.0.5.0` | `0x6e55aa9a42d4902b834aeb84db860eed0e4ae209` |
 
 `plan --print-addresses` prints all of them together with the canonical
 table.

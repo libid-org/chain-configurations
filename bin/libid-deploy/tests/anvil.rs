@@ -852,7 +852,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
         };
         assert_eq!(
             names_contract
-                .quoteClaim(platform_id, LAUNCH_VERIFIER_VERSION)
+                .quoteBind(platform_id, LAUNCH_VERIFIER_VERSION)
                 .call()
                 .await
                 .unwrap(),
