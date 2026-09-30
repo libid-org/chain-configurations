@@ -85,7 +85,7 @@ enum Command {
         #[arg(long)]
         signer: Option<String>,
         /// Comma-separated components to explicitly upgrade:
-        /// notary-service, proof-verifier, identity-names,
+        /// notary-service, proof-verifier, identity-names, handle-escrow,
         /// google-jwt-roots, x-platform-verifier,
         /// github-platform-verifier, google-platform-verifier. Each is a
         /// UUPS proxy; the entry address, its storage and its owner all

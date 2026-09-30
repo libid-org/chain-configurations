@@ -133,6 +133,9 @@ pub struct Contracts {
     pub ceremony_proof_verifier: String,
     /// The IdentityNames proxy — the contract consumers resolve against.
     pub identity_names: String,
+    /// The HandleEscrow proxy, initialized with `identity_names`, which it
+    /// keeps for life.
+    pub handle_escrow: String,
     /// The GoogleJwtRoots proxy. Starts EMPTY on-chain: point a keeper at
     /// it before Google names work.
     pub google_jwt_roots: String,
@@ -152,6 +155,7 @@ impl Contracts {
             "notary_service" => self.notary_service.as_str(),
             "ceremony_proof_verifier" => self.ceremony_proof_verifier.as_str(),
             "identity_names" => self.identity_names.as_str(),
+            "handle_escrow" => self.handle_escrow.as_str(),
             "google_jwt_roots" => self.google_jwt_roots.as_str(),
             "x_platform_verifier" => self.x_platform_verifier.as_str(),
             "github_platform_verifier" => self.github_platform_verifier.as_str(),
@@ -303,6 +307,7 @@ factory = "{factory:#x}"
 notary_service = "{notary_service}"
 ceremony_proof_verifier = "{pv}"
 identity_names = "{names}"
+handle_escrow = "{escrow}"
 google_jwt_roots = "{roots}"
 x_platform_verifier = "{x}"
 github_platform_verifier = "{github}"
@@ -311,6 +316,7 @@ google_platform_verifier = "{google}"
             notary_service = addr(names::NOTARY_SERVICE),
             pv = addr(names::CEREMONY_PROOF_VERIFIER),
             names = addr(names::IDENTITY_NAMES),
+            escrow = addr(names::HANDLE_ESCROW),
             roots = addr(names::GOOGLE_JWT_ROOTS),
             x = addr(names::X_PLATFORM_VERIFIER),
             github = addr(names::GITHUB_PLATFORM_VERIFIER),

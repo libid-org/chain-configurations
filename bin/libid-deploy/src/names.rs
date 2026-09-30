@@ -44,6 +44,10 @@ pub const CEREMONY_PROOF_VERIFIER: &str = "libid.CeremonyProofVerifier";
 /// account id, where the Google verifier now proves its digest. None of
 /// `.2`'s bindings are migrated.
 pub const IDENTITY_NAMES: &str = "libid.IdentityNames.3";
+/// The HandleEscrow proxy: value sent to a handle before anyone holds it,
+/// claimed through the IdentityNames it was initialized with. No setter
+/// moves it off that IdentityNames; only an upgrade can.
+pub const HANDLE_ESCROW: &str = "libid.HandleEscrow";
 /// The Google JWT root list proxy, read by the Google Platform Verifier.
 pub const GOOGLE_JWT_ROOTS: &str = "libid.GoogleJwtRoots";
 /// The `x/v1` Platform Verifier proxy.
@@ -66,6 +70,10 @@ pub const CANONICAL_CONTRACTS: &[CanonicalContract] = &[
     CanonicalContract {
         key: "identity_names",
         name: IDENTITY_NAMES,
+    },
+    CanonicalContract {
+        key: "handle_escrow",
+        name: HANDLE_ESCROW,
     },
     CanonicalContract {
         key: "google_jwt_roots",

@@ -39,6 +39,7 @@ use libid_contracts::{
             TlsNotaryPlatformVerifier,
         },
         circuits::HonkVerifier,
+        escrow::HandleEscrow,
         factory::LibidFactory,
         identity::IdentityNames,
         proxy::IUUPSUpgradeable,
@@ -151,6 +152,7 @@ factory = "{factory:#x}"
 notary_service = "{notary_service}"
 ceremony_proof_verifier = "{pv}"
 identity_names = "{identity_names}"
+handle_escrow = "{escrow}"
 google_jwt_roots = "{roots}"
 x_platform_verifier = "{x}"
 github_platform_verifier = "{github}"
@@ -159,6 +161,7 @@ google_platform_verifier = "{google}"
         notary_service = addr(names::NOTARY_SERVICE),
         pv = addr(names::CEREMONY_PROOF_VERIFIER),
         identity_names = addr(names::IDENTITY_NAMES),
+        escrow = addr(names::HANDLE_ESCROW),
         roots = addr(names::GOOGLE_JWT_ROOTS),
         x = addr(names::X_PLATFORM_VERIFIER),
         github = addr(names::GITHUB_PLATFORM_VERIFIER),
@@ -424,6 +427,14 @@ async fn declarative_apply_cycle_never_touches_the_config() {
         proof_verifier
     );
     assert_eq!(roots.notaryService().call().await.unwrap(), notary_service);
+    assert_eq!(
+        HandleEscrow::new(cfg.contracts.handle_escrow.parse().unwrap(), &provider)
+            .names()
+            .call()
+            .await
+            .unwrap(),
+        identity_names
+    );
     assert_declared_and_present(&provider, &cfg).await;
 
     // The whole point: the file is byte-identical through all of it.
@@ -1028,6 +1039,191 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
         .unwrap(),
         x_proxy
     );
+}
+
+/// The storage slot `HandleEscrow` keeps its naming system in: one past the
+/// root of its ERC-7201 namespace, where `held` sits.
+fn escrow_names_slot() -> U256 {
+    let namespace = U256::from_be_bytes(keccak256(b"libid.storage.HandleEscrow").0);
+    let root =
+        U256::from_be_bytes(keccak256((namespace - U256::from(1)).to_be_bytes::<32>()).0)
+            & !U256::from(0xff);
+    root + U256::from(1)
+}
+
+/// The handle escrow on a virgin chain: one apply deploys IdentityNames and
+/// then the escrow initialized with it, the escrow holds a deposit for a
+/// handle nobody has bound, and a second apply sends nothing.
+#[tokio::test]
+async fn the_handle_escrow_resolves_through_the_identity_names_beside_it() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prefilled_network_file(dir.path(), &anvil.endpoint());
+    let fresh = apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            dev: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let identity_names: Address = cfg.contracts.identity_names.parse().unwrap();
+    let handle_escrow: Address = cfg.contracts.handle_escrow.parse().unwrap();
+
+    // The escrow's initializer reads IdentityNames, so IdentityNames lands
+    // first.
+    let position = |component: &str| {
+        fresh
+            .deployed
+            .iter()
+            .position(|(c, _)| c == component)
+            .unwrap_or_else(|| panic!("{component} not deployed: {:?}", fresh.deployed))
+    };
+    assert!(position("contracts.identity_names") < position("contracts.handle_escrow"));
+
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let escrow = HandleEscrow::new(handle_escrow, &provider);
+    assert_eq!(escrow.names().call().await.unwrap(), identity_names);
+    // The deployer owns it, as it owns every proxy in the stack.
+    assert_eq!(
+        escrow.owner().call().await.unwrap(),
+        ANVIL_OWNER.parse::<Address>().unwrap()
+    );
+
+    // A deposit for a handle nobody holds, on a platform that can bind one,
+    // is held: both answers come from the IdentityNames beside it.
+    let names_contract = IdentityNames::new(identity_names, &provider);
+    let x = platforms::platform_id(platforms::X.domain);
+    assert!(names_contract.acceptsBindings(x).call().await.unwrap());
+    let handle_hash = names_contract
+        .handleHashOf(x, "alice".into())
+        .call()
+        .await
+        .unwrap();
+    let node = names_contract
+        .nodeOfHash(x, handle_hash)
+        .call()
+        .await
+        .unwrap();
+    let native = escrow.NATIVE().call().await.unwrap();
+    let refund_to: Address = ANVIL_NOTARY.parse().unwrap();
+    let key: alloy::signers::local::PrivateKeySigner = ANVIL_KEY.parse().unwrap();
+    let owned = ProviderBuilder::new()
+        .wallet(alloy::network::EthereumWallet::from(key))
+        .connect_http(anvil.endpoint_url());
+    HandleEscrow::new(handle_escrow, &owned)
+        .deposit(x, handle_hash, native, U256::from(1), refund_to)
+        .value(U256::from(1))
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    assert_eq!(
+        escrow.escrowed(node, native).call().await.unwrap(),
+        U256::from(1)
+    );
+    assert_eq!(
+        escrow
+            .refundable(node, native, refund_to)
+            .call()
+            .await
+            .unwrap(),
+        U256::from(1)
+    );
+
+    // A second apply deploys and configures nothing, and the deposit stays.
+    let again = apply_with(&path, apply::Options::default()).await;
+    assert!(again.deployed.is_empty(), "{:?}", again.deployed);
+    assert!(again.configured.is_empty(), "{:?}", again.configured);
+    let settled = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan after apply");
+    assert!(!settled.has_deploys(), "{}", settled.render());
+    assert_eq!(
+        settled.status_of("contracts.handle_escrow"),
+        Some(Status::Ok)
+    );
+    assert_eq!(settled.status_of("handle_escrow.names"), Some(Status::Ok));
+    assert_eq!(
+        escrow.escrowed(node, native).call().await.unwrap(),
+        U256::from(1)
+    );
+}
+
+/// An escrow that resolves through anything but the declared IdentityNames
+/// is a finding apply cannot repair, because the escrow has no setter: plan
+/// warns, and apply stops at the escrow. No call the escrow exposes makes
+/// the mismatch, so the test writes it into the escrow's storage.
+#[tokio::test]
+async fn apply_stops_at_an_escrow_bound_to_another_identity_names() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prefilled_network_file(dir.path(), &anvil.endpoint());
+    apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            dev: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let identity_names: Address = cfg.contracts.identity_names.parse().unwrap();
+    let handle_escrow: Address = cfg.contracts.handle_escrow.parse().unwrap();
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+
+    // The slot really is the one `names()` reads, or this proves nothing.
+    let slot = escrow_names_slot();
+    assert_eq!(
+        provider.get_storage_at(handle_escrow, slot).await.unwrap(),
+        U256::from_be_slice(identity_names.as_slice())
+    );
+    let elsewhere = Address::repeat_byte(0x99);
+    provider
+        .raw_request::<_, serde_json::Value>(
+            "anvil_setStorageAt".into(),
+            (
+                handle_escrow,
+                slot,
+                alloy::primitives::B256::left_padding_from(elsewhere.as_slice()),
+            ),
+        )
+        .await
+        .expect("anvil_setStorageAt");
+    assert_eq!(
+        HandleEscrow::new(handle_escrow, &provider)
+            .names()
+            .call()
+            .await
+            .unwrap(),
+        elsewhere
+    );
+
+    let drifted = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan sees the escrow's naming system");
+    assert_eq!(drifted.status_of("handle_escrow.names"), Some(Status::Warn));
+
+    let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
+    let err = apply::run(
+        &path,
+        &cfg,
+        &file_rpc(&cfg),
+        &signer,
+        &apply::Options::default(),
+    )
+    .await
+    .expect_err("apply cannot rebind the escrow")
+    .to_string();
+    assert!(err.contains("resolves through"), "got: {err}");
+    assert!(err.contains(&format!("{elsewhere:#x}")), "got: {err}");
 }
 
 /// The committed local-dev file is not just parseable: UNMODIFIED, it

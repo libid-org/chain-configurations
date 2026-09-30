@@ -34,7 +34,7 @@ on:
         options: [plan, apply]
         default: plan
       upgrade:
-        description: "Comma list to explicitly upgrade: notary-service, proof-verifier, identity-names, google-jwt-roots, x-platform-verifier, github-platform-verifier, google-platform-verifier"
+        description: "Comma list to explicitly upgrade: notary-service, proof-verifier, identity-names, handle-escrow, google-jwt-roots, x-platform-verifier, github-platform-verifier, google-platform-verifier"
         type: string
         default: ""
       confirm_fresh_deploy:
