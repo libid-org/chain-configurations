@@ -60,8 +60,7 @@ Then two steps `Deploy.s.sol` does not have:
 
 5. **A Honk verifier per ceremony circuit** — the bb-generated UltraHonk
    verifier each platform's proofs are checked under, deployed through the
-   factory under a CREATE3 name carrying the pinned circuits release, on
-   one shared deployment of each library it links.
+   factory under a CREATE3 name carrying the pinned circuits release.
 6. **A Platform Verifier per platform** — `XPlatformVerifier`,
    `GitHubPlatformVerifier`, `GooglePlatformVerifier` — deployed behind its
    own CREATE3 proxy, pinned to its circuit's verifier by address and code
@@ -90,9 +89,8 @@ The circuits release the embedded verifiers came from is read back out of
 the crate (`libid_contracts::circuits::version`) and becomes part of each
 verifier's factory name below, so the name follows the pin and cannot be
 restated. The crate's own tests hold the bindings to the artifacts: every
-bound selector against `methodIdentifiers`, `verify(bytes,bytes32[])` on
-every circuit verifier, both libraries covered beside every verifier that
-links them.
+bound selector against `methodIdentifiers`, and `verify(bytes,bytes32[])`
+on every circuit verifier.
 
 ### How the circuit verifier is wired
 
@@ -118,21 +116,13 @@ rotation path — a circuits release is a new name, a new address and a
 `setTrustRoots`, while the Platform Verifier proxy and its registration do
 not move.
 
-A verifier links `RelationsLib` and `ZKTranscriptLib`: their functions are
-`external`, so they are deployed contracts, and bb writes a copy of both
-into every verifier it generates. The copies compile to identical
-bytecode, and apply deploys each distinct bytecode **once** — through the
-CREATE2 deployer under an empty salt, so a library's address is a function
-of its code (`libid_contracts::deploy::library_address`): the same on
-every chain, found rather than deployed again on a re-run or by a later
-circuit, and shared by every verifier that links it. A fresh chain pays
-for two libraries and two verifiers. Because a verifier's runtime code
-carries those addresses, its code hash — the one the Platform Verifiers
-pin — is network-invariant too.
+Each verifier is bb's optimized template, one contract that links
+nothing: a fresh chain pays for two verifiers, and a verifier's code hash —
+the one the Platform Verifiers pin — is the same on every chain.
 
-Both verifiers are about 18 KiB of runtime code, comfortably under the
-EIP-170 limit of 24576; the anvil tests run the default code-size limit, so
-their passing is the proof.
+Both verifiers are under 17 KiB of runtime code, under the EIP-170 limit of
+24576; the anvil tests run the default code-size limit, so their passing is
+the proof.
 
 ## Factory-first deterministic addresses
 
@@ -163,18 +153,13 @@ entry = a NEW address, forever, on every network — names are frozen:
 
 The circuit verifiers go through the same factory but are not in that
 table and not in any network file: their names carry the circuits release
-`libid-contracts` vendors, so they move when the contracts pin does. The
-libraries they link are not in it either: those land through the CREATE2
-deployer at an address derived from their bytecode, so they move only when
-the bytecode does. At `libid-circuits` 0.4.0 (`libid-contracts` 0.12.0)
-they are
+`libid-contracts` vendors, so they move when the contracts pin does. At
+`libid-circuits` 0.5.0 (`libid-contracts` 0.14.0) they are
 
 | Component | Name | Address (every network) |
 |---|---|---|
-| `circuits.bearer-link` | `libid.circuits.bearer-link.0.4.0` | `0xab8c8aabbcd921a8bd944ca693cd2426369d702f` |
-| `circuits.oidc-google` | `libid.circuits.oidc-google.0.4.0` | `0xc1150bc7e095aa56654b5c9f6b4561c1751b8352` |
-| `circuits.library.RelationsLib` | — (CREATE2, bytecode-derived) | `0x306319f854a5596e1e9e2ec59f99f82ea48abeef` |
-| `circuits.library.ZKTranscriptLib` | — (CREATE2, bytecode-derived) | `0x7bb464aa25203cc5b199e0fd7a4258580d71d2a1` |
+| `circuits.bearer-link` | `libid.circuits.bearer-link.0.5.0` | `0x8373cb5ce354ea975c11c406ee5fc639efe0a3cc` |
+| `circuits.oidc-google` | `libid.circuits.oidc-google.0.5.0` | `0x6e55aa9a42d4902b834aeb84db860eed0e4ae209` |
 
 `plan --print-addresses` prints all of them together with the canonical
 table.
@@ -419,9 +404,8 @@ release` consumes the newest Linux x86_64 asset.
   local-dev file, unmodified, converges an anvil the file does not name,
   while a wrong chain id or a dead override is refused. The circuit
   verifiers those tests deploy are the real Honk verifiers: each is handed
-  a wrong-length proof and must answer with its own circuit's `logN`, the
-  two must differ, and both must carry the one shared address of each
-  library, deployed exactly once. A stand-in contract with unrelated code
+  a wrong-length proof and must answer with its own circuit's `logN`, and
+  the two must differ. A stand-in contract with unrelated code
   is used only to drift a trust root, so the pull-back is exercised on a
   pin that could never verify a proof.
 - Every commit must be signed off (`git commit -s`); see CONTRIBUTING.md.

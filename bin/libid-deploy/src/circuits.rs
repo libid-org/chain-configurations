@@ -22,35 +22,14 @@
 //! — a CREATE3 name carrying the circuit and the circuits release the
 //! crate vendors — so its address is a pure function of which artifact it
 //! is: a converged chain is recognised without a redeploy, and a circuits
-//! release is a new name, a new address and a `setTrustRoots`.
-//!
-//! # The libraries: CREATE2, at an address derived from their bytecode
-//!
-//! A bb verifier links `RelationsLib` and `ZKTranscriptLib`: their
-//! functions are `external`, so they are deployed contracts rather than
-//! inlined code, and the verifier's creation code carries a placeholder
-//! per call site until each one's address is substituted in. bb writes a
-//! copy of both into every verifier it generates, and the copies compile
-//! to the same bytecode. [`Libraries`](libid_contracts::deploy::Libraries)
-//! deploys each distinct bytecode ONCE, through the canonical CREATE2
-//! deployer under an empty salt, so the
-//! address is a function of the code ([`library_address`]): the same on
-//! every chain, found rather than deployed again on a re-run, and shared by
-//! every verifier that links it. The verifier's runtime code carries those
-//! addresses, so its code hash — the one the Platform Verifiers pin — is
-//! network-invariant too.
+//! release is a new name, a new address and a `setTrustRoots`. The verifier
+//! is one self-contained contract, so its code hash, the one the Platform
+//! Verifiers pin, is the same on every chain.
 
-use std::collections::BTreeMap;
-
-use alloy::primitives::Address;
 use anyhow::Result;
 pub use libid_contracts::circuits::Circuit;
 use libid_contracts::{
-    circuits::{
-        self,
-        LIBRARIES,
-    },
-    deploy::library_address,
+    circuits,
     Artifacts,
 };
 
@@ -70,29 +49,6 @@ pub fn version() -> Result<String> {
 /// rather than a silent replacement.
 pub fn factory_name(circuit: Circuit) -> Result<String> {
     Ok(format!("libid.circuits.{}.{}", circuit.name(), version()?))
-}
-
-/// The shared libraries the embedded verifiers link, each at the address
-/// its creation code derives — `address -> library`, one entry per distinct
-/// bytecode. Pure computation, no RPC: known before the chain has anything
-/// on it, like the canonical table.
-///
-/// Two entries for the launch circuits: both verifiers carry the same two
-/// libraries, so their copies collapse onto one address each. A copy that
-/// ever compiled differently would appear as its own entry under the same
-/// name, which is exactly the deployment it would get.
-pub fn library_addresses() -> Result<BTreeMap<Address, &'static str>> {
-    let artifacts = Artifacts::embedded();
-    let mut addresses = BTreeMap::new();
-    for circuit in Circuit::ALL {
-        for library in LIBRARIES {
-            // A library links nothing itself, so its creation code is final
-            // as embedded — the bytes `Libraries::deploy` hashes.
-            let code = artifacts.bytecode_named(circuit.contract(), library)?;
-            addresses.insert(library_address(&code), library);
-        }
-    }
-    Ok(addresses)
 }
 
 #[cfg(test)]
@@ -119,20 +75,5 @@ mod tests {
         }
         names.dedup();
         assert_eq!(names.len(), Circuit::ALL.len());
-    }
-
-    /// The premise of sharing, checked offline: both verifiers' copies of
-    /// each library compile to identical bytecode, so a fresh chain gets
-    /// exactly one deployment per library, however many circuits link it.
-    #[test]
-    fn every_library_is_one_deployment_across_all_circuits() {
-        let addresses = library_addresses().unwrap();
-        assert_eq!(addresses.len(), LIBRARIES.len(), "{addresses:?}");
-        for library in LIBRARIES {
-            assert!(
-                addresses.values().any(|l| *l == library),
-                "{library} has no address"
-            );
-        }
     }
 }

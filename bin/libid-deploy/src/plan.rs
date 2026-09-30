@@ -321,28 +321,7 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
     // ── The ceremony circuit verifiers ───────────────────────────────────
     // apply deploys these through the factory under a name carrying the
     // pinned circuits release, so the address is a pure function of which
-    // artifact it is — known here before the chain has anything on it. The
-    // libraries they link land at an address derived from their bytecode,
-    // known the same way; one deployment serves every verifier.
-    for (address, library) in circuits::library_addresses()? {
-        let component = format!("circuits.library.{library}");
-        let code = provider
-            .get_code_at(address)
-            .await
-            .map_err(|e| anyhow!("get_code({component}) failed: {e}"))?;
-        if code.is_empty() {
-            b.push(
-                component,
-                Status::Deploy,
-                format!(
-                    "{address:#x} has no code — apply would deploy it there, once, for \
-                     every verifier that links it"
-                ),
-            );
-        } else {
-            b.push(component, Status::Ok, format!("{address:#x}"));
-        }
-    }
+    // artifact it is — known here before the chain has anything on it.
     let mut verifiers: BTreeMap<Circuit, (Address, Option<B256>)> = BTreeMap::new();
     for circuit in Circuit::ALL {
         let name = circuits::factory_name(circuit)?;

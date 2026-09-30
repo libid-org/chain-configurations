@@ -77,9 +77,8 @@ google_platform_verifier = "0xf3d537022362d187715b28bc547f8b2532e6d0cf"
 # carries them: `libid-contracts` embeds each circuit's bb-generated
 # UltraHonk verifier from the libid-circuits release it pins, and apply
 # deploys it through the factory under a CREATE3 name carrying that
-# release, on one shared copy of each library it links (CREATE2, at an
-# address derived from the library's bytecode), and reads its code hash
-# off the chain for the Platform Verifier to pin. Moving the contracts pin
-# to a new circuits release and re-applying is the rotation path — a new
-# release is a new name, a new address and a `setTrustRoots`, with the
-# proxy and its registration untouched.
+# release and reads its code hash off the chain for the Platform Verifier
+# to pin. Moving the contracts pin to a new circuits release and
+# re-applying is the rotation path — a new release is a new name, a new
+# address and a `setTrustRoots`, with the proxy and its registration
+# untouched.
