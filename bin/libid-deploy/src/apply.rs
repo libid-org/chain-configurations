@@ -21,13 +21,14 @@
 //!
 //! The stack order is `script/Deploy.s.sol`'s: the Notary Service every
 //! notarized session is authenticated through, the Proof Verifier the
-//! naming system dispatches claims through, the naming system itself with
-//! a keyspace per platform, and the Google JWT root list that pays the
-//! Notary Service for each rotation. Then one step that script does not
-//! have: the ceremony circuits' Honk verifiers and a Platform Verifier per
-//! platform pinned to one of them and registered into the Supported
-//! Version Set, without which a platform owns a keyspace and can verify
-//! nothing.
+//! naming system dispatches bindings through, the naming system itself
+//! with a keyspace per platform, and the Google JWT root list that pays the
+//! Notary Service for each rotation. Two steps that script does not have:
+//! the handle escrow, right after the naming system it resolves through,
+//! and at the end the ceremony circuits' Honk verifiers and a Platform
+//! Verifier per platform pinned to one of them and registered into the
+//! Supported Version Set, without which a platform owns a keyspace and can
+//! verify nothing.
 
 use std::{
     collections::BTreeMap,
@@ -66,6 +67,7 @@ use libid_contracts::{
             NotaryService,
             TlsNotaryPlatformVerifier,
         },
+        escrow::HandleEscrow,
         factory::LibidFactory,
         identity::IdentityNames,
         proxy::IUUPSUpgradeable,
@@ -117,6 +119,9 @@ pub enum Upgrade {
     ProofVerifier,
     /// The naming system — every binding and keyspace survives.
     IdentityNames,
+    /// The handle escrow — every deposit, and the naming system it resolves
+    /// through, survive.
+    HandleEscrow,
     /// The Google JWT root list — both key generations survive.
     GoogleJwtRoots,
     /// The `x/v1` Platform Verifier — its trust roots and parameters
@@ -136,6 +141,7 @@ impl Upgrade {
             Self::NotaryService => "notary_service",
             Self::ProofVerifier => "ceremony_proof_verifier",
             Self::IdentityNames => "identity_names",
+            Self::HandleEscrow => "handle_escrow",
             Self::GoogleJwtRoots => "google_jwt_roots",
             Self::XPlatformVerifier => platforms::X.contracts_key,
             Self::GitHubPlatformVerifier => platforms::GITHUB.contracts_key,
@@ -149,6 +155,7 @@ impl Upgrade {
             Self::NotaryService => "NotaryService",
             Self::ProofVerifier => "CeremonyProofVerifier",
             Self::IdentityNames => "IdentityNames",
+            Self::HandleEscrow => "HandleEscrow",
             Self::GoogleJwtRoots => "GoogleJwtRoots",
             Self::XPlatformVerifier => platforms::X.contract(),
             Self::GitHubPlatformVerifier => platforms::GITHUB.contract(),
@@ -167,6 +174,7 @@ impl Upgrade {
         "notary-service",
         "proof-verifier",
         "identity-names",
+        "handle-escrow",
         "google-jwt-roots",
         "x-platform-verifier",
         "github-platform-verifier",
@@ -182,6 +190,7 @@ impl std::str::FromStr for Upgrade {
             "notary-service" => Ok(Self::NotaryService),
             "proof-verifier" => Ok(Self::ProofVerifier),
             "identity-names" => Ok(Self::IdentityNames),
+            "handle-escrow" => Ok(Self::HandleEscrow),
             "google-jwt-roots" => Ok(Self::GoogleJwtRoots),
             "x-platform-verifier" => Ok(Self::XPlatformVerifier),
             "github-platform-verifier" => Ok(Self::GitHubPlatformVerifier),
@@ -352,6 +361,8 @@ pub async fn run(
     )?;
     let identity_names =
         required_address(&cfg.contracts.identity_names, "contracts.identity_names")?;
+    let handle_escrow =
+        required_address(&cfg.contracts.handle_escrow, "contracts.handle_escrow")?;
     let jwt_roots = required_address(
         &cfg.contracts.google_jwt_roots,
         "contracts.google_jwt_roots",
@@ -360,6 +371,7 @@ pub async fn run(
     let notary_service_present = code_present(&provider, notary_service).await?;
     let proof_verifier_present = code_present(&provider, proof_verifier).await?;
     let identity_names_present = code_present(&provider, identity_names).await?;
+    let handle_escrow_present = code_present(&provider, handle_escrow).await?;
     let jwt_roots_present = code_present(&provider, jwt_roots).await?;
 
     // Does anything need `factory.deploy` (owner-gated)? Only then must the
@@ -368,6 +380,7 @@ pub async fn run(
     let mut needs_factory_deploy = !(notary_service_present
         && proof_verifier_present
         && identity_names_present
+        && handle_escrow_present
         && jwt_roots_present);
     for platform in platforms::LAUNCH {
         let declared = declared_verifier(cfg, platform)?;
@@ -573,7 +586,67 @@ pub async fn run(
         );
     }
 
-    // ── 4. The Google JWT root list, beside the verifier it serves ───────
+    // ── 4. The handle escrow, bound to the naming system above ───────────
+    // `initialize` refuses a naming system that does not answer `byHandle`,
+    // `acceptsBindings` and `nodeOfHash`, so IdentityNames and any upgrade of
+    // it land first.
+    if !handle_escrow_present {
+        let addr = deploy_named_proxy(
+            &provider,
+            &artifacts,
+            libid_factory,
+            names::HANDLE_ESCROW,
+            "HandleEscrow",
+            artifacts.bytecode("HandleEscrow")?,
+            HandleEscrow::initializeCall {
+                owner_: sender,
+                names_: identity_names,
+            }
+            .abi_encode()
+            .into(),
+            sender,
+        )
+        .await?;
+        info!(
+            "HandleEscrow proxy deployed at {addr:#x} ({}), resolving through \
+             {identity_names:#x}",
+            names::HANDLE_ESCROW
+        );
+        debug_assert_eq!(addr, handle_escrow);
+        summary
+            .deployed
+            .push(("contracts.handle_escrow".into(), addr));
+    }
+
+    upgrade_if_requested(
+        &provider,
+        &artifacts,
+        opts,
+        "handle_escrow",
+        handle_escrow,
+        sender,
+        &mut summary,
+    )
+    .await?;
+
+    // The escrow has no setter for its naming system, so apply can only
+    // check it. One bound elsewhere pays out to whoever THAT contract says
+    // holds a handle.
+    let resolves_through = HandleEscrow::new(handle_escrow, &provider)
+        .names()
+        .call()
+        .await
+        .map_err(|e| anyhow!("HandleEscrow.names read failed: {e}"))?;
+    if resolves_through != identity_names {
+        bail!(
+            "the HandleEscrow at {handle_escrow:#x} resolves through \
+             {resolves_through:#x}, not the declared IdentityNames \
+             {identity_names:#x}. apply cannot rebind it: that takes an escrow \
+             implementation that moves it, or a new canonical escrow name"
+        );
+    }
+
+    // ── 5. The Google JWT root list, beside the verifier it serves ───────
     if !jwt_roots_present {
         let addr = deploy_named_proxy(
             &provider,
@@ -632,7 +705,7 @@ pub async fn run(
             .push(format!("jwt roots -> notary service {notary_service:#x}"));
     }
 
-    // ── 5. A Platform Verifier per platform, on its circuit's verifier ───
+    // ── 6. A Platform Verifier per platform, on its circuit's verifier ───
     let mut circuits = CircuitCache::default();
     for platform in platforms::LAUNCH {
         apply_platform_verifier(
@@ -1258,7 +1331,7 @@ async fn converge_jwt_roots<P: Provider>(
 }
 
 /// Register the verifier in the Supported Version Set. Until this lands,
-/// `IdentityNames.claim` reverts `UnknownVersion` and every resolver for
+/// `IdentityNames.bind` reverts `UnknownVersion` and every resolver for
 /// the platform reverts `UnknownPlatform`.
 async fn register_verifier<P: Provider>(
     provider: &P,

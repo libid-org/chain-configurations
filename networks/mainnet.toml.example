@@ -61,13 +61,17 @@ fee_wei = "0"
 # notary attestation is authenticated; it deploys FIRST and is wired into
 # every consumer at initialize. Not the signer; that is `accounts.notary`.
 #
+# `handle_escrow` is initialized with `identity_names` and resolves every
+# handle through it for life: no setter moves it.
+#
 # `google_jwt_roots` starts EMPTY on-chain — point a keeper at it before
-# Google names work, or every Google claim reverts UntrustedModulus().
+# Google names work, or every Google binding reverts UntrustedModulus().
 [contracts]
 factory = "0xa92244c3f4462aad08bd1a33c3940b9b936321ad"
 notary_service = "0xbb5871167b0128939cab6850877981421e8dcbf5"
 ceremony_proof_verifier = "0x76bdc18f21c2db0ff796c7cc50348528b2899275"
-identity_names = "0xe78b53a183dd51763df44beb2500ddab9bb0329e"
+identity_names = "0x5b86114eccd8259347294a2bdbf3da2c93857796"
+handle_escrow = "0xbbfe9b5301d44cd67b725c600fac4a53dc090de1"
 google_jwt_roots = "0xb7a2ce28e71dbb9c877d2b5a48de33b5f0e6838d"
 x_platform_verifier = "0xcfc880f62f2744dc000687edf47a98b585d9eb35"
 github_platform_verifier = "0xac878389da7a1b58826182da0d8b4cae5e6e4178"

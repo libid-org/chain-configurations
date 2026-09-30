@@ -34,6 +34,7 @@ use libid_contracts::{
             NotaryService,
             TlsNotaryPlatformVerifier,
         },
+        escrow::HandleEscrow,
         factory::LibidFactory,
         identity::IdentityNames,
     },
@@ -308,6 +309,14 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
         );
     }
 
+    let handle_escrow =
+        required_address(&cfg.contracts.handle_escrow, "contracts.handle_escrow")?;
+    let handle_escrow_present =
+        check_code(&mut b, &provider, "contracts.handle_escrow", handle_escrow).await?;
+    if handle_escrow_present {
+        plan_handle_escrow(&mut b, &provider, handle_escrow, identity_names).await;
+    }
+
     let jwt_roots = required_address(
         &cfg.contracts.google_jwt_roots,
         "contracts.google_jwt_roots",
@@ -451,8 +460,8 @@ async fn plan_notary_service<P: Provider>(
     }
 }
 
-/// The naming system dispatches every claim through the Proof Verifier;
-/// without that pointer `quoteClaim` calls the zero address.
+/// The naming system dispatches every binding through the Proof Verifier;
+/// without that pointer `quoteBind` calls the zero address.
 async fn plan_identity_names<P: Provider>(
     b: &mut Builder,
     provider: &P,
@@ -481,6 +490,39 @@ async fn plan_identity_names<P: Provider>(
                 "proofVerifier read failed: {e} — apply STOPS at this read unless \
                  it upgrades the implementation first (--upgrade identity-names)"
             ),
+        ),
+    }
+}
+
+/// The escrow pays out to whoever its naming system says holds a handle,
+/// and has no setter to move it to another one.
+async fn plan_handle_escrow<P: Provider>(
+    b: &mut Builder,
+    provider: &P,
+    handle_escrow: Address,
+    identity_names: Address,
+) {
+    match HandleEscrow::new(handle_escrow, provider)
+        .names()
+        .call()
+        .await
+    {
+        Ok(addr) if addr == identity_names => {
+            b.push("handle_escrow.names", Status::Ok, format!("{addr:#x}"))
+        }
+        Ok(addr) => b.push(
+            "handle_escrow.names",
+            Status::Warn,
+            format!(
+                "resolves through {addr:#x}, file declares {identity_names:#x} — apply \
+                 stops here: only an escrow implementation that moves it, or a new \
+                 canonical escrow name, changes this"
+            ),
+        ),
+        Err(e) => b.push(
+            "handle_escrow.names",
+            Status::Warn,
+            format!("names read failed: {e}"),
         ),
     }
 }
@@ -515,7 +557,7 @@ async fn plan_jwt_roots<P: Provider>(
         Ok(true) => b.push(
             "google_jwt_roots.rotation",
             Status::Warn,
-            "the trust list wants a rotation — every Google claim reverts \
+            "the trust list wants a rotation — every Google binding reverts \
              UntrustedModulus until a keeper lands one. Not apply's job",
         ),
         Ok(false) => b.push("google_jwt_roots.rotation", Status::Ok, "trusted and fresh"),

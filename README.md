@@ -37,8 +37,9 @@ nothing here restates a value the chain also holds.
 
 ## The stack
 
-Four UUPS proxies, in dependency order — the order
-`libid-contracts`' own `script/Deploy.s.sol` uses:
+Five UUPS proxies, in dependency order: the four `libid-contracts`' own
+`script/Deploy.s.sol` deploys, in its order, and the handle escrow right
+after the naming system it resolves through:
 
 1. **NotaryService** — the ONE place a notary attestation is
    authenticated. It derives the digest from the attested bytes itself and
@@ -51,23 +52,28 @@ Four UUPS proxies, in dependency order — the order
 3. **IdentityNames** — the naming system, pointed at the Proof Verifier
    and given a keyspace per platform (`x`, `github`, `google`). The
    normalization rules come from `libid-identity`'s generated table.
-4. **GoogleJwtRoots** — the Google signing keys the `google/v1` Platform
+4. **HandleEscrow** — value sent to a handle before anyone holds it,
+   claimed by the wallet IdentityNames binds the handle to. `initialize`
+   takes the IdentityNames address and refuses one that does not answer
+   the escrow's reads. No setter moves the escrow to another naming
+   system afterwards.
+5. **GoogleJwtRoots** — the Google signing keys the `google/v1` Platform
    Verifier trusts, verified through the Notary Service like any other
    notarized session. It deploys **EMPTY**: point a keeper at it before
-   Google names work, or every Google claim reverts `UntrustedModulus`.
+   Google names work, or every Google binding reverts `UntrustedModulus`.
 
 Then two steps `Deploy.s.sol` does not have:
 
-5. **A Honk verifier per ceremony circuit** — the bb-generated UltraHonk
+6. **A Honk verifier per ceremony circuit** — the bb-generated UltraHonk
    verifier each platform's proofs are checked under, deployed through the
    factory under a CREATE3 name carrying the pinned circuits release.
-6. **A Platform Verifier per platform** — `XPlatformVerifier`,
+7. **A Platform Verifier per platform** — `XPlatformVerifier`,
    `GitHubPlatformVerifier`, `GooglePlatformVerifier` — deployed behind its
    own CREATE3 proxy, pinned to its circuit's verifier by address and code
    hash, and registered into the Supported Version Set with
    `CeremonyProofVerifier.setVerifier(platformId, 1, verifier)`. Until that
    registration lands, a platform owns a keyspace and can verify nothing:
-   `claim` reverts `UnknownVersion` and every resolver reverts
+   `bind` reverts `UnknownVersion` and every resolver reverts
    `UnknownPlatform`.
 
 ## The ceremony contracts
@@ -145,7 +151,8 @@ entry = a NEW address, forever, on every network — names are frozen:
 | `contracts.factory` | — (CREATE2, frozen init code) | `0xa92244c3f4462aad08bd1a33c3940b9b936321ad` |
 | `contracts.notary_service` | `libid.NotaryService` | `0xbb5871167b0128939cab6850877981421e8dcbf5` |
 | `contracts.ceremony_proof_verifier` | `libid.CeremonyProofVerifier` | `0x76bdc18f21c2db0ff796c7cc50348528b2899275` |
-| `contracts.identity_names` | `libid.IdentityNames.2` | `0xe78b53a183dd51763df44beb2500ddab9bb0329e` |
+| `contracts.identity_names` | `libid.IdentityNames.3` | `0x5b86114eccd8259347294a2bdbf3da2c93857796` |
+| `contracts.handle_escrow` | `libid.HandleEscrow` | `0xbbfe9b5301d44cd67b725c600fac4a53dc090de1` |
 | `contracts.google_jwt_roots` | `libid.GoogleJwtRoots` | `0xb7a2ce28e71dbb9c877d2b5a48de33b5f0e6838d` |
 | `contracts.x_platform_verifier` | `libid.XPlatformVerifier` | `0xcfc880f62f2744dc000687edf47a98b585d9eb35` |
 | `contracts.github_platform_verifier` | `libid.GitHubPlatformVerifier` | `0xac878389da7a1b58826182da0d8b4cae5e6e4178` |
@@ -204,7 +211,7 @@ only secret in the flow is the KMS key, which never leaves AWS.
 | `[aws]` | input | `region`, `kms_deployer` (key id / `alias/...` / ARN; the default signer) |
 | `[accounts]` | input | `notary` (the notary **signer** — see below), `owner` (the operational owner the factory ends up with; empty = the deployer) — addresses of **keys**, not contracts |
 | `[notary_service]` | input | `fee_wei` — what one attestation verification costs, as a decimal string |
-| `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_names`, `google_jwt_roots`, `x_platform_verifier`, `github_platform_verifier`, `google_platform_verifier` — always present, pre-filled with the canonical table, validated against the prediction |
+| `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_names`, `handle_escrow`, `google_jwt_roots`, `x_platform_verifier`, `github_platform_verifier`, `google_platform_verifier` — always present, pre-filled with the canonical table, validated against the prediction |
 
 The circuit verifiers are not in the file. They are a property of the
 binary's contracts pin — which carries the circuits release — not of a
@@ -290,14 +297,15 @@ answer is an error, never a fallback to the file. `plan --print-addresses`
 is offline and rejects the flag.
 
 Upgrade components: `notary-service`, `proof-verifier`, `identity-names`,
-`google-jwt-roots`, `x-platform-verifier`, `github-platform-verifier`,
-`google-platform-verifier`. Each is a UUPS `upgradeToAndCall`: the entry
-address, its storage and its owner all survive, so an upgrade never moves a
-canonical address and never disturbs a registration. Each upgrade runs
-inside its component's own step, before apply reads or wires that
-component: a proxy whose running implementation predates a getter the
-wiring reads (`plan` flags it as `WARN ... read failed`) converges in the
-same `apply --upgrade` run instead of aborting at the read.
+`handle-escrow`, `google-jwt-roots`, `x-platform-verifier`,
+`github-platform-verifier`, `google-platform-verifier`. Each is a UUPS
+`upgradeToAndCall`: the entry address, its storage and its owner all
+survive, so an upgrade never moves a canonical address and never disturbs
+a registration. Each upgrade runs inside its component's own step, before
+apply reads or wires that component: a proxy whose running implementation
+predates a getter the wiring reads (`plan` flags it as `WARN ... read
+failed`) converges in the same `apply --upgrade` run instead of aborting
+at the read.
 
 For anvil rehearsal, `apply --dev` (or just letting apply detect anvil)
 covers the factory-ownership wrinkle: the local signer is not the baked
@@ -398,8 +406,9 @@ release` consumes the newest Linux x86_64 asset.
   the critical declarative cycle — pre-filled file → fresh apply on a
   virgin anvil lands everything AT the declared addresses → second apply is
   a no-op without any flag → the file is BYTE-IDENTICAL throughout — plus
-  drift repair, the Platform Verifier deploy/register/rotate path, the
-  network-invariance proof: two separate bare anvils converge onto the same
+  drift repair, the handle escrow bound to the IdentityNames beside it,
+  the Platform Verifier deploy/register/rotate path, the network-invariance
+  proof: two separate bare anvils converge onto the same
   declared canonical addresses, and the `--rpc-url` contract: the committed
   local-dev file, unmodified, converges an anvil the file does not name,
   while a wrong chain id or a dead override is refused. The circuit

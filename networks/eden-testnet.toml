@@ -54,7 +54,7 @@ owner = ""
 [notary_service]
 # What one attestation verification costs, in wei. Zero here: this testnet
 # meters at no charge. The exact-value rule still applies — a submission must
-# attach exactly `quoteClaim`, zero included — so the path is the same one
+# attach exactly `quoteBind`, zero included — so the path is the same one
 # mainnet will run with a real number.
 fee_wei = "0"
 
@@ -63,9 +63,12 @@ fee_wei = "0"
 factory = "0xa92244c3f4462aad08bd1a33c3940b9b936321ad"
 notary_service = "0xbb5871167b0128939cab6850877981421e8dcbf5"
 ceremony_proof_verifier = "0x76bdc18f21c2db0ff796c7cc50348528b2899275"
-identity_names = "0xe78b53a183dd51763df44beb2500ddab9bb0329e"
+identity_names = "0x5b86114eccd8259347294a2bdbf3da2c93857796"
+# Initialized with identity_names above, which it resolves every handle through
+# for life: no setter moves it.
+handle_escrow = "0xbbfe9b5301d44cd67b725c600fac4a53dc090de1"
 # Deploys EMPTY. Until a keeper lands a notarized reading of Google's live JWKS,
-# every Google claim reverts with UntrustedModulus(). The deployment repo runs
+# every Google binding reverts with UntrustedModulus(). The deployment repo runs
 # the keeper hourly; the first tick has to be run deliberately, right after this
 # apply.
 google_jwt_roots = "0xb7a2ce28e71dbb9c877d2b5a48de33b5f0e6838d"

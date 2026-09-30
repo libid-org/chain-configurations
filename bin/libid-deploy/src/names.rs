@@ -33,14 +33,21 @@ pub struct CanonicalContract {
 /// authenticated through it.
 pub const NOTARY_SERVICE: &str = "libid.NotaryService";
 /// The Proof Verifier proxy: the Supported Version Set the naming system
-/// dispatches claims through.
+/// dispatches bindings through.
 pub const CEREMONY_PROOF_VERIFIER: &str = "libid.CeremonyProofVerifier";
 /// The IdentityNames proxy — the contract consumers resolve against.
-/// `.2`: the first `libid.IdentityNames` on eden-testnet was deployed from the
-/// pre-ceremony contract set and keeps its storage. A name nothing has used
-/// gives the naming system an address with no history on any network, rather
-/// than an in-place upgrade over a layout this repository no longer builds.
-pub const IDENTITY_NAMES: &str = "libid.IdentityNames.2";
+/// `.3`: `bind` records every account it binds in its wallet's account
+/// list, and the lists start empty. Upgrading `libid.IdentityNames.2` in
+/// place would leave its bindings out of `accountsOf`, and the first proof
+/// moving one to another wallet would revert removing it from a list it
+/// never entered. `.2`'s Google bindings also carry the raw `sub` as the
+/// account id, where the Google verifier now proves its digest. None of
+/// `.2`'s bindings are migrated.
+pub const IDENTITY_NAMES: &str = "libid.IdentityNames.3";
+/// The HandleEscrow proxy: value sent to a handle before anyone holds it,
+/// claimed through the IdentityNames it was initialized with. No setter
+/// moves it off that IdentityNames; only an upgrade can.
+pub const HANDLE_ESCROW: &str = "libid.HandleEscrow";
 /// The Google JWT root list proxy, read by the Google Platform Verifier.
 pub const GOOGLE_JWT_ROOTS: &str = "libid.GoogleJwtRoots";
 /// The `x/v1` Platform Verifier proxy.
@@ -63,6 +70,10 @@ pub const CANONICAL_CONTRACTS: &[CanonicalContract] = &[
     CanonicalContract {
         key: "identity_names",
         name: IDENTITY_NAMES,
+    },
+    CanonicalContract {
+        key: "handle_escrow",
+        name: HANDLE_ESCROW,
     },
     CanonicalContract {
         key: "google_jwt_roots",
