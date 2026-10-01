@@ -121,7 +121,7 @@ pub enum Upgrade {
     ProofVerifier,
     /// The identity registry — every binding and every platform's rules
     /// survive.
-    IdentityNames,
+    IdentityRegistry,
     /// The handle escrow — every deposit, and the identity registry it
     /// resolves through, survive.
     HandleEscrow,
@@ -143,7 +143,7 @@ impl Upgrade {
         match self {
             Self::NotaryService => "notary_service",
             Self::ProofVerifier => "ceremony_proof_verifier",
-            Self::IdentityNames => "identity_names",
+            Self::IdentityRegistry => "identity_registry",
             Self::HandleEscrow => "handle_escrow",
             Self::GoogleJwtRoots => "google_jwt_roots",
             Self::XPlatformVerifier => platforms::X.contracts_key,
@@ -157,7 +157,7 @@ impl Upgrade {
         match self {
             Self::NotaryService => "NotaryService",
             Self::ProofVerifier => "CeremonyProofVerifier",
-            Self::IdentityNames => "IdentityRegistry",
+            Self::IdentityRegistry => "IdentityRegistry",
             Self::HandleEscrow => "HandleEscrow",
             Self::GoogleJwtRoots => "GoogleJwtRoots",
             Self::XPlatformVerifier => platforms::X.contract(),
@@ -176,7 +176,7 @@ impl Upgrade {
     pub const VALUES: &'static [&'static str] = &[
         "notary-service",
         "proof-verifier",
-        "identity-names",
+        "identity-registry",
         "handle-escrow",
         "google-jwt-roots",
         "x-platform-verifier",
@@ -192,7 +192,7 @@ impl std::str::FromStr for Upgrade {
         match s.trim() {
             "notary-service" => Ok(Self::NotaryService),
             "proof-verifier" => Ok(Self::ProofVerifier),
-            "identity-names" => Ok(Self::IdentityNames),
+            "identity-registry" => Ok(Self::IdentityRegistry),
             "handle-escrow" => Ok(Self::HandleEscrow),
             "google-jwt-roots" => Ok(Self::GoogleJwtRoots),
             "x-platform-verifier" => Ok(Self::XPlatformVerifier),
@@ -362,8 +362,10 @@ pub async fn run(
         &cfg.contracts.ceremony_proof_verifier,
         "contracts.ceremony_proof_verifier",
     )?;
-    let identity_names =
-        required_address(&cfg.contracts.identity_names, "contracts.identity_names")?;
+    let identity_registry = required_address(
+        &cfg.contracts.identity_registry,
+        "contracts.identity_registry",
+    )?;
     let handle_escrow =
         required_address(&cfg.contracts.handle_escrow, "contracts.handle_escrow")?;
     let jwt_roots = required_address(
@@ -373,7 +375,7 @@ pub async fn run(
 
     let notary_service_present = code_present(&provider, notary_service).await?;
     let proof_verifier_present = code_present(&provider, proof_verifier).await?;
-    let identity_names_present = code_present(&provider, identity_names).await?;
+    let identity_registry_present = code_present(&provider, identity_registry).await?;
     let handle_escrow_present = code_present(&provider, handle_escrow).await?;
     let jwt_roots_present = code_present(&provider, jwt_roots).await?;
 
@@ -382,7 +384,7 @@ pub async fn run(
     // genesis owner; on dev chains ownership is impersonation-transferred.
     let mut needs_factory_deploy = !(notary_service_present
         && proof_verifier_present
-        && identity_names_present
+        && identity_registry_present
         && handle_escrow_present
         && jwt_roots_present);
     for platform in platforms::LAUNCH {
@@ -517,12 +519,12 @@ pub async fn run(
     .await?;
 
     // ── 3. The identity registry, with handle rules per platform ─────────
-    if !identity_names_present {
+    if !identity_registry_present {
         let addr = deploy_named_proxy(
             &provider,
             &artifacts,
             libid_factory,
-            names::IDENTITY_NAMES,
+            names::IDENTITY_REGISTRY,
             "IdentityRegistry",
             artifacts.bytecode("IdentityRegistry")?,
             IdentityRegistry::initializeCall { owner_: sender }
@@ -533,26 +535,26 @@ pub async fn run(
         .await?;
         info!(
             "IdentityRegistry proxy deployed at {addr:#x} ({})",
-            names::IDENTITY_NAMES
+            names::IDENTITY_REGISTRY
         );
-        debug_assert_eq!(addr, identity_names);
+        debug_assert_eq!(addr, identity_registry);
         summary
             .deployed
-            .push(("contracts.identity_names".into(), addr));
+            .push(("contracts.identity_registry".into(), addr));
     }
 
     upgrade_if_requested(
         &provider,
         &artifacts,
         opts,
-        "identity_names",
-        identity_names,
+        "identity_registry",
+        identity_registry,
         sender,
         &mut summary,
     )
     .await?;
 
-    let registry = IdentityRegistry::new(identity_names, &provider);
+    let registry = IdentityRegistry::new(identity_registry, &provider);
     let wired = registry
         .proofVerifier()
         .call()
@@ -598,7 +600,7 @@ pub async fn run(
             artifacts.bytecode("HandleEscrow")?,
             HandleEscrow::initializeCall {
                 owner_: sender,
-                registry_: identity_names,
+                registry_: identity_registry,
             }
             .abi_encode()
             .into(),
@@ -607,7 +609,7 @@ pub async fn run(
         .await?;
         info!(
             "HandleEscrow proxy deployed at {addr:#x} ({}), resolving through \
-             {identity_names:#x}",
+             {identity_registry:#x}",
             names::HANDLE_ESCROW
         );
         debug_assert_eq!(addr, handle_escrow);
@@ -635,11 +637,11 @@ pub async fn run(
         .call()
         .await
         .map_err(|e| anyhow!("HandleEscrow.registry read failed: {e}"))?;
-    if resolves_through != identity_names {
+    if resolves_through != identity_registry {
         bail!(
             "the HandleEscrow at {handle_escrow:#x} resolves through \
              {resolves_through:#x}, not the declared IdentityRegistry \
-             {identity_names:#x}. apply cannot rebind it: that takes an escrow \
+             {identity_registry:#x}. apply cannot rebind it: that takes an escrow \
              implementation that moves it, or a new canonical escrow name"
         );
     }
@@ -1457,12 +1459,15 @@ mod tests {
     }
 
     /// An unknown component lists the ones that exist rather than failing
-    /// bare. `notary` is the name the Notary Service used to answer to, so
-    /// a stale runbook fails loudly instead of upgrading nothing.
+    /// bare. `notary` and `identity-names` are what the Notary Service and
+    /// the identity registry used to answer to, so a stale runbook fails
+    /// loudly instead of upgrading nothing.
     #[test]
     fn an_unknown_upgrade_value_lists_the_known_ones() {
-        let err = "notary".parse::<Upgrade>().unwrap_err().to_string();
-        assert!(err.contains("notary-service"), "got: {err}");
-        assert!(err.contains("identity-names"), "got: {err}");
+        for stale in ["notary", "identity-names"] {
+            let err = stale.parse::<Upgrade>().unwrap_err().to_string();
+            assert!(err.contains("notary-service"), "got: {err}");
+            assert!(err.contains("identity-registry"), "got: {err}");
+        }
     }
 }

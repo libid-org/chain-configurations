@@ -151,8 +151,8 @@ entry = a NEW address, forever, on every network — names are frozen:
 | `contracts.factory` | — (CREATE2, frozen init code) | `0xa92244c3f4462aad08bd1a33c3940b9b936321ad` |
 | `contracts.notary_service` | `libid.NotaryService` | `0xbb5871167b0128939cab6850877981421e8dcbf5` |
 | `contracts.ceremony_proof_verifier` | `libid.CeremonyProofVerifier` | `0x76bdc18f21c2db0ff796c7cc50348528b2899275` |
-| `contracts.identity_names` | `libid.IdentityNames.3` | `0x5b86114eccd8259347294a2bdbf3da2c93857796` |
-| `contracts.handle_escrow` | `libid.HandleEscrow` | `0xbbfe9b5301d44cd67b725c600fac4a53dc090de1` |
+| `contracts.identity_registry` | `libid.IdentityRegistry` | `0x0531b83b010a6b0c24c2c2c1a6beecc90cc71366` |
+| `contracts.handle_escrow` | `libid.HandleEscrow.2` | `0xf7e3ad279f913ffe2ef74614e3046c15cbdabb9a` |
 | `contracts.google_jwt_roots` | `libid.GoogleJwtRoots` | `0xb7a2ce28e71dbb9c877d2b5a48de33b5f0e6838d` |
 | `contracts.x_platform_verifier` | `libid.XPlatformVerifier` | `0xcfc880f62f2744dc000687edf47a98b585d9eb35` |
 | `contracts.github_platform_verifier` | `libid.GitHubPlatformVerifier` | `0xac878389da7a1b58826182da0d8b4cae5e6e4178` |
@@ -211,7 +211,7 @@ only secret in the flow is the KMS key, which never leaves AWS.
 | `[aws]` | input | `region`, `kms_deployer` (key id / `alias/...` / ARN; the default signer) |
 | `[accounts]` | input | `notary` (the notary **signer** — see below), `owner` (the operational owner the factory ends up with; empty = the deployer) — addresses of **keys**, not contracts |
 | `[notary_service]` | input | `fee_wei` — what one attestation verification costs, as a decimal string |
-| `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_names`, `handle_escrow`, `google_jwt_roots`, `x_platform_verifier`, `github_platform_verifier`, `google_platform_verifier` — always present, pre-filled with the canonical table, validated against the prediction |
+| `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_registry`, `handle_escrow`, `google_jwt_roots`, `x_platform_verifier`, `github_platform_verifier`, `google_platform_verifier` — always present, pre-filled with the canonical table, validated against the prediction |
 
 The circuit verifiers are not in the file. They are a property of the
 binary's contracts pin — which carries the circuits release — not of a
@@ -275,7 +275,7 @@ cargo run -- plan --network networks/eden-testnet.toml
 # converge; the signer defaults to aws.kms_deployer (needs ambient AWS
 # credentials), or pass a local key for anvil rehearsal
 cargo run -- apply --network networks/eden-testnet.toml \
-  --signer <64-hex-key-or-kms-id> [--upgrade identity-names] [--yes] \
+  --signer <64-hex-key-or-kms-id> [--upgrade identity-registry] [--yes] \
   [--confirm-fresh-deploy]
 ```
 
@@ -294,7 +294,7 @@ the file is still never rewritten. A value that does not parse or does not
 answer is an error, never a fallback to the file. `plan --print-addresses`
 is offline and rejects the flag.
 
-Upgrade components: `notary-service`, `proof-verifier`, `identity-names`,
+Upgrade components: `notary-service`, `proof-verifier`, `identity-registry`,
 `handle-escrow`, `google-jwt-roots`, `x-platform-verifier`,
 `github-platform-verifier`, `google-platform-verifier`. Each is a UUPS
 `upgradeToAndCall`: the entry address, its storage and its owner all

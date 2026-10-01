@@ -84,7 +84,7 @@ pub enum Status {
 /// One line of the plan.
 #[derive(Debug, Clone, Serialize)]
 pub struct Item {
-    /// Component name, e.g. `contracts.identity_names`.
+    /// Component name, e.g. `contracts.identity_registry`.
     pub component: String,
     /// What apply would do.
     pub status: Status,
@@ -279,24 +279,27 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
     )
     .await?;
 
-    let identity_names =
-        required_address(&cfg.contracts.identity_names, "contracts.identity_names")?;
-    let identity_names_present = check_code(
+    let identity_registry = required_address(
+        &cfg.contracts.identity_registry,
+        "contracts.identity_registry",
+    )?;
+    let identity_registry_present = check_code(
         &mut b,
         &provider,
-        "contracts.identity_names",
-        identity_names,
+        "contracts.identity_registry",
+        identity_registry,
     )
     .await?;
-    if identity_names_present {
-        plan_identity_names(&mut b, &provider, identity_names, proof_verifier).await;
+    if identity_registry_present {
+        plan_identity_registry(&mut b, &provider, identity_registry, proof_verifier)
+            .await;
     }
     // The rules are written, not read: apply re-sends `setPlatform` every
     // run, which is owner-only and idempotent.
     for platform in platforms::LAUNCH {
         b.push(
-            format!("identity_names.platform.{}", platform.key),
-            if identity_names_present {
+            format!("identity_registry.platform.{}", platform.key),
+            if identity_registry_present {
                 Status::Configure
             } else {
                 Status::Deploy
@@ -313,7 +316,7 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
     let handle_escrow_present =
         check_code(&mut b, &provider, "contracts.handle_escrow", handle_escrow).await?;
     if handle_escrow_present {
-        plan_handle_escrow(&mut b, &provider, handle_escrow, identity_names).await;
+        plan_handle_escrow(&mut b, &provider, handle_escrow, identity_registry).await;
     }
 
     let jwt_roots = required_address(
@@ -461,33 +464,33 @@ async fn plan_notary_service<P: Provider>(
 
 /// The identity registry dispatches every binding through the Proof
 /// Verifier; without that pointer `quoteBind` calls the zero address.
-async fn plan_identity_names<P: Provider>(
+async fn plan_identity_registry<P: Provider>(
     b: &mut Builder,
     provider: &P,
-    identity_names: Address,
+    identity_registry: Address,
     proof_verifier: Address,
 ) {
-    match IdentityRegistry::new(identity_names, provider)
+    match IdentityRegistry::new(identity_registry, provider)
         .proofVerifier()
         .call()
         .await
     {
         Ok(addr) if addr == proof_verifier => b.push(
-            "identity_names.proof_verifier",
+            "identity_registry.proof_verifier",
             Status::Ok,
             format!("{addr:#x}"),
         ),
         Ok(addr) => b.push(
-            "identity_names.proof_verifier",
+            "identity_registry.proof_verifier",
             Status::Configure,
             format!("points at {addr:#x}, file declares {proof_verifier:#x}"),
         ),
         Err(e) => b.push(
-            "identity_names.proof_verifier",
+            "identity_registry.proof_verifier",
             Status::Warn,
             format!(
                 "proofVerifier read failed: {e} — apply STOPS at this read unless \
-                 it upgrades the implementation first (--upgrade identity-names)"
+                 it upgrades the implementation first (--upgrade identity-registry)"
             ),
         ),
     }
@@ -499,21 +502,21 @@ async fn plan_handle_escrow<P: Provider>(
     b: &mut Builder,
     provider: &P,
     handle_escrow: Address,
-    identity_names: Address,
+    identity_registry: Address,
 ) {
     match HandleEscrow::new(handle_escrow, provider)
         .registry()
         .call()
         .await
     {
-        Ok(addr) if addr == identity_names => {
+        Ok(addr) if addr == identity_registry => {
             b.push("handle_escrow.registry", Status::Ok, format!("{addr:#x}"))
         }
         Ok(addr) => b.push(
             "handle_escrow.registry",
             Status::Warn,
             format!(
-                "resolves through {addr:#x}, file declares {identity_names:#x} — apply \
+                "resolves through {addr:#x}, file declares {identity_registry:#x} — apply \
                  stops here: only an escrow implementation that moves it, or a new \
                  canonical escrow name, changes this"
             ),

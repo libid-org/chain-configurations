@@ -35,19 +35,17 @@ pub const NOTARY_SERVICE: &str = "libid.NotaryService";
 /// The Proof Verifier proxy: the Supported Version Set the identity
 /// registry dispatches bindings through.
 pub const CEREMONY_PROOF_VERIFIER: &str = "libid.CeremonyProofVerifier";
-/// The IdentityRegistry proxy — the contract consumers resolve against.
-/// `.3`: `bind` records every identity it binds in its holder's identity
-/// list, and the lists start empty. Upgrading `libid.IdentityNames.2` in
-/// place would leave its bindings out of `identitiesOf`, and the first
-/// proof moving one to another holder would revert removing it from a list
-/// it never entered. `.2`'s Google bindings also carry the raw `sub` as the
-/// id, where the Google verifier now proves its digest. None of `.2`'s
-/// bindings are migrated.
-pub const IDENTITY_NAMES: &str = "libid.IdentityNames.3";
+/// The IdentityRegistry proxy — the contract consumers resolve against. A
+/// new contract name starts without a suffix. The registries before it,
+/// `libid.IdentityNames` to `libid.IdentityNames.3`, keep their storage
+/// under another ERC-7201 root and stay on chain; none of their bindings
+/// move here.
+pub const IDENTITY_REGISTRY: &str = "libid.IdentityRegistry";
 /// The HandleEscrow proxy: value sent to a handle before anyone holds it,
 /// claimed through the IdentityRegistry it was initialized with. No setter
-/// moves it off that registry; only an upgrade can.
-pub const HANDLE_ESCROW: &str = "libid.HandleEscrow";
+/// moves it off that registry; only an upgrade can. `.2`: `libid.HandleEscrow`
+/// stays bound to `libid.IdentityNames.3`.
+pub const HANDLE_ESCROW: &str = "libid.HandleEscrow.2";
 /// The Google JWT root list proxy, read by the Google Platform Verifier.
 pub const GOOGLE_JWT_ROOTS: &str = "libid.GoogleJwtRoots";
 /// The `x/v1` Platform Verifier proxy.
@@ -68,8 +66,8 @@ pub const CANONICAL_CONTRACTS: &[CanonicalContract] = &[
         name: CEREMONY_PROOF_VERIFIER,
     },
     CanonicalContract {
-        key: "identity_names",
-        name: IDENTITY_NAMES,
+        key: "identity_registry",
+        name: IDENTITY_REGISTRY,
     },
     CanonicalContract {
         key: "handle_escrow",
