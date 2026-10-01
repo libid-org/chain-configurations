@@ -381,10 +381,11 @@ an override that does not answer fails instead of falling back to the file.
 
 Copy `networks/mainnet.toml.example` — it ships FULLY pre-filled with the
 canonical address table, which is valid on every EVM network — fill the
-input keys (chain, RPC, AWS, accounts, Notary Fee), add the name to the
-`network` choice list in `apply.yml`, and run the workflow with `mode:
-plan` first. The first apply on a virgin network needs
-`confirm_fresh_deploy`.
+input keys (chain, a public RPC, AWS, accounts, Notary Fee), add the name
+to the `network` choice list in `apply.yml`, and create the GitHub
+environment of that name with an `RPC_URL` secret holding the private
+endpoint. Run the workflow with `mode: plan` first. The first apply on a
+virgin network needs `confirm_fresh_deploy`.
 
 ## Release process
 

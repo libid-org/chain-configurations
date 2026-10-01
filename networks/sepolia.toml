@@ -1,0 +1,96 @@
+# Sepolia — desired state for the libid identity stack.
+#
+# Every address under [contracts] is CANONICAL: each entry deploys through
+# LibidFactory via CREATE3 with `salt = keccak256(canonical name)`, so an address
+# depends only on the contract's name — not its bytecode, not its constructor
+# arguments, not which chain it is on. They are identical on every EVM chain, and
+# `validate` enforces that equality offline. Regenerate the table with
+# `libid-deploy plan --print-addresses`, never by hand.
+#
+# The first apply needs `confirm_fresh_deploy: true` while the factory is not yet
+# deployed here; that guard reads chain state, not this file.
+#
+# HOW TO READ THIS FILE
+#
+# Every value here is public: contract addresses and a public RPC. The apply
+# workflow talks to a private endpoint instead, the `RPC_URL` secret of the
+# `sepolia` GitHub environment, passed as `--rpc-url`. The only other secret in
+# the flow is the KMS key, which never leaves AWS.
+#
+# INPUT keys describe what should exist: the accounts the contracts trust and the
+# Notary Fee. You edit these.
+#
+# OUTPUT keys are everything under [contracts]. They are pre-filled and
+# declarative: `apply` reads chain state to decide what is missing and NEVER
+# rewrites this file.
+
+[network]
+name = "sepolia"
+chain_id = 11155111
+# The endpoint anyone can plan against. The workflow's `RPC_URL` secret stands
+# in for it on the runs that send transactions; see `--rpc-url` in the README.
+rpc_url = "https://ethereum-sepolia-rpc.publicnode.com"
+
+[aws]
+region = "eu-central-1"
+# The deployer's KMS key: eden-testnet's, and necessarily so. It is the FACTORY
+# GENESIS ADMIN: this alias derives to 0x5bb76b0f81f028de363150602cc6d0ca929e3c31,
+# the address baked into the factory's frozen init code (FactoryGenesis.sol).
+# `factory.deploy` is owner-gated and impersonation is refused on real chains,
+# so no other key can perform this apply. It pays Sepolia ETH for gas: a fresh
+# deploy of the whole stack is 29 transactions and about 31.4M gas.
+kms_deployer = "alias/dyaka-testnet-deployer"
+
+# The ADDRESSES OF KEYS, not contracts.
+[accounts]
+# The notary SIGNER — the identity whose attestations the whole stack accepts.
+# The identity notary at testnet.notary.lib.id signs with this key for
+# eden-testnet as well: an attestation names no chain, so one notary serves
+# every network. `apply` initializes the Notary Service with this key and adds
+# it to the trusted set when it is missing. Dropping an outgoing key is a
+# separate governance call on purpose: the service holds a SET so a rotation
+# can overlap, and which key to stop trusting is not something this file can
+# say.
+notary = "0x7a3646e8431a4b0c8bb586a7d26d7da7ae4aa2b5"
+
+# The operational owner the factory ends up with. Empty = the deployer, which
+# on this network IS the KMS genesis admin, so the default is exact.
+owner = ""
+
+[notary_service]
+# What one attestation verification costs, in wei: 0.0001 ETH. Nonzero,
+# unlike eden-testnet's: a stack that meters at no charge lets a client
+# attaching the wrong value pass, and this network is where the fee path —
+# the quote, the exact-value rule, the forwarding — is exercised before a
+# mainnet number is chosen. A TLSNotary profile carries two attestations, so
+# an X or GitHub binding pays 0.0002 ETH; Google's carries none. Editing it
+# makes apply send `setFee`.
+fee_wei = "100000000000000"
+
+# OUTPUT: the canonical contract addresses. Do not hand-edit.
+[contracts]
+factory = "0xa92244c3f4462aad08bd1a33c3940b9b936321ad"
+notary_service = "0xbb5871167b0128939cab6850877981421e8dcbf5"
+ceremony_proof_verifier = "0x76bdc18f21c2db0ff796c7cc50348528b2899275"
+identity_registry = "0x0531b83b010a6b0c24c2c2c1a6beecc90cc71366"
+# Initialized with identity_registry above, which it resolves every handle
+# through for life: no setter moves it.
+handle_escrow = "0xf7e3ad279f913ffe2ef74614e3046c15cbdabb9a"
+# Deploys EMPTY. Until a keeper lands a notarized reading of Google's live JWKS,
+# every Google binding reverts with UntrustedModulus(). The deployment repo runs
+# the keeper hourly against this network too; the first tick has to be run
+# deliberately, right after this apply.
+google_jwt_roots = "0xb7a2ce28e71dbb9c877d2b5a48de33b5f0e6838d"
+x_platform_verifier = "0xcfc880f62f2744dc000687edf47a98b585d9eb35"
+github_platform_verifier = "0xac878389da7a1b58826182da0d8b4cae5e6e4178"
+google_platform_verifier = "0xf3d537022362d187715b28bc547f8b2532e6d0cf"
+
+# The ceremony circuit verifiers are NOT declared here. `libid-deploy`
+# carries them: `libid-contracts` embeds each circuit's bb-generated
+# UltraHonk verifier from the libid-circuits release it pins, and apply
+# deploys it through the factory under a CREATE3 name carrying that
+# release and reads its code hash off the chain for the Platform Verifier
+# to pin. Moving the contracts pin to a new circuits release and
+# re-applying is the rotation path — a new release is a new name, a new
+# address and a `setTrustRoots`, with the proxy and its registration
+# untouched.
