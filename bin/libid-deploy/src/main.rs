@@ -44,7 +44,8 @@ struct Rpc {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Parse a network file and run sanity checks. Sends nothing.
+    /// Parse a network file and run sanity checks, offline unless
+    /// `--check-rpc`. Sends nothing.
     Validate {
         /// Path to the network TOML file.
         #[arg(long)]
@@ -126,16 +127,22 @@ async fn main() -> Result<()> {
             rpc,
         } => {
             let cfg = NetworkConfig::load(&network)?;
-            let rpc = RpcEndpoint::resolve(&cfg, rpc.rpc_url.as_deref())?;
+            let flag = rpc.rpc_url.as_deref();
+            // Offline without --check-rpc: a real network's file names no
+            // endpoint and still validates.
+            let endpoint = RpcEndpoint::named(&cfg, flag)?.map_or_else(
+                || "none (the file names none and no --rpc-url was given)".to_string(),
+                |rpc| rpc.describe(),
+            );
             println!(
                 "{} parses and validates (network {}, chain {}, canonical \
-                 addresses); RPC endpoint {}",
+                 addresses); RPC endpoint {endpoint}",
                 network.display(),
                 cfg.network.name,
                 cfg.network.chain_id,
-                rpc.describe()
             );
             if check_rpc {
+                let rpc = RpcEndpoint::resolve(&cfg, flag)?;
                 let built = plan::build(&cfg, &rpc).await?;
                 if built.chain_id_actual != built.chain_id_expected {
                     bail!(

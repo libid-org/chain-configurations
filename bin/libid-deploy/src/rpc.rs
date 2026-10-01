@@ -15,6 +15,7 @@
 use anyhow::{
     anyhow,
     bail,
+    Context,
     Result,
 };
 use url::Url;
@@ -63,13 +64,16 @@ fn origin_of(url: &Url) -> String {
 }
 
 impl RpcEndpoint {
+    /// The endpoint the flag or the file names, if either names one:
     /// `--rpc-url` when given, else the file's `network.rpc_url`. An
     /// override that does not parse is an error naming the flag; nothing
-    /// falls back to the file. Neither at all is an error naming both
-    /// places an endpoint comes from.
-    pub fn resolve(cfg: &NetworkConfig, override_url: Option<&str>) -> Result<Self> {
+    /// falls back to the file.
+    pub fn named(
+        cfg: &NetworkConfig,
+        override_url: Option<&str>,
+    ) -> Result<Option<Self>> {
         Ok(match (override_url, cfg.network.rpc_url()) {
-            (Some(raw), file) => Self {
+            (Some(raw), file) => Some(Self {
                 url: parse_rpc_url(raw, "--rpc-url")?,
                 source: Source::Flag {
                     file: file
@@ -78,18 +82,27 @@ impl RpcEndpoint {
                         })
                         .transpose()?,
                 },
-            },
-            (None, Some(raw)) => Self {
+            }),
+            (None, Some(raw)) => Some(Self {
                 url: parse_rpc_url(raw, "network.rpc_url")?,
                 source: Source::File,
-            },
-            (None, None) => bail!(
+            }),
+            (None, None) => None,
+        })
+    }
+
+    /// The endpoint a command that contacts the chain talks to: the one
+    /// [`Self::named`], and where neither the flag nor the file names one,
+    /// an error naming both places an endpoint comes from.
+    pub fn resolve(cfg: &NetworkConfig, override_url: Option<&str>) -> Result<Self> {
+        Self::named(cfg, override_url)?.with_context(|| {
+            format!(
                 "no endpoint for '{name}': the network file names none, as a real \
                  network's does not, and no --rpc-url was given — pass --rpc-url on \
                  a host; in the apply workflow set the RPC_URL secret of the \
                  '{name}' GitHub environment",
                 name = cfg.network.name
-            ),
+            )
         })
     }
 
@@ -195,6 +208,13 @@ mod tests {
             rpc.describe(),
             "http://127.0.0.1:8545 (--rpc-url; the file names no endpoint)"
         );
+    }
+
+    /// Neither the flag nor the file names an endpoint: there is none, which
+    /// is an error only for a command that contacts the chain.
+    #[test]
+    fn a_file_without_an_endpoint_names_none() {
+        assert_eq!(RpcEndpoint::named(&config(""), None).unwrap(), None);
     }
 
     /// Without the flag, such a file is an error naming both places an
