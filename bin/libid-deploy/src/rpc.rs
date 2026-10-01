@@ -41,9 +41,16 @@ pub fn parse_rpc_url(raw: &str, label: &str) -> Result<Url> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcEndpoint {
     url: Url,
-    /// The file's `network.rpc_url`, kept when `--rpc-url` bypassed it so
-    /// prompts and logs can say so.
+    /// The origin of the file's `network.rpc_url`, kept when `--rpc-url`
+    /// bypassed it so prompts and logs can say so.
     bypassed: Option<String>,
+}
+
+/// An endpoint as a line of output names it: scheme, host and port. A
+/// private endpoint carries its provider's key in the path or the query,
+/// and these lines reach terminals and step summaries.
+fn origin_of(url: &Url) -> String {
+    url.origin().ascii_serialization()
 }
 
 impl RpcEndpoint {
@@ -54,7 +61,10 @@ impl RpcEndpoint {
         Ok(match override_url {
             Some(raw) => Self {
                 url: parse_rpc_url(raw, "--rpc-url")?,
-                bypassed: Some(cfg.network.rpc_url.clone()),
+                bypassed: Some(origin_of(&parse_rpc_url(
+                    &cfg.network.rpc_url,
+                    "network.rpc_url",
+                )?)),
             },
             None => Self {
                 url: parse_rpc_url(&cfg.network.rpc_url, "network.rpc_url")?,
@@ -73,13 +83,23 @@ impl RpcEndpoint {
         self.bypassed.is_some()
     }
 
-    /// For prompts, logs and errors: the endpoint and its provenance.
+    /// The endpoint by origin: scheme, host and port, never the path or
+    /// the query, where a private endpoint carries its key.
+    pub fn origin(&self) -> String {
+        origin_of(&self.url)
+    }
+
+    /// For prompts, logs and errors: the endpoint, by origin, and its
+    /// provenance.
     pub fn describe(&self) -> String {
         match &self.bypassed {
             Some(file) => {
-                format!("{} (--rpc-url; network.rpc_url names {file})", self.url)
+                format!(
+                    "{} (--rpc-url; network.rpc_url names {file})",
+                    self.origin()
+                )
             }
-            None => format!("{} (network.rpc_url)", self.url),
+            None => format!("{} (network.rpc_url)", self.origin()),
         }
     }
 }
@@ -100,7 +120,7 @@ mod tests {
         let rpc = RpcEndpoint::resolve(&config("http://anvil:8545"), None).unwrap();
         assert_eq!(rpc.url().as_str(), "http://anvil:8545/");
         assert!(!rpc.is_override());
-        assert_eq!(rpc.describe(), "http://anvil:8545/ (network.rpc_url)");
+        assert_eq!(rpc.describe(), "http://anvil:8545 (network.rpc_url)");
     }
 
     /// The flag wins outright and the file's value is only reported.
@@ -115,9 +135,29 @@ mod tests {
         assert!(rpc.is_override());
         assert_eq!(
             rpc.describe(),
-            "http://127.0.0.1:8545/ (--rpc-url; network.rpc_url names \
+            "http://127.0.0.1:8545 (--rpc-url; network.rpc_url names \
              http://anvil:8545)"
         );
+    }
+
+    /// A private endpoint carries its key in the path or the query. The
+    /// transport keeps the whole URL; what is written about it is the
+    /// origin, so the key reaches no log, prompt or step summary.
+    #[test]
+    fn a_keyed_endpoint_is_named_by_its_origin_alone() {
+        let keyed = "https://eth-sepolia.example/v2/4ba1ed2eKEY?token=TOKEN";
+        let rpc =
+            RpcEndpoint::resolve(&config("http://anvil:8545"), Some(keyed)).unwrap();
+        assert_eq!(rpc.url().as_str(), keyed);
+        assert_eq!(rpc.origin(), "https://eth-sepolia.example");
+        assert_eq!(
+            rpc.describe(),
+            "https://eth-sepolia.example (--rpc-url; network.rpc_url names \
+             http://anvil:8545)"
+        );
+        for secret in ["4ba1ed2eKEY", "TOKEN", "/v2/"] {
+            assert!(!rpc.describe().contains(secret), "{}", rpc.describe());
+        }
     }
 
     /// An override that does not parse is an error naming the flag, even

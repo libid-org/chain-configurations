@@ -10,6 +10,14 @@ name: Apply
 # while the job runs but cannot walk away with the key. Revocation is an IAM
 # change, not a redeploy.
 #
+# THE ENDPOINT IS THE OTHER SECRET. A network's GitHub environment may hold
+# an `RPC_URL` secret: a private endpoint whose provider key rides in the
+# URL. When it is set, every call of the run goes there as `--rpc-url`, and
+# the file's public `network.rpc_url` is what everyone else plans against.
+# GitHub masks the value in the job log; the step summaries are written
+# through `redact` because a summary is not masked, and libid-deploy itself
+# names an endpoint by its origin alone.
+#
 # THIS WORKFLOW IS MANUAL ONLY. It never runs on push. `mode: plan` (the
 # default) is read-only; `mode: apply` sends transactions. The network file
 # is DECLARATIVE: it already carries every canonical address (validated to
@@ -74,6 +82,9 @@ jobs:
       name: ${{ inputs.network }}
     env:
       NETWORK_FILE: networks/${{ inputs.network }}.toml
+      # Empty when the environment holds no such secret: the file's public
+      # endpoint is used then.
+      RPC_URL: ${{ secrets.RPC_URL }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -92,6 +103,11 @@ jobs:
           print(f"rpc_url={cfg['network']['rpc_url']}")
           print(f"chain_id={cfg['network']['chain_id']}")
           PY
+          if [ -n "$RPC_URL" ]; then
+            echo "endpoint: the RPC_URL secret of the ${{ inputs.network }} environment"
+          else
+            echo "endpoint: network.rpc_url of $NETWORK_FILE (the environment has no RPC_URL secret)"
+          fi
 
       # ── The binary: a release asset by default, cargo from the branch ──
       - name: Download libid-deploy from the latest release
@@ -164,11 +180,11 @@ jobs:
 
       - name: Deployer balance is nonzero
         env:
-          RPC_URL: ${{ steps.cfg.outputs.rpc_url }}
+          FILE_RPC_URL: ${{ steps.cfg.outputs.rpc_url }}
           ADDR: ${{ steps.identity.outputs.address }}
         run: |
           set -euo pipefail
-          bal=$(cast balance "$ADDR" --rpc-url "$RPC_URL")
+          bal=$(cast balance "$ADDR" --rpc-url "${RPC_URL:-$FILE_RPC_URL}")
           echo "deployer balance: $(cast from-wei "$bal") (native)"
           if [ "$bal" = "0" ]; then
             echo "::error::deployer $ADDR has zero balance — fund it before applying."
@@ -179,12 +195,15 @@ jobs:
       - name: Plan
         run: |
           set -euo pipefail
-          ./libid-deploy validate --network "$NETWORK_FILE"
-          ./libid-deploy plan --network "$NETWORK_FILE" | tee /tmp/plan.txt
+          redact() { python3 -c 'import os, sys; s = sys.stdin.read(); u = os.environ.get("RPC_URL", ""); sys.stdout.write(s.replace(u, "<RPC_URL>") if u else s)'; }
+          rpc=()
+          if [ -n "$RPC_URL" ]; then rpc=(--rpc-url "$RPC_URL"); fi
+          ./libid-deploy validate --network "$NETWORK_FILE" "${rpc[@]}"
+          ./libid-deploy plan --network "$NETWORK_FILE" "${rpc[@]}" | tee /tmp/plan.txt
           {
             echo "### Plan — ${{ inputs.network }}"
             echo '```'
-            cat /tmp/plan.txt
+            redact < /tmp/plan.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -197,15 +216,17 @@ jobs:
           CONFIRM_FRESH: ${{ inputs.confirm_fresh_deploy }}
         run: |
           set -euo pipefail
+          redact() { python3 -c 'import os, sys; s = sys.stdin.read(); u = os.environ.get("RPC_URL", ""); sys.stdout.write(s.replace(u, "<RPC_URL>") if u else s)'; }
           args=(--network "$NETWORK_FILE" --yes)
           # The signer defaults to aws.kms_deployer from the network file.
+          [ -n "$RPC_URL" ] && args+=(--rpc-url "$RPC_URL")
           [ -n "$UPGRADE" ] && args+=(--upgrade "$UPGRADE")
           [ "$CONFIRM_FRESH" = "true" ] && args+=(--confirm-fresh-deploy)
           ./libid-deploy apply "${args[@]}" 2>&1 | tee /tmp/apply.log
           {
             echo "### Apply — ${{ inputs.network }}"
             echo '```'
-            tail -60 /tmp/apply.log
+            tail -60 /tmp/apply.log | redact
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

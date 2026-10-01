@@ -294,6 +294,12 @@ the file is still never rewritten. A value that does not parse or does not
 answer is an error, never a fallback to the file. `plan --print-addresses`
 is offline and rejects the flag.
 
+In the apply workflow the flag is the `RPC_URL` secret of the network's
+GitHub environment: a private endpoint, keyed, that the job passes on
+every call, while the file keeps the public one. Everything written about
+an endpoint — the plan's first line, the apply log, a prompt — names it by
+origin alone, scheme, host and port, so the key reaches no step summary.
+
 Upgrade components: `notary-service`, `proof-verifier`, `identity-registry`,
 `handle-escrow`, `google-jwt-roots`, `x-platform-verifier`,
 `github-platform-verifier`, `google-platform-verifier`. Each is a UUPS

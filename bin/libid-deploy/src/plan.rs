@@ -97,9 +97,10 @@ pub struct Item {
 pub struct Plan {
     /// Network name from the file.
     pub network: String,
-    /// The endpoint that answered — the file's `network.rpc_url` unless
-    /// `--rpc-url` named another.
-    pub rpc_url: String,
+    /// The endpoint that answered, by origin — the file's `network.rpc_url`
+    /// unless `--rpc-url` named another. Scheme, host and port: a private
+    /// endpoint's key stays out of every plan and every summary of one.
+    pub rpc_origin: String,
     /// Chain id the file expects.
     pub chain_id_expected: u64,
     /// Chain id the RPC reported.
@@ -130,7 +131,7 @@ impl Plan {
         let _ = writeln!(
             out,
             "Plan for {} via {} (chain {} — RPC reports {})",
-            self.network, self.rpc_url, self.chain_id_expected, self.chain_id_actual
+            self.network, self.rpc_origin, self.chain_id_expected, self.chain_id_actual
         );
         for item in &self.items {
             let tag = match item.status {
@@ -388,7 +389,7 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
 
     Ok(Plan {
         network: cfg.network.name.clone(),
-        rpc_url: rpc.url().to_string(),
+        rpc_origin: rpc.origin(),
         chain_id_expected: cfg.network.chain_id,
         chain_id_actual,
         items: b.items,
