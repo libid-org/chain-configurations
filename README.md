@@ -202,12 +202,14 @@ How apply gets there, in order:
 
 ## Config schema
 
-Every value in a network file is public: addresses and a public RPC. The
-only secret in the flow is the KMS key, which never leaves AWS.
+Every value in a network file is public: addresses, accounts, the fee.
+The endpoint is not in the file: it is the `RPC_URL` secret of the
+network's GitHub environment, or `--rpc-url` on a host. The other secret
+in the flow is the KMS key, which never leaves AWS.
 
 | Section | Kind | Contents |
 |---|---|---|
-| `[network]` | input | `name`, `chain_id` (apply refuses a mismatch, whichever endpoint answers), `rpc_url` (the endpoint the file's own environment reaches; `--rpc-url` names another without touching the file) |
+| `[network]` | input | `name`, `chain_id` (apply refuses a mismatch, whichever endpoint answers); `rpc_url` only where the environment's endpoint is no secret (`local-dev`'s compose service) — a real network's file names none, and `--rpc-url` supplies it |
 | `[aws]` | input | `region`, `kms_deployer` (key id / `alias/...` / ARN; the default signer) |
 | `[accounts]` | input | `notary` (the notary **signer** — see below), `owner` (the operational owner the factory ends up with; empty = the deployer) — addresses of **keys**, not contracts |
 | `[notary_service]` | input | `fee_wei` — what one attestation verification costs, as a decimal string |
@@ -284,20 +286,23 @@ key, anything else goes to AWS KMS (region/credentials from the ambient AWS
 environment). An all-hex value of the wrong length is rejected as a mangled
 key rather than shipped to AWS.
 
-Every command that contacts a chain takes `--rpc-url <URL>`. A network
-file names the endpoint its own environment reaches (`network.rpc_url`);
-the flag is for a caller somewhere else — the host outside a compose
-network, a CI job with a bare anvil — and it wins outright, the file being
-the default. Only the transport moves: the declared chain id is still
-enforced against whatever answers, every address is still the file's, and
-the file is still never rewritten. A value that does not parse or does not
-answer is an error, never a fallback to the file. `plan --print-addresses`
-is offline and rejects the flag.
+Every command that contacts a chain takes `--rpc-url <URL>`, and for a
+real network that is where the endpoint comes from: its file names none,
+because where a node listens is a property of the caller's environment,
+not of the network, and a provider's endpoint carries a key. A file may
+name the endpoint its own environment reaches — `local-dev` names its
+compose service — and then the flag, for a caller somewhere else, wins
+outright with the file as the default. Only the transport moves: the
+declared chain id is still enforced against whatever answers, every
+address is still the file's, and the file is still never rewritten. A
+value that does not parse or does not answer is an error, never a
+fallback; a file without an endpoint and no flag is an error naming both.
+`plan --print-addresses` is offline and rejects the flag.
 
 In the apply workflow the flag is the `RPC_URL` secret of the network's
-GitHub environment: a private endpoint, keyed, that the job passes on
-every call, while the file keeps the public one. Everything written about
-an endpoint — the plan's first line, the apply log, a prompt — names it by
+GitHub environment, passed on every call; a network whose environment
+lacks it fails before anything is read. Everything written about an
+endpoint — the plan's first line, the apply log, a prompt — names it by
 origin alone, scheme, host and port, so the key reaches no step summary.
 
 Upgrade components: `notary-service`, `proof-verifier`, `identity-registry`,
@@ -381,10 +386,10 @@ an override that does not answer fails instead of falling back to the file.
 
 Copy `networks/mainnet.toml.example` — it ships FULLY pre-filled with the
 canonical address table, which is valid on every EVM network — fill the
-input keys (chain, a public RPC, AWS, accounts, Notary Fee), add the name
-to the `network` choice list in `apply.yml`, and create the GitHub
-environment of that name with an `RPC_URL` secret holding the private
-endpoint. Run the workflow with `mode: plan` first. The first apply on a
+input keys (chain, AWS, accounts, Notary Fee), add the name to the
+`network` choice list in `apply.yml`, and create the GitHub environment of
+that name with an `RPC_URL` secret holding its endpoint: the file names
+none. Run the workflow with `mode: plan` first. The first apply on a
 virgin network needs `confirm_fresh_deploy`.
 
 ## Release process

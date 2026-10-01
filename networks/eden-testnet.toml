@@ -12,8 +12,10 @@
 #
 # HOW TO READ THIS FILE
 #
-# Every value here is public: contract addresses and a public RPC. The only
-# secret in the flow is the KMS key, which never leaves AWS.
+# Every value here is public: contract addresses, accounts, the fee. The
+# endpoint is not here: it is the `RPC_URL` secret of the `eden-testnet`
+# GitHub environment (`--rpc-url` on a host). The other secret in the flow is
+# the KMS key, which never leaves AWS.
 #
 # INPUT keys describe what should exist: the accounts the contracts trust and the
 # Notary Fee. You edit these.
@@ -25,7 +27,6 @@
 [network]
 name = "eden-testnet"
 chain_id = 3735928814
-rpc_url = "https://ev-reth-eden-testnet.binarybuilders.services:8545"
 
 [aws]
 region = "eu-central-1"

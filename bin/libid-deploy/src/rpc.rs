@@ -2,14 +2,15 @@
 //!
 //! A network file is the source of truth for what a chain should hold and
 //! which chain that is. Where a node listens is a property of the caller's
-//! environment, not of the network: `network.rpc_url` names the endpoint
-//! the file's own environment reaches — a compose service name for
-//! `local-dev`, a public URL for a real network — and `--rpc-url` names it
-//! from anywhere else. The flag wins outright, the file is the default,
-//! and an override that is unusable is an error, never a fallback. Nothing
-//! but the transport moves: the declared chain id is enforced against
-//! whatever answers, and every address stays a function of the file's
-//! declarations.
+//! environment, not of the network, so a real network's file names no
+//! endpoint: the apply workflow passes the `RPC_URL` secret of the
+//! network's GitHub environment, and a host passes a URL, both as
+//! `--rpc-url`. A file may still name the endpoint its own environment
+//! reaches — `local-dev` names its compose service — and then the flag
+//! wins outright, the file is the default, and an override that is
+//! unusable is an error, never a fallback. Nothing but the transport
+//! moves: the declared chain id is enforced against whatever answers, and
+//! every address stays a function of the file's declarations.
 
 use anyhow::{
     anyhow,
@@ -41,9 +42,17 @@ pub fn parse_rpc_url(raw: &str, label: &str) -> Result<Url> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcEndpoint {
     url: Url,
-    /// The origin of the file's `network.rpc_url`, kept when `--rpc-url`
-    /// bypassed it so prompts and logs can say so.
-    bypassed: Option<String>,
+    source: Source,
+}
+
+/// Where an endpoint came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Source {
+    /// `--rpc-url`, with the origin of the file's endpoint when the file
+    /// names one, so prompts and logs can say what was bypassed.
+    Flag { file: Option<String> },
+    /// The file's `network.rpc_url`.
+    File,
 }
 
 /// An endpoint as a line of output names it: scheme, host and port. A
@@ -56,20 +65,31 @@ fn origin_of(url: &Url) -> String {
 impl RpcEndpoint {
     /// `--rpc-url` when given, else the file's `network.rpc_url`. An
     /// override that does not parse is an error naming the flag; nothing
-    /// falls back to the file.
+    /// falls back to the file. Neither at all is an error naming both
+    /// places an endpoint comes from.
     pub fn resolve(cfg: &NetworkConfig, override_url: Option<&str>) -> Result<Self> {
-        Ok(match override_url {
-            Some(raw) => Self {
+        Ok(match (override_url, cfg.network.rpc_url()) {
+            (Some(raw), file) => Self {
                 url: parse_rpc_url(raw, "--rpc-url")?,
-                bypassed: Some(origin_of(&parse_rpc_url(
-                    &cfg.network.rpc_url,
-                    "network.rpc_url",
-                )?)),
+                source: Source::Flag {
+                    file: file
+                        .map(|f| {
+                            parse_rpc_url(f, "network.rpc_url").map(|u| origin_of(&u))
+                        })
+                        .transpose()?,
+                },
             },
-            None => Self {
-                url: parse_rpc_url(&cfg.network.rpc_url, "network.rpc_url")?,
-                bypassed: None,
+            (None, Some(raw)) => Self {
+                url: parse_rpc_url(raw, "network.rpc_url")?,
+                source: Source::File,
             },
+            (None, None) => bail!(
+                "no endpoint for '{name}': the network file names none, as a real \
+                 network's does not, and no --rpc-url was given — pass --rpc-url on \
+                 a host; in the apply workflow set the RPC_URL secret of the \
+                 '{name}' GitHub environment",
+                name = cfg.network.name
+            ),
         })
     }
 
@@ -78,9 +98,9 @@ impl RpcEndpoint {
         &self.url
     }
 
-    /// Whether `--rpc-url` bypassed the file's value.
+    /// Whether `--rpc-url` named the endpoint.
     pub fn is_override(&self) -> bool {
-        self.bypassed.is_some()
+        matches!(self.source, Source::Flag { .. })
     }
 
     /// The endpoint by origin: scheme, host and port, never the path or
@@ -92,14 +112,17 @@ impl RpcEndpoint {
     /// For prompts, logs and errors: the endpoint, by origin, and its
     /// provenance.
     pub fn describe(&self) -> String {
-        match &self.bypassed {
-            Some(file) => {
+        match &self.source {
+            Source::Flag { file: Some(file) } => {
                 format!(
                     "{} (--rpc-url; network.rpc_url names {file})",
                     self.origin()
                 )
             }
-            None => format!("{} (network.rpc_url)", self.origin()),
+            Source::Flag { file: None } => {
+                format!("{} (--rpc-url; the file names no endpoint)", self.origin())
+            }
+            Source::File => format!("{} (network.rpc_url)", self.origin()),
         }
     }
 }
@@ -158,6 +181,32 @@ mod tests {
         for secret in ["4ba1ed2eKEY", "TOKEN", "/v2/"] {
             assert!(!rpc.describe().contains(secret), "{}", rpc.describe());
         }
+    }
+
+    /// A real network's file names no endpoint. The flag serves it, and
+    /// the description says the file had nothing to bypass.
+    #[test]
+    fn the_flag_serves_a_file_that_names_no_endpoint() {
+        let rpc =
+            RpcEndpoint::resolve(&config(""), Some("http://127.0.0.1:8545")).unwrap();
+        assert_eq!(rpc.url().as_str(), "http://127.0.0.1:8545/");
+        assert!(rpc.is_override());
+        assert_eq!(
+            rpc.describe(),
+            "http://127.0.0.1:8545 (--rpc-url; the file names no endpoint)"
+        );
+    }
+
+    /// Without the flag, such a file is an error naming both places an
+    /// endpoint comes from — never a guess.
+    #[test]
+    fn a_file_without_an_endpoint_needs_the_flag() {
+        let err = RpcEndpoint::resolve(&config(""), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--rpc-url"), "{err}");
+        assert!(err.contains("RPC_URL secret"), "{err}");
+        assert!(err.contains("'canonical-test'"), "{err}");
     }
 
     /// An override that does not parse is an error naming the flag, even
