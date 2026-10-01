@@ -131,7 +131,7 @@ pub struct Contracts {
     pub notary_service: String,
     /// The CeremonyProofVerifier proxy: the Supported Version Set.
     pub ceremony_proof_verifier: String,
-    /// The IdentityNames proxy — the contract consumers resolve against.
+    /// The IdentityRegistry proxy — the contract consumers resolve against.
     pub identity_names: String,
     /// The HandleEscrow proxy, initialized with `identity_names`, which it
     /// keeps for life.

@@ -1,5 +1,5 @@
-//! The launch platform table: what `IdentityNames.setPlatform` writes for
-//! each keyspace, and what each platform's Platform Verifier is
+//! The launch platform table: what `IdentityRegistry.setPlatform` writes
+//! for each platform, and what each platform's Platform Verifier is
 //! initialized with.
 //!
 //! Nothing here is retyped. The platform keys and normalization rules come
@@ -16,7 +16,7 @@ use alloy::primitives::{
     FixedBytes,
 };
 use libid_contracts::{
-    bindings::identity::IdentityNames,
+    bindings::identity::IdentityRegistry,
     circuits::Circuit,
     platform_verifier::{
         GoogleRoots,
@@ -51,7 +51,7 @@ pub struct Platform {
     /// strings, and keccak256 of the key is the on-chain platform id.
     pub key: &'static str,
     /// The normalization rules `setPlatform` stores.
-    pub rules: IdentityNames::Rules,
+    pub rules: IdentityRegistry::Rules,
     /// The `[contracts]` key holding its Platform Verifier proxy address.
     pub contracts_key: &'static str,
     /// The canonical CREATE3 name of that proxy.
@@ -106,9 +106,9 @@ impl Platform {
 
 /// Widen a generated rule table into the contract's struct. `const` so a
 /// value that does not fit the on-chain width fails the build below rather
-/// than silently truncating into a keyspace nobody can resolve.
-const fn on_chain_rules(rules: Rules) -> IdentityNames::Rules {
-    IdentityNames::Rules {
+/// than silently writing different rules.
+const fn on_chain_rules(rules: Rules) -> IdentityRegistry::Rules {
+    IdentityRegistry::Rules {
         maxLength: rules.max_length as u16,
         stripLeadingAt: rules.strip_leading_at,
         isEmail: rules.is_email,
@@ -229,13 +229,13 @@ mod tests {
         }
     }
 
-    /// Every launch platform the profile table knows has a keyspace here.
+    /// Every launch platform the profile table knows has rules here.
     #[test]
     fn the_launch_list_matches_the_profile_table() {
         for profile in profiles::LAUNCH {
             assert!(
                 by_key(profile.platform).is_some(),
-                "{} has a profile but no keyspace",
+                "{} has a profile but no rules",
                 profile.platform
             );
         }

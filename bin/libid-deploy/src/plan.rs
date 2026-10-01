@@ -36,7 +36,7 @@ use libid_contracts::{
         },
         escrow::HandleEscrow,
         factory::LibidFactory,
-        identity::IdentityNames,
+        identity::IdentityRegistry,
     },
     factory::{
         predict_address,
@@ -291,9 +291,8 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
     if identity_names_present {
         plan_identity_names(&mut b, &provider, identity_names, proof_verifier).await;
     }
-    // The keyspaces are written, not read: IdentityNames exposes no getter
-    // for a platform's rules, so apply converges them by re-sending
-    // `setPlatform`, which is owner-only and idempotent.
+    // The rules are written, not read: apply re-sends `setPlatform` every
+    // run, which is owner-only and idempotent.
     for platform in platforms::LAUNCH {
         b.push(
             format!("identity_names.platform.{}", platform.key),
@@ -303,7 +302,7 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
                 Status::Deploy
             },
             format!(
-                "setPlatform({:#x}) re-sent — the contract exposes no rules getter",
+                "setPlatform({:#x}) re-sent every run",
                 platforms::platform_id(platform.key)
             ),
         );
@@ -468,7 +467,7 @@ async fn plan_identity_names<P: Provider>(
     identity_names: Address,
     proof_verifier: Address,
 ) {
-    match IdentityNames::new(identity_names, provider)
+    match IdentityRegistry::new(identity_names, provider)
         .proofVerifier()
         .call()
         .await

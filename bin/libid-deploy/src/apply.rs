@@ -22,13 +22,13 @@
 //! The stack order is `script/Deploy.s.sol`'s: the Notary Service every
 //! notarized session is authenticated through, the Proof Verifier the
 //! identity registry dispatches bindings through, the identity registry
-//! itself with a keyspace per platform, and the Google JWT root list that
+//! itself with handle rules per platform, and the Google JWT root list that
 //! pays the Notary Service for each rotation. Two steps that script does
 //! not have: the handle escrow, right after the identity registry it
 //! resolves through, and at the end the ceremony circuits' Honk verifiers
 //! and a Platform Verifier per platform pinned to one of them and
 //! registered into the Supported Version Set, without which a platform has
-//! a keyspace and can verify nothing.
+//! its rules and can verify nothing.
 
 use std::{
     collections::BTreeMap,
@@ -69,7 +69,7 @@ use libid_contracts::{
         },
         escrow::HandleEscrow,
         factory::LibidFactory,
-        identity::IdentityNames,
+        identity::IdentityRegistry,
         proxy::IUUPSUpgradeable,
     },
     deploy::deploy_contract_from,
@@ -119,7 +119,8 @@ pub enum Upgrade {
     NotaryService,
     /// The Proof Verifier — the Supported Version Set survives.
     ProofVerifier,
-    /// The identity registry — every binding and keyspace survives.
+    /// The identity registry — every binding and every platform's rules
+    /// survive.
     IdentityNames,
     /// The handle escrow — every deposit, and the identity registry it
     /// resolves through, survive.
@@ -156,7 +157,7 @@ impl Upgrade {
         match self {
             Self::NotaryService => "NotaryService",
             Self::ProofVerifier => "CeremonyProofVerifier",
-            Self::IdentityNames => "IdentityNames",
+            Self::IdentityNames => "IdentityRegistry",
             Self::HandleEscrow => "HandleEscrow",
             Self::GoogleJwtRoots => "GoogleJwtRoots",
             Self::XPlatformVerifier => platforms::X.contract(),
@@ -515,23 +516,23 @@ pub async fn run(
     )
     .await?;
 
-    // ── 3. The identity registry, with a keyspace per platform ───────────
+    // ── 3. The identity registry, with handle rules per platform ─────────
     if !identity_names_present {
         let addr = deploy_named_proxy(
             &provider,
             &artifacts,
             libid_factory,
             names::IDENTITY_NAMES,
-            "IdentityNames",
-            artifacts.bytecode("IdentityNames")?,
-            IdentityNames::initializeCall { owner_: sender }
+            "IdentityRegistry",
+            artifacts.bytecode("IdentityRegistry")?,
+            IdentityRegistry::initializeCall { owner_: sender }
                 .abi_encode()
                 .into(),
             sender,
         )
         .await?;
         info!(
-            "IdentityNames proxy deployed at {addr:#x} ({})",
+            "IdentityRegistry proxy deployed at {addr:#x} ({})",
             names::IDENTITY_NAMES
         );
         debug_assert_eq!(addr, identity_names);
@@ -551,46 +552,41 @@ pub async fn run(
     )
     .await?;
 
-    let names_contract = IdentityNames::new(identity_names, &provider);
-    let wired = names_contract
+    let registry = IdentityRegistry::new(identity_names, &provider);
+    let wired = registry
         .proofVerifier()
         .call()
         .await
-        .map_err(|e| anyhow!("IdentityNames.proofVerifier read failed: {e}"))?;
+        .map_err(|e| anyhow!("IdentityRegistry.proofVerifier read failed: {e}"))?;
     if wired != proof_verifier {
         send_with_nonce_retry!(
-            names_contract.setProofVerifier(proof_verifier),
-            "IdentityNames.setProofVerifier",
+            registry.setProofVerifier(proof_verifier),
+            "IdentityRegistry.setProofVerifier",
             &provider,
             sender
         )?;
-        info!("IdentityNames dispatches through {proof_verifier:#x}");
+        info!("IdentityRegistry dispatches through {proof_verifier:#x}");
         summary.configured.push(format!(
-            "identity names -> proof verifier {proof_verifier:#x}"
+            "identity registry -> proof verifier {proof_verifier:#x}"
         ));
     }
 
-    // A keyspace per platform. Re-sent every run: the contract exposes no
-    // getter for a platform's rules, so writing them is the only way to
-    // converge on what the generated table says. The call is owner-only and
-    // idempotent.
+    // Handle rules per platform, re-sent every run: the call is owner-only
+    // and idempotent.
     for platform in platforms::LAUNCH {
         let platform_id = platforms::platform_id(platform.key);
         send_with_nonce_retry!(
-            names_contract.setPlatform(platform_id, platform.rules.clone()),
-            format!("IdentityNames.setPlatform({})", platform.label),
+            registry.setPlatform(platform_id, platform.rules.clone()),
+            format!("IdentityRegistry.setPlatform({})", platform.label),
             &provider,
             sender
         )?;
-        info!(
-            "keyspace configured for {} ({platform_id:#x})",
-            platform.label
-        );
+        info!("rules configured for {} ({platform_id:#x})", platform.label);
     }
 
     // ── 4. The handle escrow, bound to the identity registry above ───────
     // `initialize` refuses a registry that does not answer `handleBinding`,
-    // `acceptsBindings` and `handleNodeOfHash`, so IdentityNames and any
+    // `acceptsBindings` and `handleNodeOfHash`, so the registry and any
     // upgrade of it land first.
     if !handle_escrow_present {
         let addr = deploy_named_proxy(
@@ -642,7 +638,7 @@ pub async fn run(
     if resolves_through != identity_names {
         bail!(
             "the HandleEscrow at {handle_escrow:#x} resolves through \
-             {resolves_through:#x}, not the declared IdentityNames \
+             {resolves_through:#x}, not the declared IdentityRegistry \
              {identity_names:#x}. apply cannot rebind it: that takes an escrow \
              implementation that moves it, or a new canonical escrow name"
         );
@@ -1333,7 +1329,7 @@ async fn converge_jwt_roots<P: Provider>(
 }
 
 /// Register the verifier in the Supported Version Set. Until this lands,
-/// `IdentityNames.bind` reverts `UnknownVersion` and every resolver for
+/// `IdentityRegistry.bind` reverts `UnknownVersion` and every resolver for
 /// the platform reverts `UnknownPlatform`.
 async fn register_verifier<P: Provider>(
     provider: &P,

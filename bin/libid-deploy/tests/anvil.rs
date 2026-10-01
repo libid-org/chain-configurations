@@ -41,7 +41,7 @@ use libid_contracts::{
         circuits::HonkVerifier,
         escrow::HandleEscrow,
         factory::LibidFactory,
-        identity::IdentityNames,
+        identity::IdentityRegistry,
         proxy::IUUPSUpgradeable,
     },
     deploy::deploy_contract_from,
@@ -339,9 +339,9 @@ async fn declarative_apply_cycle_never_touches_the_config() {
         U256::from(NOTARY_FEE_WEI)
     );
 
-    let names_contract = IdentityNames::new(identity_names, &provider);
+    let registry = IdentityRegistry::new(identity_names, &provider);
     assert_eq!(
-        names_contract.proofVerifier().call().await.unwrap(),
+        registry.proofVerifier().call().await.unwrap(),
         proof_verifier
     );
 
@@ -355,7 +355,7 @@ async fn declarative_apply_cycle_never_touches_the_config() {
     // name can bind. That is a keeper's job, not apply's.
     assert!(roots.needsRotation().call().await.unwrap());
 
-    // Every launch platform has its keyspace AND can verify: one apply
+    // Every launch platform has its rules AND can verify: one apply
     // builds the circuit verifiers, deploys a Platform Verifier on each and
     // registers it, so the identity registry resolves instead of reverting
     // UnknownPlatform.
@@ -368,7 +368,7 @@ async fn declarative_apply_cycle_never_touches_the_config() {
             platform.label
         );
         assert_eq!(
-            names_contract
+            registry
                 .resolveId(platform_id, "12345".into())
                 .call()
                 .await
@@ -423,7 +423,7 @@ async fn declarative_apply_cycle_never_touches_the_config() {
         U256::from(NOTARY_FEE_WEI)
     );
     assert_eq!(
-        names_contract.proofVerifier().call().await.unwrap(),
+        registry.proofVerifier().call().await.unwrap(),
         proof_verifier
     );
     assert_eq!(roots.notaryService().call().await.unwrap(), notary_service);
@@ -474,7 +474,7 @@ async fn apply_converges_drifted_wiring_without_redeploying() {
     let owned = ProviderBuilder::new()
         .wallet(alloy::network::EthereumWallet::from(key))
         .connect_http(anvil.endpoint_url());
-    IdentityNames::new(identity_names, &owned)
+    IdentityRegistry::new(identity_names, &owned)
         .setProofVerifier(Address::repeat_byte(0x99))
         .send()
         .await
@@ -508,7 +508,7 @@ async fn apply_converges_drifted_wiring_without_redeploying() {
     assert!(repaired.deployed.is_empty());
     let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
     assert_eq!(
-        IdentityNames::new(identity_names, &provider)
+        IdentityRegistry::new(identity_names, &provider)
             .proofVerifier()
             .call()
             .await
@@ -575,7 +575,7 @@ async fn apply_upgrades_a_proxy_before_reading_through_it() {
         .await
         .unwrap();
     assert!(
-        IdentityNames::new(identity_names, &owned)
+        IdentityRegistry::new(identity_names, &owned)
             .proofVerifier()
             .call()
             .await
@@ -625,7 +625,7 @@ async fn apply_upgrades_a_proxy_before_reading_through_it() {
     assert_eq!(upgraded.upgraded.len(), 1);
     assert!(upgraded.deployed.is_empty());
     assert_eq!(
-        IdentityNames::new(identity_names, &owned)
+        IdentityRegistry::new(identity_names, &owned)
             .proofVerifier()
             .call()
             .await
@@ -766,7 +766,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
     let jwt_roots: Address = cfg.contracts.google_jwt_roots.parse().unwrap();
 
     let version_set = CeremonyProofVerifier::new(proof_verifier, &provider);
-    let names_contract = IdentityNames::new(identity_names, &provider);
+    let registry = IdentityRegistry::new(identity_names, &provider);
 
     for platform in platforms::LAUNCH {
         let platform_id = platforms::platform_id(platform.key);
@@ -837,7 +837,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
             .await
             .unwrap());
         assert_eq!(
-            names_contract
+            registry
                 .resolveId(platform_id, "12345".into())
                 .call()
                 .await
@@ -854,7 +854,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
             PlatformVerifier::Google => U256::ZERO,
         };
         assert_eq!(
-            names_contract
+            registry
                 .quoteBind(platform_id, LAUNCH_VERIFIER_VERSION)
                 .call()
                 .await
@@ -1043,11 +1043,11 @@ fn escrow_registry_slot() -> U256 {
     root + U256::from(1)
 }
 
-/// The handle escrow on a virgin chain: one apply deploys IdentityNames and
-/// then the escrow initialized with it, the escrow holds a deposit for a
+/// The handle escrow on a virgin chain: one apply deploys IdentityRegistry
+/// and then the escrow initialized with it, the escrow holds a deposit for a
 /// handle nobody has bound, and a second apply sends nothing.
 #[tokio::test]
-async fn the_handle_escrow_resolves_through_the_identity_names_beside_it() {
+async fn the_handle_escrow_resolves_through_the_identity_registry_beside_it() {
     let anvil = spawn_anvil();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = prefilled_network_file(dir.path(), &anvil.endpoint());
@@ -1065,7 +1065,7 @@ async fn the_handle_escrow_resolves_through_the_identity_names_beside_it() {
     let identity_names: Address = cfg.contracts.identity_names.parse().unwrap();
     let handle_escrow: Address = cfg.contracts.handle_escrow.parse().unwrap();
 
-    // The escrow's initializer reads IdentityNames, so IdentityNames lands
+    // The escrow's initializer reads the registry, so the registry lands
     // first.
     let position = |component: &str| {
         fresh
@@ -1086,16 +1086,16 @@ async fn the_handle_escrow_resolves_through_the_identity_names_beside_it() {
     );
 
     // A deposit for a handle nobody holds, on a platform that can bind one,
-    // is held: both answers come from the IdentityNames beside it.
-    let names_contract = IdentityNames::new(identity_names, &provider);
+    // is held: both answers come from the IdentityRegistry beside it.
+    let registry = IdentityRegistry::new(identity_names, &provider);
     let x = platforms::platform_id(platforms::X.key);
-    assert!(names_contract.acceptsBindings(x).call().await.unwrap());
-    let handle_hash = names_contract
+    assert!(registry.acceptsBindings(x).call().await.unwrap());
+    let handle_hash = registry
         .handleHashOf(x, "alice".into())
         .call()
         .await
         .unwrap();
-    let node = names_contract
+    let node = registry
         .handleNodeOfHash(x, handle_hash)
         .call()
         .await
@@ -1150,12 +1150,12 @@ async fn the_handle_escrow_resolves_through_the_identity_names_beside_it() {
     );
 }
 
-/// An escrow that resolves through anything but the declared IdentityNames
+/// An escrow that resolves through anything but the declared IdentityRegistry
 /// is a finding apply cannot repair, because the escrow has no setter: plan
 /// warns, and apply stops at the escrow. No call the escrow exposes makes
 /// the mismatch, so the test writes it into the escrow's storage.
 #[tokio::test]
-async fn apply_stops_at_an_escrow_bound_to_another_identity_names() {
+async fn apply_stops_at_an_escrow_bound_to_another_identity_registry() {
     let anvil = spawn_anvil();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = prefilled_network_file(dir.path(), &anvil.endpoint());

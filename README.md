@@ -49,15 +49,14 @@ after the identity registry it resolves through:
    Verifier answers for a `(platformId, verifierVersion)` pair. Without it
    the identity registry's `proofVerifier` reads zero and every resolver
    reverts.
-3. **IdentityNames** — the identity registry, pointed at the Proof
-   Verifier and given a keyspace per platform key (`x`, `github`,
-   `google`). The normalization rules come from `libid-identity`'s
-   generated table.
+3. **IdentityRegistry** — the identity registry, pointed at the Proof
+   Verifier and given handle rules per platform key (`x`, `github`,
+   `google`) from `libid-identity`'s generated table.
 4. **HandleEscrow** — value sent to a handle before anyone holds it,
-   claimed by the holder IdentityNames binds the handle to. `initialize`
-   takes the IdentityNames address as its registry and refuses one that
-   does not answer the escrow's reads. No setter moves the escrow to
-   another registry afterwards.
+   claimed by the holder the registry binds the handle to. `initialize`
+   takes the registry's address and refuses one that does not answer the
+   escrow's reads. No setter moves the escrow to another registry
+   afterwards.
 5. **GoogleJwtRoots** — the Google signing keys the `google/v1` Platform
    Verifier trusts, verified through the Notary Service like any other
    notarized session. It deploys **EMPTY**: point a keeper at it, or every
@@ -73,7 +72,7 @@ Then two steps `Deploy.s.sol` does not have:
    own CREATE3 proxy, pinned to its circuit's verifier by address and code
    hash, and registered into the Supported Version Set with
    `CeremonyProofVerifier.setVerifier(platformId, 1, verifier)`. Until that
-   registration lands, a platform has a keyspace and can verify nothing:
+   registration lands, a platform has its rules and can verify nothing:
    `bind` reverts `UnknownVersion` and every resolver reverts
    `UnknownPlatform`.
 
@@ -258,10 +257,8 @@ Declared-address semantics:
   is required exactly when the FACTORY has no code on-chain (a virgin
   network — that first apply publishes the entire declared stack). With
   the factory present, apply converges incrementally without the flag.
-- The three keyspaces are **re-sent every run**. `IdentityNames` exposes no
-  getter for a platform's rules, so writing them is the only way to
-  converge on what the generated table says; the call is owner-only and
-  idempotent.
+- The three platforms' handle rules are **re-sent every run**; the call is
+  owner-only and idempotent.
 
 ## Running locally
 
@@ -407,7 +404,7 @@ release` consumes the newest Linux x86_64 asset.
   the critical declarative cycle — pre-filled file → fresh apply on a
   virgin anvil lands everything AT the declared addresses → second apply is
   a no-op without any flag → the file is BYTE-IDENTICAL throughout — plus
-  drift repair, the handle escrow bound to the IdentityNames beside it,
+  drift repair, the handle escrow bound to the IdentityRegistry beside it,
   the Platform Verifier deploy/register/rotate path, the network-invariance
   proof: two separate bare anvils converge onto the same
   declared canonical addresses, and the `--rpc-url` contract: the committed

@@ -35,7 +35,7 @@ pub const NOTARY_SERVICE: &str = "libid.NotaryService";
 /// The Proof Verifier proxy: the Supported Version Set the identity
 /// registry dispatches bindings through.
 pub const CEREMONY_PROOF_VERIFIER: &str = "libid.CeremonyProofVerifier";
-/// The IdentityNames proxy — the contract consumers resolve against.
+/// The IdentityRegistry proxy — the contract consumers resolve against.
 /// `.3`: `bind` records every identity it binds in its holder's identity
 /// list, and the lists start empty. Upgrading `libid.IdentityNames.2` in
 /// place would leave its bindings out of `identitiesOf`, and the first
@@ -45,8 +45,8 @@ pub const CEREMONY_PROOF_VERIFIER: &str = "libid.CeremonyProofVerifier";
 /// bindings are migrated.
 pub const IDENTITY_NAMES: &str = "libid.IdentityNames.3";
 /// The HandleEscrow proxy: value sent to a handle before anyone holds it,
-/// claimed through the IdentityNames it was initialized with. No setter
-/// moves it off that IdentityNames; only an upgrade can.
+/// claimed through the IdentityRegistry it was initialized with. No setter
+/// moves it off that registry; only an upgrade can.
 pub const HANDLE_ESCROW: &str = "libid.HandleEscrow";
 /// The Google JWT root list proxy, read by the Google Platform Verifier.
 pub const GOOGLE_JWT_ROOTS: &str = "libid.GoogleJwtRoots";
