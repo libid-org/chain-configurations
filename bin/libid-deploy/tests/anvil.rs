@@ -49,6 +49,7 @@ use libid_contracts::{
         predict_address,
         predict_factory_address,
     },
+    platform_verifier::PlatformVerifier,
     Artifacts,
 };
 use libid_deploy::{
@@ -65,7 +66,6 @@ use libid_deploy::{
     },
     platforms::{
         self,
-        VerifierKind,
         LAUNCH_VERIFIER_VERSION,
     },
     rpc::RpcEndpoint,
@@ -798,29 +798,15 @@ async fn platform_verifiers_deploy_wire_and_register() {
             platform.label
         );
 
-        // The parameters come from the generated tables, not from here.
-        let params = verifier.protocolParameters().call().await.unwrap();
-        assert_eq!(
-            params.futureObservationAllowance,
-            platform.future_observation_allowance
-        );
-        match platform.kind {
-            VerifierKind::TlsNotary {
-                proof_lifetime,
-                max_future_attestation_skew,
-            } => {
-                assert_eq!(params.proofLifetime, proof_lifetime);
-                assert_eq!(params.maxFutureAttestationSkew, max_future_attestation_skew);
+        match platform.verifier {
+            PlatformVerifier::X | PlatformVerifier::GitHub => {
                 assert_eq!(
                     verifier.notaryService().call().await.unwrap(),
                     notary_service
                 );
             }
-            VerifierKind::GoogleJwt => {
-                // A profile that notarizes nothing holds no Notary Service
-                // and no attestation window.
-                assert_eq!(params.proofLifetime, 0);
-                assert_eq!(params.maxFutureAttestationSkew, 0);
+            PlatformVerifier::Google => {
+                // A profile that notarizes nothing holds no Notary Service.
                 assert_eq!(
                     verifier.notaryService().call().await.unwrap(),
                     Address::ZERO
@@ -857,9 +843,11 @@ async fn platform_verifiers_deploy_wire_and_register() {
 
         // One Notary Fee per attestation the profile requires, quoted end
         // to end through the naming system.
-        let expected_quote = match platform.kind {
-            VerifierKind::TlsNotary { .. } => U256::from(NOTARY_FEE_WEI) * U256::from(2),
-            VerifierKind::GoogleJwt => U256::ZERO,
+        let expected_quote = match platform.verifier {
+            PlatformVerifier::X | PlatformVerifier::GitHub => {
+                U256::from(NOTARY_FEE_WEI) * U256::from(2)
+            }
+            PlatformVerifier::Google => U256::ZERO,
         };
         assert_eq!(
             names_contract

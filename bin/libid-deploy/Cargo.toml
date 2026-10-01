@@ -11,13 +11,12 @@ publish = false
 [dependencies]
 libid-contracts = "0.14.0"
 # The handle transform's generated table: platform domains (whose keccak256
-# is the on-chain platform id), the normalization rules `setPlatform` stores,
-# and each profile's future-observation allowance. Retyping any of them here
-# would key handles differently from every deployed reader.
+# is the on-chain platform id) and the normalization rules `setPlatform`
+# stores. Retyping either here would key handles differently from every
+# deployed reader.
 libid-identity = "0.14.0"
-# The ceremony profile table: which sessions a platform notarizes (hence
-# whether its Platform Verifier holds a Notary Service at all) and the launch
-# protocol parameters.
+# The ceremony profile table: which sessions a platform notarizes, hence
+# whether its Platform Verifier holds a Notary Service at all.
 libid-profiles = "0.14.0"
 alloy = { version = "1", features = [
     "contract",

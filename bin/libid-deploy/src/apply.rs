@@ -79,7 +79,10 @@ use libid_contracts::{
         predict_address,
         predict_factory_address,
     },
-    platform_verifier::codehash_at,
+    platform_verifier::{
+        codehash_at,
+        PlatformVerifier,
+    },
     send_with_nonce_retry,
     Artifacts,
 };
@@ -101,7 +104,6 @@ use crate::{
     platforms::{
         self,
         Platform,
-        VerifierKind,
         LAUNCH_VERIFIER_VERSION,
     },
     rpc::RpcEndpoint,
@@ -124,9 +126,9 @@ pub enum Upgrade {
     HandleEscrow,
     /// The Google JWT root list — both key generations survive.
     GoogleJwtRoots,
-    /// The `x/v1` Platform Verifier — its trust roots and parameters
-    /// survive. Registration is not touched: the Proof Verifier points at
-    /// the proxy, which does not move.
+    /// The `x/v1` Platform Verifier — its trust roots survive.
+    /// Registration is not touched: the Proof Verifier points at the
+    /// proxy, which does not move.
     XPlatformVerifier,
     /// The `github/v1` Platform Verifier.
     GitHubPlatformVerifier,
@@ -1188,11 +1190,11 @@ async fn apply_platform_verifier<P: Provider>(
 
     if !code_present(provider, proxy).await? {
         // The initializer knows the contract's rules — a Notary Service
-        // exactly where the profile notarizes, every parameter under its
-        // ceiling — and reads the code hash it pins off the chain, so a
-        // mis-wiring fails here rather than at the proxy's constructor.
+        // exactly where the profile notarizes — and reads the code hash it
+        // pins off the chain, so a mis-wiring fails here rather than at the
+        // proxy's constructor.
         let init = platform
-            .initializer(sender, notary_service, circuit, jwt_roots)?
+            .initializer(sender, notary_service, circuit, jwt_roots)
             .call(provider)
             .await?;
         if init.honk_verifier_codehash() != codehash {
@@ -1237,7 +1239,7 @@ async fn apply_platform_verifier<P: Provider>(
         provider, platform, proxy, circuit, codehash, sender, summary,
     )
     .await?;
-    if matches!(platform.kind, VerifierKind::GoogleJwt) {
+    if platform.verifier == PlatformVerifier::Google {
         converge_jwt_roots(provider, proxy, jwt_roots, sender, summary).await?;
     }
     register_verifier(provider, platform, proof_verifier, proxy, sender, summary).await
@@ -1249,10 +1251,10 @@ async fn apply_platform_verifier<P: Provider>(
 /// new factory name, and the verifier must be told which one it answers
 /// for.
 ///
-/// The reads and the write go through the TLSNotary binding for both kinds
-/// — this surface is `PlatformVerifierBase`'s, identical in every Platform
-/// Verifier — and only the Notary Service argument differs, which is what
-/// the profile decides.
+/// The reads and the write go through the TLSNotary binding for every
+/// platform — this surface is `PlatformVerifierBase`'s, identical in every
+/// Platform Verifier — and only the Notary Service argument differs, which
+/// is what the profile decides.
 async fn converge_trust_roots<P: Provider>(
     provider: &P,
     platform: &Platform,
@@ -1274,13 +1276,13 @@ async fn converge_trust_roots<P: Provider>(
     if wired == circuit && wired_hash == codehash {
         return Ok(());
     }
-    let notary = match platform.kind {
-        VerifierKind::TlsNotary { .. } => {
+    let notary = match platform.verifier {
+        PlatformVerifier::X | PlatformVerifier::GitHub => {
             verifier.notaryService().call().await.map_err(|e| {
                 anyhow!("{}.notaryService read failed: {e}", platform.label)
             })?
         }
-        VerifierKind::GoogleJwt => Address::ZERO,
+        PlatformVerifier::Google => Address::ZERO,
     };
     send_with_nonce_retry!(
         verifier.setTrustRoots(notary, circuit, codehash),
