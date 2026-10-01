@@ -2,13 +2,13 @@
 //! each keyspace, and what each platform's Platform Verifier is
 //! initialized with.
 //!
-//! Nothing here is retyped. The platform domains and normalization rules
-//! come from `libid-identity`'s generated table — the same one Solidity and
+//! Nothing here is retyped. The platform keys and normalization rules come
+//! from `libid-identity`'s generated table — the same one Solidity and
 //! TypeScript read — the profile shape from `libid-profiles`, generated
 //! from `CeremonyProfile.sol`'s source, and which contract serves a
 //! platform and which circuit it proves under from `libid-contracts`. A
-//! value restated here would key handles differently from every deployed
-//! reader.
+//! value restated here would hash handles to nodes no deployed reader looks
+//! up.
 
 use alloy::primitives::{
     keccak256,
@@ -47,9 +47,9 @@ pub const LAUNCH_VERIFIER_VERSION: u16 = 1;
 pub struct Platform {
     /// Human label for logs and plan lines.
     pub label: &'static str,
-    /// The platform's own bare name: libID namespaces only its own
-    /// strings, and keccak256 of this is the on-chain platform id.
-    pub domain: &'static str,
+    /// The platform key, a bare name: libID namespaces only its own
+    /// strings, and keccak256 of the key is the on-chain platform id.
+    pub key: &'static str,
     /// The normalization rules `setPlatform` stores.
     pub rules: IdentityNames::Rules,
     /// The `[contracts]` key holding its Platform Verifier proxy address.
@@ -120,7 +120,7 @@ const fn on_chain_rules(rules: Rules) -> IdentityNames::Rules {
 /// X: letters, digits and underscore.
 pub const X: Platform = Platform {
     label: "X",
-    domain: vectors::PLATFORM_X_DOMAIN,
+    key: vectors::PLATFORM_X_KEY,
     rules: on_chain_rules(Rules::X),
     contracts_key: "x_platform_verifier",
     canonical_name: names::X_PLATFORM_VERIFIER,
@@ -130,7 +130,7 @@ pub const X: Platform = Platform {
 /// GitHub: letters, digits and hyphen.
 pub const GITHUB: Platform = Platform {
     label: "GitHub",
-    domain: vectors::PLATFORM_GITHUB_DOMAIN,
+    key: vectors::PLATFORM_GITHUB_KEY,
     rules: on_chain_rules(Rules::GITHUB),
     contracts_key: "github_platform_verifier",
     canonical_name: names::GITHUB_PLATFORM_VERIFIER,
@@ -140,7 +140,7 @@ pub const GITHUB: Platform = Platform {
 /// Google: an email address, used exactly as proved.
 pub const GOOGLE: Platform = Platform {
     label: "Google",
-    domain: vectors::PLATFORM_GOOGLE_DOMAIN,
+    key: vectors::PLATFORM_GOOGLE_KEY,
     rules: on_chain_rules(Rules::GOOGLE),
     contracts_key: "google_platform_verifier",
     canonical_name: names::GOOGLE_PLATFORM_VERIFIER,
@@ -151,14 +151,14 @@ pub const GOOGLE: Platform = Platform {
 /// profile, and the ceremony contracts revert on one.
 pub const LAUNCH: &[Platform] = &[X, GITHUB, GOOGLE];
 
-/// The launch platform with this domain, or nothing.
-pub fn by_domain(domain: &str) -> Option<&'static Platform> {
-    LAUNCH.iter().find(|p| p.domain == domain)
+/// The launch platform with this key, or nothing.
+pub fn by_key(key: &str) -> Option<&'static Platform> {
+    LAUNCH.iter().find(|p| p.key == key)
 }
 
-/// The on-chain platform id for a platform domain.
-pub fn platform_id(domain: &str) -> FixedBytes<32> {
-    keccak256(domain.as_bytes())
+/// The on-chain platform id for a platform key.
+pub fn platform_id(key: &str) -> FixedBytes<32> {
+    keccak256(key.as_bytes())
 }
 
 // The verifier shape is a property of the profile, not a choice made here:
@@ -198,21 +198,18 @@ mod tests {
 
     use super::*;
 
-    /// The platform ids come from the generated domains — a mistyped
-    /// domain would key every handle differently from every deployed
-    /// reader — and the contract table spells each platform the same way.
+    /// The platform ids come from the generated keys — a mistyped key would
+    /// hash every handle to nodes no deployed reader looks up — and the
+    /// contract table spells each platform the same way.
     #[test]
-    fn platform_ids_come_from_the_generated_domains() {
-        assert_eq!(platform_id(X.domain), keccak256(b"x"));
-        assert_eq!(platform_id(GITHUB.domain), keccak256(b"github"));
-        assert_eq!(platform_id(GOOGLE.domain), keccak256(b"google"));
-        assert_ne!(platform_id(X.domain), platform_id(GITHUB.domain));
+    fn platform_ids_come_from_the_generated_keys() {
+        assert_eq!(platform_id(X.key), keccak256(b"x"));
+        assert_eq!(platform_id(GITHUB.key), keccak256(b"github"));
+        assert_eq!(platform_id(GOOGLE.key), keccak256(b"google"));
+        assert_ne!(platform_id(X.key), platform_id(GITHUB.key));
         for platform in LAUNCH {
-            assert_eq!(platform.domain, platform.verifier.platform());
-            assert_eq!(
-                platform_id(platform.domain),
-                platform.verifier.platform_id()
-            );
+            assert_eq!(platform.key, platform.verifier.platform());
+            assert_eq!(platform_id(platform.key), platform.verifier.platform_id());
         }
     }
 
@@ -237,12 +234,12 @@ mod tests {
     fn the_launch_list_matches_the_profile_table() {
         for profile in profiles::LAUNCH {
             assert!(
-                by_domain(profile.platform).is_some(),
+                by_key(profile.platform).is_some(),
                 "{} has a profile but no keyspace",
                 profile.platform
             );
         }
-        assert!(by_domain("discord").is_none());
+        assert!(by_key("discord").is_none());
     }
 
     /// One circuit for both TLSNotary platforms, a separate one for

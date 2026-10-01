@@ -32,17 +32,17 @@ pub struct CanonicalContract {
 /// The Notary Service proxy — deploys first; every notarized session is
 /// authenticated through it.
 pub const NOTARY_SERVICE: &str = "libid.NotaryService";
-/// The Proof Verifier proxy: the Supported Version Set the naming system
-/// dispatches bindings through.
+/// The Proof Verifier proxy: the Supported Version Set the identity
+/// registry dispatches bindings through.
 pub const CEREMONY_PROOF_VERIFIER: &str = "libid.CeremonyProofVerifier";
 /// The IdentityNames proxy — the contract consumers resolve against.
-/// `.3`: `bind` records every account it binds in its wallet's account
+/// `.3`: `bind` records every identity it binds in its holder's identity
 /// list, and the lists start empty. Upgrading `libid.IdentityNames.2` in
-/// place would leave its bindings out of `accountsOf`, and the first proof
-/// moving one to another wallet would revert removing it from a list it
-/// never entered. `.2`'s Google bindings also carry the raw `sub` as the
-/// account id, where the Google verifier now proves its digest. None of
-/// `.2`'s bindings are migrated.
+/// place would leave its bindings out of `identitiesOf`, and the first
+/// proof moving one to another holder would revert removing it from a list
+/// it never entered. `.2`'s Google bindings also carry the raw `sub` as the
+/// id, where the Google verifier now proves its digest. None of `.2`'s
+/// bindings are migrated.
 pub const IDENTITY_NAMES: &str = "libid.IdentityNames.3";
 /// The HandleEscrow proxy: value sent to a handle before anyone holds it,
 /// claimed through the IdentityNames it was initialized with. No setter

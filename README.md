@@ -39,7 +39,7 @@ nothing here restates a value the chain also holds.
 
 Five UUPS proxies, in dependency order: the four `libid-contracts`' own
 `script/Deploy.s.sol` deploys, in its order, and the handle escrow right
-after the naming system it resolves through:
+after the identity registry it resolves through:
 
 1. **NotaryService** — the ONE place a notary attestation is
    authenticated. It derives the digest from the attested bytes itself and
@@ -47,20 +47,21 @@ after the naming system it resolves through:
    wired into every consumer's `initialize`.
 2. **CeremonyProofVerifier** — the Supported Version Set: which Platform
    Verifier answers for a `(platformId, verifierVersion)` pair. Without it
-   the naming system's `proofVerifier` reads zero and every resolver
+   the identity registry's `proofVerifier` reads zero and every resolver
    reverts.
-3. **IdentityNames** — the naming system, pointed at the Proof Verifier
-   and given a keyspace per platform (`x`, `github`, `google`). The
-   normalization rules come from `libid-identity`'s generated table.
+3. **IdentityNames** — the identity registry, pointed at the Proof
+   Verifier and given a keyspace per platform key (`x`, `github`,
+   `google`). The normalization rules come from `libid-identity`'s
+   generated table.
 4. **HandleEscrow** — value sent to a handle before anyone holds it,
-   claimed by the wallet IdentityNames binds the handle to. `initialize`
-   takes the IdentityNames address and refuses one that does not answer
-   the escrow's reads. No setter moves the escrow to another naming
-   system afterwards.
+   claimed by the holder IdentityNames binds the handle to. `initialize`
+   takes the IdentityNames address as its registry and refuses one that
+   does not answer the escrow's reads. No setter moves the escrow to
+   another registry afterwards.
 5. **GoogleJwtRoots** — the Google signing keys the `google/v1` Platform
    Verifier trusts, verified through the Notary Service like any other
-   notarized session. It deploys **EMPTY**: point a keeper at it before
-   Google names work, or every Google binding reverts `UntrustedModulus`.
+   notarized session. It deploys **EMPTY**: point a keeper at it, or every
+   Google binding reverts `UntrustedModulus`.
 
 Then two steps `Deploy.s.sol` does not have:
 
@@ -72,7 +73,7 @@ Then two steps `Deploy.s.sol` does not have:
    own CREATE3 proxy, pinned to its circuit's verifier by address and code
    hash, and registered into the Supported Version Set with
    `CeremonyProofVerifier.setVerifier(platformId, 1, verifier)`. Until that
-   registration lands, a platform owns a keyspace and can verify nothing:
+   registration lands, a platform has a keyspace and can verify nothing:
    `bind` reverts `UnknownVersion` and every resolver reverts
    `UnknownPlatform`.
 

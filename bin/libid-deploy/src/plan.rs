@@ -296,7 +296,7 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
     // `setPlatform`, which is owner-only and idempotent.
     for platform in platforms::LAUNCH {
         b.push(
-            format!("identity_names.platform.{}", platform.domain),
+            format!("identity_names.platform.{}", platform.key),
             if identity_names_present {
                 Status::Configure
             } else {
@@ -304,7 +304,7 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
             },
             format!(
                 "setPlatform({:#x}) re-sent — the contract exposes no rules getter",
-                platforms::platform_id(platform.domain)
+                platforms::platform_id(platform.key)
             ),
         );
     }
@@ -460,8 +460,8 @@ async fn plan_notary_service<P: Provider>(
     }
 }
 
-/// The naming system dispatches every binding through the Proof Verifier;
-/// without that pointer `quoteBind` calls the zero address.
+/// The identity registry dispatches every binding through the Proof
+/// Verifier; without that pointer `quoteBind` calls the zero address.
 async fn plan_identity_names<P: Provider>(
     b: &mut Builder,
     provider: &P,
@@ -494,8 +494,8 @@ async fn plan_identity_names<P: Provider>(
     }
 }
 
-/// The escrow pays out to whoever its naming system says holds a handle,
-/// and has no setter to move it to another one.
+/// The escrow pays out to whoever its identity registry says holds a
+/// handle, and has no setter to move it to another one.
 async fn plan_handle_escrow<P: Provider>(
     b: &mut Builder,
     provider: &P,
@@ -503,15 +503,15 @@ async fn plan_handle_escrow<P: Provider>(
     identity_names: Address,
 ) {
     match HandleEscrow::new(handle_escrow, provider)
-        .names()
+        .registry()
         .call()
         .await
     {
         Ok(addr) if addr == identity_names => {
-            b.push("handle_escrow.names", Status::Ok, format!("{addr:#x}"))
+            b.push("handle_escrow.registry", Status::Ok, format!("{addr:#x}"))
         }
         Ok(addr) => b.push(
-            "handle_escrow.names",
+            "handle_escrow.registry",
             Status::Warn,
             format!(
                 "resolves through {addr:#x}, file declares {identity_names:#x} — apply \
@@ -520,9 +520,12 @@ async fn plan_handle_escrow<P: Provider>(
             ),
         ),
         Err(e) => b.push(
-            "handle_escrow.names",
+            "handle_escrow.registry",
             Status::Warn,
-            format!("names read failed: {e}"),
+            format!(
+                "registry read failed: {e} — apply STOPS at this read unless it \
+                 upgrades the implementation first (--upgrade handle-escrow)"
+            ),
         ),
     }
 }
@@ -585,7 +588,7 @@ async fn plan_platform_verifier<P: Provider>(
     proof_verifier_present: bool,
 ) -> Result<()> {
     let component = format!("contracts.{}", platform.contracts_key);
-    let registration = format!("ceremony.{}.registration", platform.domain);
+    let registration = format!("ceremony.{}.registration", platform.key);
     let (circuit_address, circuit_hash) = circuit;
 
     let proxy = required_address(
@@ -635,7 +638,7 @@ async fn plan_platform_verifier<P: Provider>(
         );
         return Ok(());
     }
-    let platform_id = platforms::platform_id(platform.domain);
+    let platform_id = platforms::platform_id(platform.key);
     match CeremonyProofVerifier::new(proof_verifier, provider)
         .verifierOf(platform_id, LAUNCH_VERIFIER_VERSION)
         .call()

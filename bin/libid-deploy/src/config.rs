@@ -137,7 +137,7 @@ pub struct Contracts {
     /// keeps for life.
     pub handle_escrow: String,
     /// The GoogleJwtRoots proxy. Starts EMPTY on-chain: point a keeper at
-    /// it before Google names work.
+    /// it, or every Google binding reverts.
     pub google_jwt_roots: String,
     /// The `x/v1` Platform Verifier proxy.
     pub x_platform_verifier: String,

@@ -355,13 +355,13 @@ async fn declarative_apply_cycle_never_touches_the_config() {
     // name can bind. That is a keeper's job, not apply's.
     assert!(roots.needsRotation().call().await.unwrap());
 
-    // Every launch platform owns its keyspace AND can verify: one apply
+    // Every launch platform has its keyspace AND can verify: one apply
     // builds the circuit verifiers, deploys a Platform Verifier on each and
-    // registers it, so the naming system resolves instead of reverting
+    // registers it, so the identity registry resolves instead of reverting
     // UnknownPlatform.
     let verifier = CeremonyProofVerifier::new(proof_verifier, &provider);
     for platform in platforms::LAUNCH {
-        let platform_id = platforms::platform_id(platform.domain);
+        let platform_id = platforms::platform_id(platform.key);
         assert!(
             verifier.verifiesPlatform(platform_id).call().await.unwrap(),
             "{} has no verifier registered",
@@ -429,7 +429,7 @@ async fn declarative_apply_cycle_never_touches_the_config() {
     assert_eq!(roots.notaryService().call().await.unwrap(), notary_service);
     assert_eq!(
         HandleEscrow::new(cfg.contracts.handle_escrow.parse().unwrap(), &provider)
-            .names()
+            .registry()
             .call()
             .await
             .unwrap(),
@@ -469,7 +469,7 @@ async fn apply_converges_drifted_wiring_without_redeploying() {
     let identity_names: Address = cfg.contracts.identity_names.parse().unwrap();
 
     // Drift: the owner (the anvil #0 key, which is also the apply signer)
-    // points the naming system somewhere else and changes the fee.
+    // points the identity registry somewhere else and changes the fee.
     let key: alloy::signers::local::PrivateKeySigner = ANVIL_KEY.parse().unwrap();
     let owned = ProviderBuilder::new()
         .wallet(alloy::network::EthereumWallet::from(key))
@@ -692,8 +692,8 @@ async fn fresh_apply_addresses_are_network_invariant() {
 /// the two ceremony circuits' Honk verifiers from the embedded artifacts,
 /// deploys a Platform Verifier per platform pinned to the right one — by
 /// address AND by the code hash the chain reports — registers each into
-/// the Supported Version Set, and leaves the naming system resolving and
-/// quoting for all three.
+/// the Supported Version Set, and leaves the identity registry resolving
+/// and quoting for all three.
 #[tokio::test]
 async fn platform_verifiers_deploy_wire_and_register() {
     let anvil = spawn_anvil();
@@ -765,11 +765,11 @@ async fn platform_verifiers_deploy_wire_and_register() {
     let identity_names: Address = cfg.contracts.identity_names.parse().unwrap();
     let jwt_roots: Address = cfg.contracts.google_jwt_roots.parse().unwrap();
 
-    let registry = CeremonyProofVerifier::new(proof_verifier, &provider);
+    let version_set = CeremonyProofVerifier::new(proof_verifier, &provider);
     let names_contract = IdentityNames::new(identity_names, &provider);
 
     for platform in platforms::LAUNCH {
-        let platform_id = platforms::platform_id(platform.domain);
+        let platform_id = platforms::platform_id(platform.key);
         let proxy: Address = cfg
             .contracts
             .raw(platform.contracts_key)
@@ -824,14 +824,18 @@ async fn platform_verifiers_deploy_wire_and_register() {
 
         // Registered, so the platform can verify and the resolvers answer.
         assert_eq!(
-            registry
+            version_set
                 .verifierOf(platform_id, LAUNCH_VERIFIER_VERSION)
                 .call()
                 .await
                 .unwrap(),
             proxy
         );
-        assert!(registry.verifiesPlatform(platform_id).call().await.unwrap());
+        assert!(version_set
+            .verifiesPlatform(platform_id)
+            .call()
+            .await
+            .unwrap());
         assert_eq!(
             names_contract
                 .resolveId(platform_id, "12345".into())
@@ -842,7 +846,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
         );
 
         // One Notary Fee per attestation the profile requires, quoted end
-        // to end through the naming system.
+        // to end through the identity registry.
         let expected_quote = match platform.verifier {
             PlatformVerifier::X | PlatformVerifier::GitHub => {
                 U256::from(NOTARY_FEE_WEI) * U256::from(2)
@@ -900,7 +904,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
     }
     for platform in platforms::LAUNCH {
         assert_eq!(
-            settled.status_of(&format!("ceremony.{}.registration", platform.domain)),
+            settled.status_of(&format!("ceremony.{}.registration", platform.key)),
             Some(Status::Ok)
         );
         assert_eq!(
@@ -1019,7 +1023,7 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
             &provider
         )
         .verifierOf(
-            platforms::platform_id(platforms::X.domain),
+            platforms::platform_id(platforms::X.key),
             LAUNCH_VERIFIER_VERSION
         )
         .call()
@@ -1029,9 +1033,9 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
     );
 }
 
-/// The storage slot `HandleEscrow` keeps its naming system in: one past the
-/// root of its ERC-7201 namespace, where `held` sits.
-fn escrow_names_slot() -> U256 {
+/// The storage slot `HandleEscrow` keeps its identity registry in: one past
+/// the root of its ERC-7201 namespace, where `held` sits.
+fn escrow_registry_slot() -> U256 {
     let namespace = U256::from_be_bytes(keccak256(b"libid.storage.HandleEscrow").0);
     let root =
         U256::from_be_bytes(keccak256((namespace - U256::from(1)).to_be_bytes::<32>()).0)
@@ -1074,7 +1078,7 @@ async fn the_handle_escrow_resolves_through_the_identity_names_beside_it() {
 
     let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
     let escrow = HandleEscrow::new(handle_escrow, &provider);
-    assert_eq!(escrow.names().call().await.unwrap(), identity_names);
+    assert_eq!(escrow.registry().call().await.unwrap(), identity_names);
     // The deployer owns it, as it owns every proxy in the stack.
     assert_eq!(
         escrow.owner().call().await.unwrap(),
@@ -1084,7 +1088,7 @@ async fn the_handle_escrow_resolves_through_the_identity_names_beside_it() {
     // A deposit for a handle nobody holds, on a platform that can bind one,
     // is held: both answers come from the IdentityNames beside it.
     let names_contract = IdentityNames::new(identity_names, &provider);
-    let x = platforms::platform_id(platforms::X.domain);
+    let x = platforms::platform_id(platforms::X.key);
     assert!(names_contract.acceptsBindings(x).call().await.unwrap());
     let handle_hash = names_contract
         .handleHashOf(x, "alice".into())
@@ -1092,7 +1096,7 @@ async fn the_handle_escrow_resolves_through_the_identity_names_beside_it() {
         .await
         .unwrap();
     let node = names_contract
-        .nodeOfHash(x, handle_hash)
+        .handleNodeOfHash(x, handle_hash)
         .call()
         .await
         .unwrap();
@@ -1136,7 +1140,10 @@ async fn the_handle_escrow_resolves_through_the_identity_names_beside_it() {
         settled.status_of("contracts.handle_escrow"),
         Some(Status::Ok)
     );
-    assert_eq!(settled.status_of("handle_escrow.names"), Some(Status::Ok));
+    assert_eq!(
+        settled.status_of("handle_escrow.registry"),
+        Some(Status::Ok)
+    );
     assert_eq!(
         escrow.escrowed(node, native).call().await.unwrap(),
         U256::from(1)
@@ -1167,8 +1174,8 @@ async fn apply_stops_at_an_escrow_bound_to_another_identity_names() {
     let handle_escrow: Address = cfg.contracts.handle_escrow.parse().unwrap();
     let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
 
-    // The slot really is the one `names()` reads, or this proves nothing.
-    let slot = escrow_names_slot();
+    // The slot really is the one `registry()` reads, or this proves nothing.
+    let slot = escrow_registry_slot();
     assert_eq!(
         provider.get_storage_at(handle_escrow, slot).await.unwrap(),
         U256::from_be_slice(identity_names.as_slice())
@@ -1187,7 +1194,7 @@ async fn apply_stops_at_an_escrow_bound_to_another_identity_names() {
         .expect("anvil_setStorageAt");
     assert_eq!(
         HandleEscrow::new(handle_escrow, &provider)
-            .names()
+            .registry()
             .call()
             .await
             .unwrap(),
@@ -1196,8 +1203,11 @@ async fn apply_stops_at_an_escrow_bound_to_another_identity_names() {
 
     let drifted = plan::build(&cfg, &file_rpc(&cfg))
         .await
-        .expect("plan sees the escrow's naming system");
-    assert_eq!(drifted.status_of("handle_escrow.names"), Some(Status::Warn));
+        .expect("plan sees the escrow's registry");
+    assert_eq!(
+        drifted.status_of("handle_escrow.registry"),
+        Some(Status::Warn)
+    );
 
     let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
     let err = apply::run(

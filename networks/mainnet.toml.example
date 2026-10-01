@@ -64,8 +64,8 @@ fee_wei = "0"
 # `handle_escrow` is initialized with `identity_names` and resolves every
 # handle through it for life: no setter moves it.
 #
-# `google_jwt_roots` starts EMPTY on-chain — point a keeper at it before
-# Google names work, or every Google binding reverts UntrustedModulus().
+# `google_jwt_roots` starts EMPTY on-chain — point a keeper at it, or every
+# Google binding reverts UntrustedModulus().
 [contracts]
 factory = "0xa92244c3f4462aad08bd1a33c3940b9b936321ad"
 notary_service = "0xbb5871167b0128939cab6850877981421e8dcbf5"

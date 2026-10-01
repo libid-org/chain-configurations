@@ -21,14 +21,14 @@
 //!
 //! The stack order is `script/Deploy.s.sol`'s: the Notary Service every
 //! notarized session is authenticated through, the Proof Verifier the
-//! naming system dispatches bindings through, the naming system itself
-//! with a keyspace per platform, and the Google JWT root list that pays the
-//! Notary Service for each rotation. Two steps that script does not have:
-//! the handle escrow, right after the naming system it resolves through,
-//! and at the end the ceremony circuits' Honk verifiers and a Platform
-//! Verifier per platform pinned to one of them and registered into the
-//! Supported Version Set, without which a platform owns a keyspace and can
-//! verify nothing.
+//! identity registry dispatches bindings through, the identity registry
+//! itself with a keyspace per platform, and the Google JWT root list that
+//! pays the Notary Service for each rotation. Two steps that script does
+//! not have: the handle escrow, right after the identity registry it
+//! resolves through, and at the end the ceremony circuits' Honk verifiers
+//! and a Platform Verifier per platform pinned to one of them and
+//! registered into the Supported Version Set, without which a platform has
+//! a keyspace and can verify nothing.
 
 use std::{
     collections::BTreeMap,
@@ -119,10 +119,10 @@ pub enum Upgrade {
     NotaryService,
     /// The Proof Verifier — the Supported Version Set survives.
     ProofVerifier,
-    /// The naming system — every binding and keyspace survives.
+    /// The identity registry — every binding and keyspace survives.
     IdentityNames,
-    /// The handle escrow — every deposit, and the naming system it resolves
-    /// through, survive.
+    /// The handle escrow — every deposit, and the identity registry it
+    /// resolves through, survive.
     HandleEscrow,
     /// The Google JWT root list — both key generations survive.
     GoogleJwtRoots,
@@ -479,7 +479,7 @@ pub async fn run(
             .push(format!("notary fee {on_chain_fee} -> {notary_fee} wei"));
     }
 
-    // ── 2. The Proof Verifier the naming system dispatches through ───────
+    // ── 2. The Proof Verifier the identity registry dispatches through ───
     if !proof_verifier_present {
         let addr = deploy_named_proxy(
             &provider,
@@ -515,7 +515,7 @@ pub async fn run(
     )
     .await?;
 
-    // ── 3. The naming system, with a keyspace per platform ───────────────
+    // ── 3. The identity registry, with a keyspace per platform ───────────
     if !identity_names_present {
         let addr = deploy_named_proxy(
             &provider,
@@ -575,7 +575,7 @@ pub async fn run(
     // converge on what the generated table says. The call is owner-only and
     // idempotent.
     for platform in platforms::LAUNCH {
-        let platform_id = platforms::platform_id(platform.domain);
+        let platform_id = platforms::platform_id(platform.key);
         send_with_nonce_retry!(
             names_contract.setPlatform(platform_id, platform.rules.clone()),
             format!("IdentityNames.setPlatform({})", platform.label),
@@ -588,10 +588,10 @@ pub async fn run(
         );
     }
 
-    // ── 4. The handle escrow, bound to the naming system above ───────────
-    // `initialize` refuses a naming system that does not answer `byHandle`,
-    // `acceptsBindings` and `nodeOfHash`, so IdentityNames and any upgrade of
-    // it land first.
+    // ── 4. The handle escrow, bound to the identity registry above ───────
+    // `initialize` refuses a registry that does not answer `handleBinding`,
+    // `acceptsBindings` and `handleNodeOfHash`, so IdentityNames and any
+    // upgrade of it land first.
     if !handle_escrow_present {
         let addr = deploy_named_proxy(
             &provider,
@@ -602,7 +602,7 @@ pub async fn run(
             artifacts.bytecode("HandleEscrow")?,
             HandleEscrow::initializeCall {
                 owner_: sender,
-                names_: identity_names,
+                registry_: identity_names,
             }
             .abi_encode()
             .into(),
@@ -631,14 +631,14 @@ pub async fn run(
     )
     .await?;
 
-    // The escrow has no setter for its naming system, so apply can only
-    // check it. One bound elsewhere pays out to whoever THAT contract says
-    // holds a handle.
+    // The escrow has no setter for its registry, so apply can only check
+    // it. One bound elsewhere pays out to whoever THAT contract says holds a
+    // handle.
     let resolves_through = HandleEscrow::new(handle_escrow, &provider)
-        .names()
+        .registry()
         .call()
         .await
-        .map_err(|e| anyhow!("HandleEscrow.names read failed: {e}"))?;
+        .map_err(|e| anyhow!("HandleEscrow.registry read failed: {e}"))?;
     if resolves_through != identity_names {
         bail!(
             "the HandleEscrow at {handle_escrow:#x} resolves through \
@@ -668,7 +668,7 @@ pub async fn run(
         .await?;
         info!(
             "GoogleJwtRoots proxy deployed at {addr:#x} ({}) — the trust list starts \
-             EMPTY; point a keeper at it before Google names work",
+             EMPTY; point a keeper at it, or every Google binding reverts",
             names::GOOGLE_JWT_ROOTS
         );
         debug_assert_eq!(addr, jwt_roots);
@@ -1343,9 +1343,9 @@ async fn register_verifier<P: Provider>(
     sender: Address,
     summary: &mut Summary,
 ) -> Result<()> {
-    let platform_id = platforms::platform_id(platform.domain);
-    let registry = CeremonyProofVerifier::new(proof_verifier, provider);
-    let registered = registry
+    let platform_id = platforms::platform_id(platform.key);
+    let version_set = CeremonyProofVerifier::new(proof_verifier, provider);
+    let registered = version_set
         .verifierOf(platform_id, LAUNCH_VERIFIER_VERSION)
         .call()
         .await
@@ -1354,7 +1354,7 @@ async fn register_verifier<P: Provider>(
         return Ok(());
     }
     send_with_nonce_retry!(
-        registry.setVerifier(platform_id, LAUNCH_VERIFIER_VERSION, proxy),
+        version_set.setVerifier(platform_id, LAUNCH_VERIFIER_VERSION, proxy),
         format!("CeremonyProofVerifier.setVerifier({})", platform.label),
         provider,
         sender
@@ -1399,9 +1399,9 @@ async fn upgrade_proxy<P: Provider>(
 /// Run the `--upgrade`s that name the proxy under `[contracts].<key>`.
 /// Called from the component's own section, once its proxy has code and
 /// BEFORE anything reads or writes through it: the implementation running
-/// today may predate a getter the wiring reads (eden's IdentityNames
-/// predates `proofVerifier()`), and the upgrade is what makes that read
-/// answer. Nothing to do when no upgrade names the component.
+/// today may predate a getter the wiring reads (a HandleEscrow from before
+/// libid-contracts 0.15 has no `registry()`), and the upgrade is what makes
+/// that read answer. Nothing to do when no upgrade names the component.
 async fn upgrade_if_requested<P: Provider>(
     provider: &P,
     artifacts: &Artifacts,
