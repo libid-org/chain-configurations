@@ -1239,7 +1239,8 @@ async fn the_committed_local_dev_file_converges_an_anvil_through_rpc_url() {
 
     let cfg = NetworkConfig::load(&path).expect("local-dev loads");
     assert_eq!(
-        cfg.network.rpc_url, "http://anvil:8545",
+        cfg.network.rpc_url(),
+        Some("http://anvil:8545"),
         "the committed file names the compose service, not this anvil"
     );
     let rpc = override_rpc(&cfg, &anvil.endpoint());
@@ -1359,7 +1360,10 @@ async fn rpc_override_moves_only_the_transport() {
     // The file is untouched and still names the dead endpoint; the
     // override lived only in the invocation.
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    assert_eq!(NetworkConfig::load(&path).unwrap().network.rpc_url, dead);
+    assert_eq!(
+        NetworkConfig::load(&path).unwrap().network.rpc_url(),
+        Some(dead.as_str())
+    );
 
     let settled = plan::build(&cfg, &rpc)
         .await

@@ -31,12 +31,13 @@ struct Cli {
 /// a chain.
 #[derive(Args)]
 struct Rpc {
-    /// JSON-RPC endpoint to use instead of the file's `network.rpc_url`,
-    /// for a caller outside the environment the file names (e.g.
-    /// http://127.0.0.1:8545 for a bare anvil on the host). Wins outright;
-    /// the file is the default. Only the transport changes: the declared
-    /// chain id and every address stay the file's. An unusable value is an
-    /// error, never a fallback.
+    /// The JSON-RPC endpoint. A real network's file names none, so this is
+    /// where its endpoint comes from: the RPC_URL secret in the apply
+    /// workflow, a URL on a host. A file that names one (local-dev, its
+    /// compose service) is the default this wins over, e.g.
+    /// http://127.0.0.1:8545 for a bare anvil on the host. Only the
+    /// transport changes: the declared chain id and every address stay the
+    /// file's. An unusable value is an error, never a fallback.
     #[arg(long, value_name = "URL")]
     rpc_url: Option<String>,
 }

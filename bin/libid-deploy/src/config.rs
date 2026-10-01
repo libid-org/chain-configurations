@@ -54,10 +54,25 @@ pub struct Network {
     /// Chain id `apply` refuses to run without matching on-chain — against
     /// whichever endpoint answers, `--rpc-url` included.
     pub chain_id: u64,
-    /// The JSON-RPC endpoint this file's own environment reaches. It is the
-    /// default, and the only thing `--rpc-url` replaces: see
-    /// [`crate::rpc`].
-    pub rpc_url: String,
+    /// The JSON-RPC endpoint this file's own environment reaches, when the
+    /// file names one at all. A real network's endpoint is a secret of the
+    /// environment that runs the command — the `RPC_URL` secret of its
+    /// GitHub environment, `--rpc-url` on a host — so its file carries
+    /// none. `local-dev` names its compose service, which is no secret.
+    /// See [`crate::rpc`].
+    #[serde(default)]
+    pub rpc_url: Option<String>,
+}
+
+impl Network {
+    /// The endpoint the file names, if it names one: an absent or empty
+    /// `rpc_url` is none.
+    pub fn rpc_url(&self) -> Option<&str> {
+        self.rpc_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+    }
 }
 
 /// `[aws]`.
@@ -209,7 +224,9 @@ impl NetworkConfig {
         if self.network.chain_id == 0 {
             bail!("network.chain_id must be nonzero");
         }
-        crate::rpc::parse_rpc_url(&self.network.rpc_url, "network.rpc_url")?;
+        if let Some(url) = self.network.rpc_url() {
+            crate::rpc::parse_rpc_url(url, "network.rpc_url")?;
+        }
         required_address(&self.accounts.notary, "accounts.notary")?;
         self.accounts.owner_address()?;
         self.notary_service.fee()?;
@@ -353,7 +370,6 @@ google_platform_verifier = "{google}"
         // operator must fill so validation reaches the address checks.
         let text = text
             .replace("chain_id = 0", "chain_id = 1")
-            .replace("rpc_url = \"\"", "rpc_url = \"https://example.invalid\"")
             .replace("region = \"\"", "region = \"eu-central-1\"")
             .replace("kms_deployer = \"\"", "kms_deployer = \"alias/x\"")
             .replace(
@@ -362,6 +378,21 @@ google_platform_verifier = "{google}"
             );
         let cfg: NetworkConfig = toml::from_str(&text).expect("template parses");
         cfg.validate().expect("template validates canonically");
+    }
+
+    /// A real network's file names no endpoint — the environment supplies
+    /// it — and validates like one that does. An empty `rpc_url` is none.
+    #[test]
+    fn a_file_without_an_endpoint_validates() {
+        let text = canonical_toml().replace("rpc_url = \"http://localhost:8545\"\n", "");
+        let cfg: NetworkConfig = toml::from_str(&text).unwrap();
+        cfg.validate().expect("validates without an endpoint");
+        assert_eq!(cfg.network.rpc_url(), None);
+
+        let text = canonical_toml().replace("http://localhost:8545", "");
+        let cfg: NetworkConfig = toml::from_str(&text).unwrap();
+        cfg.validate().expect("an empty endpoint is none");
+        assert_eq!(cfg.network.rpc_url(), None);
     }
 
     /// A fully pre-filled config validates.

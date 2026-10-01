@@ -97,9 +97,10 @@ pub struct Item {
 pub struct Plan {
     /// Network name from the file.
     pub network: String,
-    /// The endpoint that answered, by origin — the file's `network.rpc_url`
-    /// unless `--rpc-url` named another. Scheme, host and port: a private
-    /// endpoint's key stays out of every plan and every summary of one.
+    /// The endpoint that answered, by origin — `--rpc-url`'s, or the file's
+    /// `network.rpc_url` when the file names one and no flag was given.
+    /// Scheme, host and port: a private endpoint's key stays out of every
+    /// plan and every summary of one.
     pub rpc_origin: String,
     /// Chain id the file expects.
     pub chain_id_expected: u64,
