@@ -1,6 +1,6 @@
 //! Converge a chain onto the network file: deploy whatever the CHAIN lacks
-//! (in dependency order), re-send the idempotent configuration ops, and
-//! perform any explicitly requested upgrades.
+//! (in dependency order), send the configuration that differs from the
+//! file, and perform any explicitly requested upgrades.
 //!
 //! The file pre-declares every canonical address (validated to equal
 //! `predict_address(factory, name)` at load), so apply reads presence from
@@ -101,6 +101,7 @@ use crate::{
     platforms::{
         self,
         Platform,
+        RulesOnChain,
         VerifierKind,
         LAUNCH_VERIFIER_VERSION,
     },
@@ -228,8 +229,8 @@ pub struct Summary {
     pub deployed: Vec<(String, Address)>,
     /// Explicitly upgraded components.
     pub upgraded: Vec<String>,
-    /// On-chain configuration changes beyond the always-resent idempotent
-    /// ops — signer and fee convergence, wiring, ownership handovers.
+    /// On-chain configuration changes — signer and fee convergence,
+    /// keyspaces, wiring, ownership handovers.
     pub configured: Vec<String>,
 }
 
@@ -568,11 +569,15 @@ pub async fn run(
         ));
     }
 
-    // A keyspace per platform. Re-sent every run: the contract exposes no
-    // getter for a platform's rules, so writing them is the only way to
-    // converge on what the generated table says. The call is owner-only and
-    // idempotent.
+    // A keyspace per platform, written only where the chain has none or
+    // other rules: every `setPlatform` emits `PlatformConfigured`, which
+    // readers take as a reconfiguration.
     for platform in platforms::LAUNCH {
+        let change = match platform.rules_on_chain(&provider, identity_names).await? {
+            RulesOnChain::Same => continue,
+            RulesOnChain::Unconfigured => "written",
+            RulesOnChain::Different => "rewritten: its rules differed",
+        };
         let platform_id = platforms::platform_id(platform.domain);
         send_with_nonce_retry!(
             names_contract.setPlatform(platform_id, platform.rules.clone()),
@@ -580,10 +585,10 @@ pub async fn run(
             &provider,
             sender
         )?;
-        info!(
-            "keyspace configured for {} ({platform_id:#x})",
-            platform.label
-        );
+        info!("{} keyspace {change} ({platform_id:#x})", platform.label);
+        summary
+            .configured
+            .push(format!("{} keyspace {change}", platform.label));
     }
 
     // ── 4. The handle escrow, bound to the naming system above ───────────

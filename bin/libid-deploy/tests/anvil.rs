@@ -21,13 +21,18 @@ use alloy::{
         keccak256,
         Address,
         Bytes,
+        B256,
         U256,
     },
     providers::{
         Provider,
         ProviderBuilder,
     },
-    sol_types::SolError,
+    rpc::types::Filter,
+    sol_types::{
+        SolError,
+        SolEvent,
+    },
 };
 use libid_contracts::{
     bindings::{
@@ -523,6 +528,162 @@ async fn apply_converges_drifted_wiring_without_redeploying() {
             .unwrap(),
         U256::from(NOTARY_FEE_WEI)
     );
+}
+
+/// The platform ids of every `PlatformConfigured` the IdentityNames at
+/// `identity_names` has emitted, oldest first: what an indexer sees of
+/// `setPlatform`.
+async fn platform_configured<P: Provider>(
+    provider: &P,
+    identity_names: Address,
+) -> Vec<B256> {
+    let filter = Filter::new()
+        .address(identity_names)
+        .event_signature(IdentityNames::PlatformConfigured::SIGNATURE_HASH)
+        .from_block(0);
+    provider
+        .get_logs(&filter)
+        .await
+        .expect("PlatformConfigured logs")
+        .iter()
+        .map(|log| log.topics()[1])
+        .collect()
+}
+
+/// The storage slot of `configured` for `platform_id` in IdentityNames:
+/// `platforms` is field 3 of its ERC-7201 namespace, and `configured` the
+/// word after a platform's packed rules.
+fn configured_slot(platform_id: B256) -> U256 {
+    let namespace = U256::from_be_bytes(keccak256(b"libid.storage.IdentityNames").0);
+    let root =
+        U256::from_be_bytes(keccak256((namespace - U256::from(1)).to_be_bytes::<32>()).0)
+            & !U256::from(0xff);
+    let platforms = (root + U256::from(3)).to_be_bytes::<32>();
+    let entry = keccak256([platform_id.as_slice(), platforms.as_slice()].concat());
+    U256::from_be_bytes(entry.0) + U256::from(1)
+}
+
+/// A keyspace is written only when the chain has none or other rules, since
+/// every `setPlatform` emits `PlatformConfigured`. A settled chain plans each
+/// keyspace ok and a second apply emits nothing; a rule changed on chain, or
+/// a keyspace the chain lost, is planned as such and written back, alone.
+#[tokio::test]
+async fn apply_writes_a_keyspace_only_when_it_changes() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prefilled_network_file(dir.path(), &anvil.endpoint());
+    let fresh = apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            dev: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    for platform in platforms::LAUNCH {
+        let written = format!("{} keyspace written", platform.label);
+        assert!(
+            fresh.configured.contains(&written),
+            "{:?}",
+            fresh.configured
+        );
+    }
+
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let identity_names: Address = cfg.contracts.identity_names.parse().unwrap();
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let component = |platform: &platforms::Platform| {
+        format!("identity_names.platform.{}", platform.domain)
+    };
+
+    // Settled: nothing to write, and a second apply emits nothing.
+    let settled = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan after apply");
+    for platform in platforms::LAUNCH {
+        assert_eq!(settled.status_of(&component(platform)), Some(Status::Ok));
+    }
+    let emitted = platform_configured(&provider, identity_names).await;
+    assert_eq!(emitted.len(), platforms::LAUNCH.len());
+    let again = apply_with(&path, apply::Options::default()).await;
+    assert!(again.configured.is_empty(), "{:?}", again.configured);
+    assert_eq!(
+        platform_configured(&provider, identity_names).await,
+        emitted,
+        "an unchanged keyspace was written again"
+    );
+
+    // Drift: the owner changes X's maximum length, and GitHub's keyspace is
+    // cleared in storage, a state no call reaches.
+    let key: alloy::signers::local::PrivateKeySigner = ANVIL_KEY.parse().unwrap();
+    let owned = ProviderBuilder::new()
+        .wallet(alloy::network::EthereumWallet::from(key))
+        .connect_http(anvil.endpoint_url());
+    let x = platforms::platform_id(platforms::X.domain);
+    let mut longer = platforms::X.rules.clone();
+    longer.maxLength += 1;
+    IdentityNames::new(identity_names, &owned)
+        .setPlatform(x, longer)
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    let github = platforms::platform_id(platforms::GITHUB.domain);
+    let slot = configured_slot(github);
+    // The slot really is GitHub's `configured`, or this proves nothing.
+    assert_eq!(
+        provider.get_storage_at(identity_names, slot).await.unwrap(),
+        U256::from(1)
+    );
+    provider
+        .raw_request::<_, serde_json::Value>(
+            "anvil_setStorageAt".into(),
+            (identity_names, slot, B256::ZERO),
+        )
+        .await
+        .expect("anvil_setStorageAt");
+
+    let drifted = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan sees the drift");
+    let detail = |platform: &platforms::Platform| {
+        drifted
+            .items
+            .iter()
+            .find(|i| i.component == component(platform))
+            .map(|i| (i.status, i.detail.clone()))
+            .expect("the keyspace is planned")
+    };
+    let (status, said) = detail(&platforms::X);
+    assert_eq!(status, Status::Configure);
+    assert!(said.starts_with("rules differ"), "got: {said}");
+    let (status, said) = detail(&platforms::GITHUB);
+    assert_eq!(status, Status::Configure);
+    assert!(said.starts_with("no keyspace"), "got: {said}");
+    assert_eq!(detail(&platforms::GOOGLE).0, Status::Ok);
+
+    let emitted = platform_configured(&provider, identity_names).await;
+    let repaired = apply_with(&path, apply::Options::default()).await;
+    assert_eq!(
+        repaired.configured,
+        vec![
+            "X keyspace rewritten: its rules differed".to_string(),
+            "GitHub keyspace written".to_string(),
+        ]
+    );
+    assert_eq!(
+        platform_configured(&provider, identity_names).await,
+        [emitted, vec![x, github]].concat()
+    );
+    let settled = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan after the repair");
+    for platform in platforms::LAUNCH {
+        assert_eq!(settled.status_of(&component(platform)), Some(Status::Ok));
+    }
 }
 
 /// A proxy whose running implementation predates a getter the wiring reads
