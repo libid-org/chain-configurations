@@ -60,6 +60,7 @@ use crate::{
     platforms::{
         self,
         Platform,
+        RulesOnChain,
         LAUNCH_VERIFIER_VERSION,
     },
     rpc::RpcEndpoint,
@@ -109,8 +110,7 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// Whether `apply` would send any transaction beyond the always-resent
-    /// idempotent configuration ops.
+    /// Whether `apply` would deploy anything.
     pub fn has_deploys(&self) -> bool {
         self.items.iter().any(|i| i.status == Status::Deploy)
     }
@@ -291,23 +291,7 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
     if identity_names_present {
         plan_identity_names(&mut b, &provider, identity_names, proof_verifier).await;
     }
-    // The keyspaces are written, not read: IdentityNames exposes no getter
-    // for a platform's rules, so apply converges them by re-sending
-    // `setPlatform`, which is owner-only and idempotent.
-    for platform in platforms::LAUNCH {
-        b.push(
-            format!("identity_names.platform.{}", platform.domain),
-            if identity_names_present {
-                Status::Configure
-            } else {
-                Status::Deploy
-            },
-            format!(
-                "setPlatform({:#x}) re-sent — the contract exposes no rules getter",
-                platforms::platform_id(platform.domain)
-            ),
-        );
-    }
+    plan_keyspaces(&mut b, &provider, identity_names, identity_names_present).await;
 
     let handle_escrow =
         required_address(&cfg.contracts.handle_escrow, "contracts.handle_escrow")?;
@@ -491,6 +475,54 @@ async fn plan_identity_names<P: Provider>(
                  it upgrades the implementation first (--upgrade identity-names)"
             ),
         ),
+    }
+}
+
+/// Each platform's keyspace against the generated table. apply writes one
+/// only where the chain has none or other rules.
+async fn plan_keyspaces<P: Provider>(
+    b: &mut Builder,
+    provider: &P,
+    identity_names: Address,
+    identity_names_present: bool,
+) {
+    for platform in platforms::LAUNCH {
+        let component = format!("identity_names.platform.{}", platform.domain);
+        let platform_id = platforms::platform_id(platform.domain);
+        if !identity_names_present {
+            b.push(
+                component,
+                Status::Deploy,
+                format!("setPlatform({platform_id:#x}) once IdentityNames is deployed"),
+            );
+            continue;
+        }
+        match platform.rules_on_chain(provider, identity_names).await {
+            Ok(RulesOnChain::Same) => {
+                b.push(component, Status::Ok, "rules match the generated table")
+            }
+            Ok(RulesOnChain::Different) => b.push(
+                component,
+                Status::Configure,
+                format!(
+                    "rules differ from the generated table — apply sends \
+                     setPlatform({platform_id:#x})"
+                ),
+            ),
+            Ok(RulesOnChain::Unconfigured) => b.push(
+                component,
+                Status::Configure,
+                format!("no keyspace — apply sends setPlatform({platform_id:#x})"),
+            ),
+            Err(e) => b.push(
+                component,
+                Status::Warn,
+                format!(
+                    "{e} — apply STOPS at this read unless it upgrades the \
+                     implementation first (--upgrade identity-names)"
+                ),
+            ),
+        }
     }
 }
 

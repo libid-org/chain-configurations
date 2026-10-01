@@ -19,8 +19,9 @@ The model is DECLARATIVE:
    each component is "declared + present" (ok) or "declared + missing"
    (DEPLOY — apply would put it at exactly the declared address). A wrong
    declared address never gets that far: it fails validation at load.
-4. `libid-deploy apply` deploys whatever the CHAIN lacks, re-sends the
-   idempotent configuration, and performs explicitly requested upgrades.
+4. `libid-deploy apply` deploys whatever the CHAIN lacks, sends only the
+   configuration that differs from the file, and performs explicitly
+   requested upgrades.
    It **never rewrites the file** — after an apply the config is
    byte-identical, and there is no write-back PR. Integration tests can
    therefore use identical config data regardless of which chain (or how
@@ -257,10 +258,10 @@ Declared-address semantics:
   is required exactly when the FACTORY has no code on-chain (a virgin
   network — that first apply publishes the entire declared stack). With
   the factory present, apply converges incrementally without the flag.
-- The three keyspaces are **re-sent every run**. `IdentityNames` exposes no
-  getter for a platform's rules, so writing them is the only way to
-  converge on what the generated table says; the call is owner-only and
-  idempotent.
+- A keyspace is **written only when it changes**: apply reads `rulesOf`
+  and sends `setPlatform` where a platform has no keyspace or other rules.
+  Every `setPlatform` emits `PlatformConfigured`, which readers take as a
+  reconfiguration.
 
 ## Running locally
 

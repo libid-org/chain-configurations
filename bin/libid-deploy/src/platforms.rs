@@ -10,17 +10,24 @@
 //! value restated here would key handles differently from every deployed
 //! reader.
 
-use alloy::primitives::{
-    keccak256,
-    Address,
-    FixedBytes,
+use alloy::{
+    primitives::{
+        keccak256,
+        Address,
+        FixedBytes,
+    },
+    providers::Provider,
 };
 use anyhow::{
+    anyhow,
     bail,
     Result,
 };
 use libid_contracts::{
-    bindings::identity::IdentityNames,
+    bindings::identity::IdentityNames::{
+        self,
+        UnknownPlatform,
+    },
     circuits::Circuit,
     platform_verifier::{
         GoogleRoots,
@@ -64,6 +71,18 @@ pub enum VerifierKind {
     /// count is zero — and no attestation window; the signed `exp` is the
     /// whole validity ceiling. It reads the JWT root list instead.
     GoogleJwt,
+}
+
+/// What an IdentityNames holds for a platform's keyspace, against the
+/// generated table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RulesOnChain {
+    /// No keyspace yet: `rulesOf` reverts `UnknownPlatform`.
+    Unconfigured,
+    /// A keyspace whose rules differ from the generated table.
+    Different,
+    /// Exactly the generated table's rules.
+    Same,
 }
 
 /// One launch platform.
@@ -152,6 +171,41 @@ impl Platform {
                 self.label
             ),
         })
+    }
+
+    /// Read this platform's keyspace from the IdentityNames at
+    /// `identity_names` and compare its rules with the generated table.
+    pub async fn rules_on_chain<P: Provider>(
+        &self,
+        provider: &P,
+        identity_names: Address,
+    ) -> Result<RulesOnChain> {
+        let read = IdentityNames::new(identity_names, provider)
+            .rulesOf(platform_id(self.domain))
+            .call()
+            .await;
+        match read {
+            Ok(rules) if self.has_rules(&rules) => Ok(RulesOnChain::Same),
+            Ok(_) => Ok(RulesOnChain::Different),
+            Err(e) if e.as_decoded_error::<UnknownPlatform>().is_some() => {
+                Ok(RulesOnChain::Unconfigured)
+            }
+            Err(e) => Err(anyhow!(
+                "IdentityNames.rulesOf({}) read failed: {e}",
+                self.label
+            )),
+        }
+    }
+
+    /// Whether `rules` are the ones `setPlatform` writes for this platform,
+    /// field for field.
+    fn has_rules(&self, rules: &IdentityNames::Rules) -> bool {
+        let want = &self.rules;
+        rules.maxLength == want.maxLength
+            && rules.stripLeadingAt == want.stripLeadingAt
+            && rules.isEmail == want.isEmail
+            && rules.allowUnderscore == want.allowUnderscore
+            && rules.allowHyphen == want.allowHyphen
     }
 }
 
@@ -282,6 +336,27 @@ mod tests {
                 platform_id(platform.domain),
                 platform.verifier.platform_id()
             );
+        }
+    }
+
+    /// A keyspace counts as written only when every field matches; one
+    /// differing field is a rewrite.
+    #[test]
+    fn has_rules_compares_every_field() {
+        for platform in LAUNCH {
+            assert!(platform.has_rules(&platform.rules), "{}", platform.label);
+            let changes: [fn(&mut IdentityNames::Rules); 5] = [
+                |r| r.maxLength += 1,
+                |r| r.stripLeadingAt = !r.stripLeadingAt,
+                |r| r.isEmail = !r.isEmail,
+                |r| r.allowUnderscore = !r.allowUnderscore,
+                |r| r.allowHyphen = !r.allowHyphen,
+            ];
+            for change in changes {
+                let mut other = platform.rules.clone();
+                change(&mut other);
+                assert!(!platform.has_rules(&other), "{}", platform.label);
+            }
         }
     }
 
