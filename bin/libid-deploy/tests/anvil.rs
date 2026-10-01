@@ -1364,7 +1364,7 @@ async fn rpc_override_moves_only_the_transport() {
     let settled = plan::build(&cfg, &rpc)
         .await
         .expect("plan through the override");
-    assert_eq!(settled.rpc_url, rpc.url().to_string());
+    assert_eq!(settled.rpc_origin, rpc.origin());
     assert!(!settled.has_deploys(), "{}", settled.render());
     let again = apply::run(&path, &cfg, &rpc, &signer, &apply::Options::default())
         .await
@@ -1494,7 +1494,7 @@ fn the_cli_applies_the_committed_file_through_rpc_url() {
     let stdout = String::from_utf8_lossy(&plan.stdout);
     assert!(plan.status.success(), "{stdout}");
     assert!(
-        stdout.starts_with(&format!("Plan for local-dev via {}/", anvil.endpoint())),
+        stdout.starts_with(&format!("Plan for local-dev via {} (", anvil.endpoint())),
         "{stdout}"
     );
     assert!(!stdout.contains("DEPLOY"), "{stdout}");

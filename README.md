@@ -294,6 +294,12 @@ the file is still never rewritten. A value that does not parse or does not
 answer is an error, never a fallback to the file. `plan --print-addresses`
 is offline and rejects the flag.
 
+In the apply workflow the flag is the `RPC_URL` secret of the network's
+GitHub environment: a private endpoint, keyed, that the job passes on
+every call, while the file keeps the public one. Everything written about
+an endpoint — the plan's first line, the apply log, a prompt — names it by
+origin alone, scheme, host and port, so the key reaches no step summary.
+
 Upgrade components: `notary-service`, `proof-verifier`, `identity-registry`,
 `handle-escrow`, `google-jwt-roots`, `x-platform-verifier`,
 `github-platform-verifier`, `google-platform-verifier`. Each is a UUPS
@@ -375,10 +381,11 @@ an override that does not answer fails instead of falling back to the file.
 
 Copy `networks/mainnet.toml.example` — it ships FULLY pre-filled with the
 canonical address table, which is valid on every EVM network — fill the
-input keys (chain, RPC, AWS, accounts, Notary Fee), add the name to the
-`network` choice list in `apply.yml`, and run the workflow with `mode:
-plan` first. The first apply on a virgin network needs
-`confirm_fresh_deploy`.
+input keys (chain, a public RPC, AWS, accounts, Notary Fee), add the name
+to the `network` choice list in `apply.yml`, and create the GitHub
+environment of that name with an `RPC_URL` secret holding the private
+endpoint. Run the workflow with `mode: plan` first. The first apply on a
+virgin network needs `confirm_fresh_deploy`.
 
 ## Release process
 
