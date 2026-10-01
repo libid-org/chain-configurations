@@ -39,7 +39,7 @@ nothing here restates a value the chain also holds.
 
 Five UUPS proxies, in dependency order: the four `libid-contracts`' own
 `script/Deploy.s.sol` deploys, in its order, and the handle escrow right
-after the naming system it resolves through:
+after the identity registry it resolves through:
 
 1. **NotaryService** — the ONE place a notary attestation is
    authenticated. It derives the digest from the attested bytes itself and
@@ -47,20 +47,20 @@ after the naming system it resolves through:
    wired into every consumer's `initialize`.
 2. **CeremonyProofVerifier** — the Supported Version Set: which Platform
    Verifier answers for a `(platformId, verifierVersion)` pair. Without it
-   the naming system's `proofVerifier` reads zero and every resolver
+   the identity registry's `proofVerifier` reads zero and every resolver
    reverts.
-3. **IdentityNames** — the naming system, pointed at the Proof Verifier
-   and given a keyspace per platform (`x`, `github`, `google`). The
-   normalization rules come from `libid-identity`'s generated table.
+3. **IdentityRegistry** — the identity registry, pointed at the Proof
+   Verifier and given handle rules per platform key (`x`, `github`,
+   `google`) from `libid-identity`'s generated table.
 4. **HandleEscrow** — value sent to a handle before anyone holds it,
-   claimed by the wallet IdentityNames binds the handle to. `initialize`
-   takes the IdentityNames address and refuses one that does not answer
-   the escrow's reads. No setter moves the escrow to another naming
-   system afterwards.
+   claimed by the holder the registry binds the handle to. `initialize`
+   takes the registry's address and refuses one that does not answer the
+   escrow's reads. No setter moves the escrow to another registry
+   afterwards.
 5. **GoogleJwtRoots** — the Google signing keys the `google/v1` Platform
    Verifier trusts, verified through the Notary Service like any other
-   notarized session. It deploys **EMPTY**: point a keeper at it before
-   Google names work, or every Google binding reverts `UntrustedModulus`.
+   notarized session. It deploys **EMPTY**: point a keeper at it, or every
+   Google binding reverts `UntrustedModulus`.
 
 Then two steps `Deploy.s.sol` does not have:
 
@@ -72,7 +72,7 @@ Then two steps `Deploy.s.sol` does not have:
    own CREATE3 proxy, pinned to its circuit's verifier by address and code
    hash, and registered into the Supported Version Set with
    `CeremonyProofVerifier.setVerifier(platformId, 1, verifier)`. Until that
-   registration lands, a platform owns a keyspace and can verify nothing:
+   registration lands, a platform has its rules and can verify nothing:
    `bind` reverts `UnknownVersion` and every resolver reverts
    `UnknownPlatform`.
 
@@ -151,8 +151,8 @@ entry = a NEW address, forever, on every network — names are frozen:
 | `contracts.factory` | — (CREATE2, frozen init code) | `0xa92244c3f4462aad08bd1a33c3940b9b936321ad` |
 | `contracts.notary_service` | `libid.NotaryService` | `0xbb5871167b0128939cab6850877981421e8dcbf5` |
 | `contracts.ceremony_proof_verifier` | `libid.CeremonyProofVerifier` | `0x76bdc18f21c2db0ff796c7cc50348528b2899275` |
-| `contracts.identity_names` | `libid.IdentityNames.3` | `0x5b86114eccd8259347294a2bdbf3da2c93857796` |
-| `contracts.handle_escrow` | `libid.HandleEscrow` | `0xbbfe9b5301d44cd67b725c600fac4a53dc090de1` |
+| `contracts.identity_registry` | `libid.IdentityRegistry` | `0x0531b83b010a6b0c24c2c2c1a6beecc90cc71366` |
+| `contracts.handle_escrow` | `libid.HandleEscrow.2` | `0xf7e3ad279f913ffe2ef74614e3046c15cbdabb9a` |
 | `contracts.google_jwt_roots` | `libid.GoogleJwtRoots` | `0xb7a2ce28e71dbb9c877d2b5a48de33b5f0e6838d` |
 | `contracts.x_platform_verifier` | `libid.XPlatformVerifier` | `0xcfc880f62f2744dc000687edf47a98b585d9eb35` |
 | `contracts.github_platform_verifier` | `libid.GitHubPlatformVerifier` | `0xac878389da7a1b58826182da0d8b4cae5e6e4178` |
@@ -161,7 +161,7 @@ entry = a NEW address, forever, on every network — names are frozen:
 The circuit verifiers go through the same factory but are not in that
 table and not in any network file: their names carry the circuits release
 `libid-contracts` vendors, so they move when the contracts pin does. At
-`libid-circuits` 0.5.0 (`libid-contracts` 0.14.0) they are
+`libid-circuits` 0.5.0 (`libid-contracts` 0.15.0) they are
 
 | Component | Name | Address (every network) |
 |---|---|---|
@@ -211,7 +211,7 @@ only secret in the flow is the KMS key, which never leaves AWS.
 | `[aws]` | input | `region`, `kms_deployer` (key id / `alias/...` / ARN; the default signer) |
 | `[accounts]` | input | `notary` (the notary **signer** — see below), `owner` (the operational owner the factory ends up with; empty = the deployer) — addresses of **keys**, not contracts |
 | `[notary_service]` | input | `fee_wei` — what one attestation verification costs, as a decimal string |
-| `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_names`, `handle_escrow`, `google_jwt_roots`, `x_platform_verifier`, `github_platform_verifier`, `google_platform_verifier` — always present, pre-filled with the canonical table, validated against the prediction |
+| `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_registry`, `handle_escrow`, `google_jwt_roots`, `x_platform_verifier`, `github_platform_verifier`, `google_platform_verifier` — always present, pre-filled with the canonical table, validated against the prediction |
 
 The circuit verifiers are not in the file. They are a property of the
 binary's contracts pin — which carries the circuits release — not of a
@@ -257,10 +257,8 @@ Declared-address semantics:
   is required exactly when the FACTORY has no code on-chain (a virgin
   network — that first apply publishes the entire declared stack). With
   the factory present, apply converges incrementally without the flag.
-- The three keyspaces are **re-sent every run**. `IdentityNames` exposes no
-  getter for a platform's rules, so writing them is the only way to
-  converge on what the generated table says; the call is owner-only and
-  idempotent.
+- The three platforms' handle rules are **re-sent every run**; the call is
+  owner-only and idempotent.
 
 ## Running locally
 
@@ -277,7 +275,7 @@ cargo run -- plan --network networks/eden-testnet.toml
 # converge; the signer defaults to aws.kms_deployer (needs ambient AWS
 # credentials), or pass a local key for anvil rehearsal
 cargo run -- apply --network networks/eden-testnet.toml \
-  --signer <64-hex-key-or-kms-id> [--upgrade identity-names] [--yes] \
+  --signer <64-hex-key-or-kms-id> [--upgrade identity-registry] [--yes] \
   [--confirm-fresh-deploy]
 ```
 
@@ -296,7 +294,7 @@ the file is still never rewritten. A value that does not parse or does not
 answer is an error, never a fallback to the file. `plan --print-addresses`
 is offline and rejects the flag.
 
-Upgrade components: `notary-service`, `proof-verifier`, `identity-names`,
+Upgrade components: `notary-service`, `proof-verifier`, `identity-registry`,
 `handle-escrow`, `google-jwt-roots`, `x-platform-verifier`,
 `github-platform-verifier`, `google-platform-verifier`. Each is a UUPS
 `upgradeToAndCall`: the entry address, its storage and its owner all
@@ -406,7 +404,7 @@ release` consumes the newest Linux x86_64 asset.
   the critical declarative cycle — pre-filled file → fresh apply on a
   virgin anvil lands everything AT the declared addresses → second apply is
   a no-op without any flag → the file is BYTE-IDENTICAL throughout — plus
-  drift repair, the handle escrow bound to the IdentityNames beside it,
+  drift repair, the handle escrow bound to the IdentityRegistry beside it,
   the Platform Verifier deploy/register/rotate path, the network-invariance
   proof: two separate bare anvils converge onto the same
   declared canonical addresses, and the `--rpc-url` contract: the committed

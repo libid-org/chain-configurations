@@ -131,13 +131,13 @@ pub struct Contracts {
     pub notary_service: String,
     /// The CeremonyProofVerifier proxy: the Supported Version Set.
     pub ceremony_proof_verifier: String,
-    /// The IdentityNames proxy — the contract consumers resolve against.
-    pub identity_names: String,
-    /// The HandleEscrow proxy, initialized with `identity_names`, which it
+    /// The IdentityRegistry proxy — the contract consumers resolve against.
+    pub identity_registry: String,
+    /// The HandleEscrow proxy, initialized with `identity_registry`, which it
     /// keeps for life.
     pub handle_escrow: String,
     /// The GoogleJwtRoots proxy. Starts EMPTY on-chain: point a keeper at
-    /// it before Google names work.
+    /// it, or every Google binding reverts.
     pub google_jwt_roots: String,
     /// The `x/v1` Platform Verifier proxy.
     pub x_platform_verifier: String,
@@ -154,7 +154,7 @@ impl Contracts {
             "factory" => self.factory.as_str(),
             "notary_service" => self.notary_service.as_str(),
             "ceremony_proof_verifier" => self.ceremony_proof_verifier.as_str(),
-            "identity_names" => self.identity_names.as_str(),
+            "identity_registry" => self.identity_registry.as_str(),
             "handle_escrow" => self.handle_escrow.as_str(),
             "google_jwt_roots" => self.google_jwt_roots.as_str(),
             "x_platform_verifier" => self.x_platform_verifier.as_str(),
@@ -306,7 +306,7 @@ fee_wei = "1000"
 factory = "{factory:#x}"
 notary_service = "{notary_service}"
 ceremony_proof_verifier = "{pv}"
-identity_names = "{names}"
+identity_registry = "{registry}"
 handle_escrow = "{escrow}"
 google_jwt_roots = "{roots}"
 x_platform_verifier = "{x}"
@@ -315,7 +315,7 @@ google_platform_verifier = "{google}"
 "#,
             notary_service = addr(names::NOTARY_SERVICE),
             pv = addr(names::CEREMONY_PROOF_VERIFIER),
-            names = addr(names::IDENTITY_NAMES),
+            registry = addr(names::IDENTITY_REGISTRY),
             escrow = addr(names::HANDLE_ESCROW),
             roots = addr(names::GOOGLE_JWT_ROOTS),
             x = addr(names::X_PLATFORM_VERIFIER),
@@ -386,12 +386,12 @@ google_platform_verifier = "{google}"
     fn canonical_mismatch_is_an_error_naming_the_expected_address() {
         let artifacts = libid_contracts::Artifacts::embedded();
         let factory = predict_factory_address(&artifacts).unwrap();
-        let expected = predict_address(factory, names::IDENTITY_NAMES);
+        let expected = predict_address(factory, names::IDENTITY_REGISTRY);
         let wrong = "0x00000000000000000000000000000000deadbeef";
         let text = canonical_toml().replace(&format!("{expected:#x}"), wrong);
         let cfg: NetworkConfig = toml::from_str(&text).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("contracts.identity_names"), "got: {err}");
+        assert!(err.contains("contracts.identity_registry"), "got: {err}");
         assert!(err.contains(&format!("{expected:#x}")), "got: {err}");
     }
 
