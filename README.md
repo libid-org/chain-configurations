@@ -297,7 +297,9 @@ declared chain id is still enforced against whatever answers, every
 address is still the file's, and the file is still never rewritten. A
 value that does not parse or does not answer is an error, never a
 fallback; a file without an endpoint and no flag is an error naming both.
-`plan --print-addresses` is offline and rejects the flag.
+`validate` contacts the chain only under `--check-rpc`, so without it a
+file needs no endpoint. `plan --print-addresses` is offline and rejects the
+flag.
 
 In the apply workflow the flag is the `RPC_URL` secret of the network's
 GitHub environment, passed on every call; a network whose environment
