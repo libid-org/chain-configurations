@@ -162,7 +162,7 @@ entry = a NEW address, forever, on every network — names are frozen:
 The circuit verifiers go through the same factory but are not in that
 table and not in any network file: their names carry the circuits release
 `libid-contracts` vendors, so they move when the contracts pin does. At
-`libid-circuits` 0.5.0 (`libid-contracts` 0.14.0) they are
+`libid-circuits` 0.5.0 (`libid-contracts` 0.15.0) they are
 
 | Component | Name | Address (every network) |
 |---|---|---|
