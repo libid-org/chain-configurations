@@ -22,7 +22,7 @@ use anyhow::{
 };
 use libid_contracts::factory::{
     predict_address,
-    predict_factory_address,
+    FactoryGenesis,
 };
 use serde::Deserialize;
 
@@ -89,6 +89,13 @@ pub struct Aws {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Accounts {
+    /// The DEPLOYER — the address of `aws.kms_deployer`. It is the genesis
+    /// admin baked into the factory's init code, so the factory address
+    /// and every canonical address below follow from it; one deployer per
+    /// environment gives testnet and mainnet their own tables. `apply`
+    /// refuses a signer that is not this address: `factory.deploy` is
+    /// owner-gated, and this is the owner.
+    pub deployer: String,
     /// The notary SIGNER — the EOA/KMS identity whose attestations the
     /// stack accepts. The NotaryService CONTRACT
     /// (`contracts.notary_service`) holds the trusted key set; apply
@@ -96,15 +103,27 @@ pub struct Accounts {
     /// Distinct on purpose: this is a key, not a contract.
     pub notary: String,
     /// The OPERATIONAL OWNER the factory should end up with. Empty =
-    /// the deployer (the apply signer). On real networks this is the KMS
-    /// genesis admin — the same identity as the deployer key — so the
-    /// default is exact; on local dev chains it names the anvil #0 wallet
-    /// and the anvil auto-impersonation hands factory ownership to IT.
+    /// the deployer, which owns it from genesis, so the default is exact. A
+    /// different key makes apply start the Ownable2Step handover; on a dev
+    /// chain apply completes it by impersonation.
     #[serde(default)]
     pub owner: String,
 }
 
 impl Accounts {
+    /// The deployer key's address.
+    pub fn deployer_address(&self) -> Result<Address> {
+        required_address(&self.deployer, "accounts.deployer")
+    }
+
+    /// The factory this network's deployer owns from genesis: what every
+    /// canonical address is predicted from.
+    pub fn factory_genesis(&self) -> Result<FactoryGenesis> {
+        Ok(FactoryGenesis {
+            admin: self.deployer_address()?,
+        })
+    }
+
     /// The declared operational owner, if any (`None` = default to the
     /// deployer).
     pub fn owner_address(&self) -> Result<Option<Address>> {
@@ -206,12 +225,19 @@ pub fn required_address(value: &str, label: &str) -> Result<Address> {
 impl NetworkConfig {
     /// Load and validate a network file.
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let cfg: Self = toml::from_str(&text)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let cfg = Self::read(path)?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// The file as written, before validation: what `plan --print-addresses`
+    /// reads, so that a file whose `[contracts]` table is still to be filled
+    /// in can print the table it needs.
+    pub fn read(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        toml::from_str(&text)
+            .with_context(|| format!("failed to parse {}", path.display()))
     }
 
     /// Structural sanity checks — everything that can fail before touching
@@ -241,11 +267,14 @@ impl NetworkConfig {
 
     /// Every declared canonical key must EQUAL the predicted CREATE3
     /// address for its frozen name; the factory key must equal the
-    /// canonical factory address.
+    /// deployer's factory address.
     fn validate_canonical_addresses(&self) -> Result<()> {
         let artifacts = libid_contracts::Artifacts::embedded();
-        let factory = predict_factory_address(&artifacts)
-            .map_err(|e| anyhow!("predict_factory_address failed: {e}"))?;
+        let factory = self
+            .accounts
+            .factory_genesis()?
+            .address(&artifacts)
+            .map_err(|e| anyhow!("predicting the factory address failed: {e}"))?;
 
         let declared_factory = required_address(
             &self.contracts.factory,
@@ -297,10 +326,22 @@ pub(crate) mod tests {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../networks")
     }
 
+    /// Anvil account #0: the deployer of the test configurations.
+    pub(crate) const TEST_DEPLOYER: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+
+    /// The factory the test deployer owns from genesis.
+    pub(crate) fn test_factory() -> Address {
+        let genesis = FactoryGenesis {
+            admin: TEST_DEPLOYER.parse().unwrap(),
+        };
+        genesis
+            .address(&libid_contracts::Artifacts::embedded())
+            .unwrap()
+    }
+
     /// A minimal file with every address pre-filled from the prediction.
     pub(crate) fn canonical_toml() -> String {
-        let artifacts = libid_contracts::Artifacts::embedded();
-        let factory = predict_factory_address(&artifacts).unwrap();
+        let factory = test_factory();
         let addr = |name: &str| format!("{:#x}", predict_address(factory, name));
         format!(
             r#"[network]
@@ -313,6 +354,7 @@ region = "eu-central-1"
 kms_deployer = "alias/test"
 
 [accounts]
+deployer = "{TEST_DEPLOYER}"
 notary = "0x1111111111111111111111111111111111111111"
 owner = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 
@@ -415,9 +457,7 @@ google_platform_verifier = "{google}"
     /// validation ERROR that names the expected address.
     #[test]
     fn canonical_mismatch_is_an_error_naming_the_expected_address() {
-        let artifacts = libid_contracts::Artifacts::embedded();
-        let factory = predict_factory_address(&artifacts).unwrap();
-        let expected = predict_address(factory, names::IDENTITY_REGISTRY);
+        let expected = predict_address(test_factory(), names::IDENTITY_REGISTRY);
         let wrong = "0x00000000000000000000000000000000deadbeef";
         let text = canonical_toml().replace(&format!("{expected:#x}"), wrong);
         let cfg: NetworkConfig = toml::from_str(&text).unwrap();
@@ -429,9 +469,7 @@ google_platform_verifier = "{google}"
     /// An empty canonical key is an error naming the fill-in value.
     #[test]
     fn canonical_empty_key_is_an_error() {
-        let artifacts = libid_contracts::Artifacts::embedded();
-        let factory = predict_factory_address(&artifacts).unwrap();
-        let expected = predict_address(factory, names::GOOGLE_JWT_ROOTS);
+        let expected = predict_address(test_factory(), names::GOOGLE_JWT_ROOTS);
         let text = canonical_toml().replace(&format!("{expected:#x}"), "");
         let cfg: NetworkConfig = toml::from_str(&text).unwrap();
         let err = cfg.validate().unwrap_err().to_string();

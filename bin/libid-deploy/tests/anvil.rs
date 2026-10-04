@@ -8,8 +8,8 @@
 //!
 //! Every anvil here starts with `--disable-default-create2-deployer`, so
 //! the tests prove the full bootstrap: keyless deployer install → factory
-//! at its canonical predicted address → dev ownership impersonation →
-//! every entry contract CREATE3-deployed at `predict_address(factory,
+//! at its predicted address, owned by the signer from genesis → every
+//! entry contract CREATE3-deployed at `predict_address(factory,
 //! name)` — exactly the addresses the file declared before the chain even
 //! existed.
 
@@ -47,7 +47,7 @@ use libid_contracts::{
     deploy::deploy_contract_from,
     factory::{
         predict_address,
-        predict_factory_address,
+        FactoryGenesis,
     },
     platform_verifier::PlatformVerifier,
     Artifacts,
@@ -75,9 +75,22 @@ use libid_deploy::{
 // The canonical anvil account #0 key. Public test material, not a secret.
 const ANVIL_KEY: &str =
     "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-// The address of anvil account #0 — the declared operational owner in the
-// local dev config, exactly as networks/local-dev.toml describes it.
+// The address of anvil account #0 — the deployer and the declared
+// operational owner in the local dev config, exactly as
+// networks/local-dev.toml describes it.
 const ANVIL_OWNER: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+
+/// The factory anvil account #0 owns from genesis.
+fn genesis() -> FactoryGenesis {
+    FactoryGenesis {
+        admin: ANVIL_OWNER.parse().unwrap(),
+    }
+}
+
+/// Where that factory lives.
+fn factory_address() -> Address {
+    genesis().address(&Artifacts::embedded()).unwrap()
+}
 // Anvil account #1, the notary signer in the local dev config.
 const ANVIL_NOTARY: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 // A Notary Fee that is not zero, so the fee path is exercised rather than
@@ -126,8 +139,7 @@ fn prefilled_network_file(dir: &std::path::Path, rpc: &str) -> PathBuf {
 }
 
 fn write_network_file(dir: &std::path::Path, rpc: &str) -> PathBuf {
-    let artifacts = Artifacts::embedded();
-    let factory = predict_factory_address(&artifacts).unwrap();
+    let factory = factory_address();
     let addr = |name: &str| format!("{:#x}", predict_address(factory, name));
     let path = dir.join("anvil-local.toml");
     let body = format!(
@@ -141,6 +153,7 @@ region = "eu-central-1"
 kms_deployer = "alias/unused-in-tests"
 
 [accounts]
+deployer = "{ANVIL_OWNER}"
 notary = "{ANVIL_NOTARY}"
 owner = "{ANVIL_OWNER}"
 
@@ -209,8 +222,7 @@ async fn apply_with(path: &std::path::Path, opts: apply::Options) -> apply::Summ
 /// `predict_address(factory, name)` — the CREATE3 name-determinism proof —
 /// and that the chain has CODE at every one of them.
 async fn assert_declared_and_present<P: Provider>(provider: &P, cfg: &NetworkConfig) {
-    let artifacts = Artifacts::embedded();
-    let factory = predict_factory_address(&artifacts).unwrap();
+    let factory = factory_address();
     for c in names::CANONICAL_CONTRACTS {
         let declared: Address = cfg
             .contracts
@@ -253,7 +265,7 @@ async fn honk_log_n<P: Provider>(provider: &P, verifier: Address) -> u64 {
 /// name carrying the pinned circuits release, so it is known before the
 /// chain has anything on it.
 fn circuit_verifier_address(circuit: Circuit) -> Address {
-    let factory = predict_factory_address(&Artifacts::embedded()).unwrap();
+    let factory = factory_address();
     predict_address(factory, &circuits::factory_name(circuit).unwrap())
 }
 
@@ -307,7 +319,6 @@ async fn declarative_apply_cycle_never_touches_the_config() {
         &path,
         apply::Options {
             confirm_fresh_deploy: true,
-            dev: true,
             ..Default::default()
         },
     )
@@ -457,7 +468,6 @@ async fn apply_converges_drifted_wiring_without_redeploying() {
         &path,
         apply::Options {
             confirm_fresh_deploy: true,
-            dev: true,
             ..Default::default()
         },
     )
@@ -544,7 +554,6 @@ async fn apply_upgrades_a_proxy_before_reading_through_it() {
         &path,
         apply::Options {
             confirm_fresh_deploy: true,
-            dev: true,
             ..Default::default()
         },
     )
@@ -660,7 +669,6 @@ async fn fresh_apply_addresses_are_network_invariant() {
             &path,
             apply::Options {
                 confirm_fresh_deploy: true,
-                dev: true,
                 ..Default::default()
             },
         )
@@ -706,7 +714,6 @@ async fn platform_verifiers_deploy_wire_and_register() {
         &path,
         apply::Options {
             confirm_fresh_deploy: true,
-            dev: true,
             ..Default::default()
         },
     )
@@ -966,7 +973,6 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
         &path,
         apply::Options {
             confirm_fresh_deploy: true,
-            dev: true,
             ..Default::default()
         },
     )
@@ -1055,7 +1061,6 @@ async fn the_handle_escrow_resolves_through_the_identity_registry_beside_it() {
         &path,
         apply::Options {
             confirm_fresh_deploy: true,
-            dev: true,
             ..Default::default()
         },
     )
@@ -1165,7 +1170,6 @@ async fn apply_stops_at_an_escrow_bound_to_another_identity_registry() {
         &path,
         apply::Options {
             confirm_fresh_deploy: true,
-            dev: true,
             ..Default::default()
         },
     )
@@ -1257,7 +1261,6 @@ async fn the_committed_local_dev_file_converges_an_anvil_through_rpc_url() {
         &signer,
         &apply::Options {
             confirm_fresh_deploy: true,
-            dev: true,
             ..Default::default()
         },
     )
@@ -1326,7 +1329,6 @@ async fn rpc_override_moves_only_the_transport() {
     let signer = SignerSource::from_spec(ANVIL_KEY).unwrap();
     let opts = apply::Options {
         confirm_fresh_deploy: true,
-        dev: true,
         ..Default::default()
     };
     let summary = apply::run(&path, &cfg, &rpc, &signer, &opts)
@@ -1334,7 +1336,7 @@ async fn rpc_override_moves_only_the_transport() {
         .expect("apply converges through the override");
 
     // Every canonical component deployed, at exactly the file's address.
-    let factory = predict_factory_address(&Artifacts::embedded()).unwrap();
+    let factory = factory_address();
     for c in names::CANONICAL_CONTRACTS {
         let declared: Address = cfg.contracts.raw(c.key).unwrap().parse().unwrap();
         let landed = summary
@@ -1398,7 +1400,6 @@ async fn rpc_override_never_falls_back_to_the_file() {
     let signer = SignerSource::from_spec(ANVIL_KEY).unwrap();
     let opts = apply::Options {
         confirm_fresh_deploy: true,
-        dev: true,
         ..Default::default()
     };
     let err = apply::run(&path, &cfg, &rpc, &signer, &opts)
@@ -1437,7 +1438,6 @@ async fn rpc_override_still_enforces_the_declared_chain_id() {
     let signer = SignerSource::from_spec(ANVIL_KEY).unwrap();
     let opts = apply::Options {
         confirm_fresh_deploy: true,
-        dev: true,
         ..Default::default()
     };
     let err = apply::run(&path, &cfg, &rpc, &signer, &opts)
@@ -1467,7 +1467,7 @@ fn the_cli_applies_the_committed_file_through_rpc_url() {
         .arg(&path)
         .arg("--rpc-url")
         .arg(anvil.endpoint())
-        .args(["--yes", "--confirm-fresh-deploy", "--dev"])
+        .args(["--yes", "--confirm-fresh-deploy"])
         .output()
         .expect("libid-deploy runs");
     let stdout = String::from_utf8_lossy(&apply.stdout);
@@ -1478,7 +1478,7 @@ fn the_cli_applies_the_committed_file_through_rpc_url() {
         "{stdout}"
     );
     for c in names::CANONICAL_CONTRACTS {
-        let addr = plan::predicted(c.key).unwrap();
+        let addr = plan::predicted(genesis(), c.key).unwrap();
         assert!(
             stdout.contains(&format!("contracts.{} = {addr:#x}", c.key)),
             "{} missing from the summary:\n{stdout}",

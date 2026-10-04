@@ -134,39 +134,44 @@ the proof.
 
 Every top-level (entry) contract deploys THROUGH the deterministic
 `LibidFactory` via CREATE3, with `salt = keccak256(name)` for a fixed
-canonical name. The factory itself lives at one canonical address on every
-EVM network (deployed via the keyless Arachnid CREATE2 deployer with frozen
-init code), so **each entry address is a pure function of its name** — the
-same on every chain, computable before anything is deployed:
+canonical name. The factory itself lives at one address on every EVM
+network its deployer deploys to (via the keyless Arachnid CREATE2 deployer,
+with init code whose only varying input is `accounts.deployer`, the genesis
+admin), so **each entry address is a pure function of the deployer and the
+name** — computable before anything is deployed:
 
 ```sh
-cargo run -- plan --network networks/mainnet.toml.example --print-addresses
+cargo run -- plan --network networks/eden-testnet.toml --print-addresses
 ```
 
-The authoritative name table (`bin/libid-deploy/src/names.rs`). Renaming an
-entry = a NEW address, forever, on every network — names are frozen:
+One deployer key per environment: testnet's lives in the libid-testnet AWS
+account and serves eden-testnet and Sepolia, mainnet's in libid-mainnet, so
+the two environments have different tables. The authoritative name table
+(`bin/libid-deploy/src/names.rs`). Renaming an entry = a NEW address,
+forever, on every network — names are frozen. The testnet table, deployer
+`0xdaeb247f5a90c53f2d7a80a81f6cb6acb0d8b907`:
 
-| Config key | Canonical name | Address (every network) |
+| Config key | Canonical name | Address (testnet) |
 |---|---|---|
-| `contracts.factory` | — (CREATE2, frozen init code) | `0xa92244c3f4462aad08bd1a33c3940b9b936321ad` |
-| `contracts.notary_service` | `libid.NotaryService` | `0xbb5871167b0128939cab6850877981421e8dcbf5` |
-| `contracts.ceremony_proof_verifier` | `libid.CeremonyProofVerifier` | `0x76bdc18f21c2db0ff796c7cc50348528b2899275` |
-| `contracts.identity_registry` | `libid.IdentityRegistry` | `0x0531b83b010a6b0c24c2c2c1a6beecc90cc71366` |
-| `contracts.handle_escrow` | `libid.HandleEscrow.2` | `0xf7e3ad279f913ffe2ef74614e3046c15cbdabb9a` |
-| `contracts.google_jwt_roots` | `libid.GoogleJwtRoots` | `0xb7a2ce28e71dbb9c877d2b5a48de33b5f0e6838d` |
-| `contracts.x_platform_verifier` | `libid.XPlatformVerifier` | `0xcfc880f62f2744dc000687edf47a98b585d9eb35` |
-| `contracts.github_platform_verifier` | `libid.GitHubPlatformVerifier` | `0xac878389da7a1b58826182da0d8b4cae5e6e4178` |
-| `contracts.google_platform_verifier` | `libid.GooglePlatformVerifier` | `0xf3d537022362d187715b28bc547f8b2532e6d0cf` |
+| `contracts.factory` | — (CREATE2, frozen init code) | `0x9dbf2b5f96cb31a48cca4e25d2c8348be414ebc8` |
+| `contracts.notary_service` | `libid.NotaryService` | `0xa773ec5e7500d1c87827ab1b899bbd992c1b5931` |
+| `contracts.ceremony_proof_verifier` | `libid.CeremonyProofVerifier` | `0xa795b14a2e09daf273bc6971058b0462c7d6be42` |
+| `contracts.identity_registry` | `libid.IdentityRegistry` | `0x25f29c8c765db2f27d1e2b23987a7b0655c7d640` |
+| `contracts.handle_escrow` | `libid.HandleEscrow.2` | `0x57355e1d1bcf61fec9b2e5cad60dcccdddc4d8e5` |
+| `contracts.google_jwt_roots` | `libid.GoogleJwtRoots` | `0x8a14a5dda7662f88a5448b9b8b2ca9f1d5742904` |
+| `contracts.x_platform_verifier` | `libid.XPlatformVerifier` | `0x9f655c2fe778260d90f3202d97da0a46510aa3d0` |
+| `contracts.github_platform_verifier` | `libid.GitHubPlatformVerifier` | `0xb5fdf35eedf7c849f3d1e41675d8b8a41487e248` |
+| `contracts.google_platform_verifier` | `libid.GooglePlatformVerifier` | `0x5cfb807545e0e2ce4d7dac7d97ab0583e3fbe1c6` |
 
 The circuit verifiers go through the same factory but are not in that
 table and not in any network file: their names carry the circuits release
 `libid-contracts` vendors, so they move when the contracts pin does. At
 `libid-circuits` 0.6.0 (`libid-contracts` 0.16.0) they are
 
-| Component | Name | Address (every network) |
+| Component | Name | Address (testnet) |
 |---|---|---|
-| `circuits.bearer-link` | `libid.circuits.bearer-link.0.6.0` | `0x7be247fc8040fac413f8c7451618d9589c3b689e` |
-| `circuits.oidc-google` | `libid.circuits.oidc-google.0.6.0` | `0x4d4fcbf08d075992e40feb5a4124e4d573a85238` |
+| `circuits.bearer-link` | `libid.circuits.bearer-link.0.6.0` | `0xb152321148f37c13147f4313a82c72d4e1a95d14` |
+| `circuits.oidc-google` | `libid.circuits.oidc-google.0.6.0` | `0x5301b6c527410565c82dff20b44a71c3e1d151b2` |
 
 `plan --print-addresses` prints all of them together with the canonical
 table.
@@ -183,19 +188,17 @@ How apply gets there, in order:
    0.01 native and broadcasts it). There is deliberately no fallback: a
    chain that rejects the transaction (EIP-155-only) or ships different
    CREATE2 semantics **cannot host the stack** and apply hard-errors.
-2. **Factory.** `ensure_factory` deploys the LibidFactory implementation
-   and proxy at their frozen-init-code CREATE2 addresses (idempotent).
-3. **Canary.** The factory must sit at exactly its predicted canonical
-   address; any mismatch means the chain derives CREATE2 addresses
-   non-standardly (zkSync-Era-style) and apply aborts before sending
-   anything else.
+2. **Factory.** `FactoryGenesis::ensure` deploys the LibidFactory
+   implementation and proxy at their CREATE2 addresses, the proxy's init
+   code carrying `accounts.deployer` as the genesis admin (idempotent).
+3. **Canary.** The factory must sit at exactly its predicted address; any
+   mismatch means the chain derives CREATE2 addresses non-standardly
+   (zkSync-Era-style) and apply aborts before sending anything else.
 4. **Ownership.** `factory.deploy` is owner-gated (Ownable2Step) and the
-   genesis owner baked into the frozen init code is the libID deployer KMS
-   address — on real networks the apply signer IS that key. On dev chains
-   (anvil/hardhat, detected via `web3_clientVersion`) apply impersonates
-   the genesis admin and transfers factory ownership to the local signer;
-   impersonation is refused on anything that does not look like a dev
-   chain, `--dev` flag or not.
+   genesis owner is `accounts.deployer`, so apply refuses any signer but
+   that key, on every chain, anvil included. A factory that an earlier
+   apply handed to a different `owner` has to be handed back before new
+   names can deploy.
 5. **CREATE3 deploys.** Every entry contract goes through
    `factory.deploy(name, creationCode)` and is verified to land on
    `predict_address(factory, name)`.
@@ -220,16 +223,14 @@ binary's contracts pin — which carries the circuits release — not of a
 network, and their addresses derive from it the same way the canonical
 table derives from its names.
 
-The `[accounts].owner` flow: the factory's genesis owner is the libID
-deployer KMS address baked into its frozen init code. `apply` needs factory
-ownership only while it has names left to `factory.deploy`; at the end of
-every run it converges ownership onto `owner`. Empty `owner` = the deployer
-— exact on real networks, where the KMS genesis admin IS the apply signer.
-A different `owner` makes apply INITIATE the Ownable2Step handover (that
-key must `acceptOwnership` itself). Local dev configs set
-`owner = <anvil #0>` explicitly, and on a dev chain (anvil/hardhat) apply
-completes the handover by impersonation, so the stack ends fully owned by
-the declared operational owner.
+The `[accounts].owner` flow: the factory's genesis owner is
+`accounts.deployer`, the apply signer. `apply` needs factory ownership only
+while it has names left to `factory.deploy`; at the end of every run it
+converges ownership onto `owner`. Empty `owner` = the deployer, exact. A
+different `owner` makes apply INITIATE the Ownable2Step handover (that key
+must `acceptOwnership` itself); on a dev chain (anvil/hardhat, detected via
+`web3_clientVersion`) apply completes the handover by impersonation, so a
+local stack ends fully owned by the declared operational owner.
 
 The notary split:
 
@@ -318,13 +319,10 @@ predates a getter the wiring reads (`plan` flags it as `WARN ... read
 failed`) converges in the same `apply --upgrade` run instead of aborting
 at the read.
 
-For anvil rehearsal, `apply --dev` (or just letting apply detect anvil)
-covers the factory-ownership wrinkle: the local signer is not the baked
-genesis admin, so apply impersonates the admin and Ownable2Step-transfers
-factory ownership to the signer for the deploys, then converges it onto
-the declared `[accounts].owner` (the anvil #0 wallet in the local dev
-configs), completing the handover by impersonation. This path is refused
-on real chains.
+For anvil rehearsal the local dev config names anvil #0 as `deployer` and
+`owner` alike, so the local signer owns the factory from genesis and no
+handover happens. A rehearsal of a handover sets a different `owner`:
+apply initiates it and, on anvil, completes it by impersonation.
 
 ## How the Apply action works
 
@@ -370,12 +368,12 @@ is and `--rpc-url` names the endpoint:
 # inside the compose network
 docker compose up -d anvil
 libid-deploy apply --network networks/local-dev.toml --yes \
-  --confirm-fresh-deploy --dev
+  --confirm-fresh-deploy
 
 # from the host, or a CI runner with a bare anvil
 anvil --host 127.0.0.1 --port 8545 &
 libid-deploy apply --network networks/local-dev.toml \
-  --rpc-url http://127.0.0.1:8545 --yes --confirm-fresh-deploy --dev
+  --rpc-url http://127.0.0.1:8545 --yes --confirm-fresh-deploy
 ```
 
 Integration tests apply the committed file, unmodified, against a real
@@ -386,9 +384,10 @@ an override that does not answer fails instead of falling back to the file.
 
 ## Adding a network
 
-Copy `networks/mainnet.toml.example` — it ships FULLY pre-filled with the
-canonical address table, which is valid on every EVM network — fill the
-input keys (chain, AWS, accounts, Notary Fee), add the name to the
+Copy `networks/mainnet.toml.example`, fill the input keys (chain, AWS,
+accounts, Notary Fee), regenerate `[contracts]` for the file's deployer with
+`plan --network <file> --print-addresses` (the template's table is anvil
+#0's), add the name to the
 `network` choice list in `apply.yml`, and create the GitHub environment of
 that name with an `RPC_URL` secret holding its endpoint: the file names
 none. Run the workflow with `mode: plan` first. The first apply on a

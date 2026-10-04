@@ -75,9 +75,7 @@ use libid_contracts::{
     deploy::deploy_contract_from,
     factory::{
         ensure_create2_deployer,
-        ensure_factory,
         predict_address,
-        predict_factory_address,
     },
     platform_verifier::{
         codehash_at,
@@ -215,11 +213,6 @@ pub struct Options {
     /// that first apply publishes the entire declared stack. With the
     /// factory present, apply converges incrementally without the flag.
     pub confirm_fresh_deploy: bool,
-    /// Dev-chain mode: allow taking factory ownership from the baked
-    /// genesis admin via impersonation. Impersonation only ever happens
-    /// when `web3_clientVersion` ALSO reports anvil/hardhat — this flag on
-    /// a real chain is a hard error, never a fallback.
-    pub dev: bool,
 }
 
 /// What an apply run did. The network file is declarative and NEVER
@@ -296,11 +289,26 @@ pub async fn run(
         );
     }
 
+    // The signer must be the declared deployer: it is the factory's genesis
+    // admin, the only key `factory.deploy` accepts, and what every canonical
+    // address in the file was predicted from.
+    let genesis = cfg.accounts.factory_genesis()?;
+    if sender != genesis.admin {
+        bail!(
+            "apply signs as {sender:#x} but accounts.deployer of '{}' is {:#x} — the \
+             signer must be the deployer key: its factory, and every address declared \
+             in {}, follow from that key",
+            cfg.network.name,
+            genesis.admin,
+            path.display()
+        );
+    }
+
     let artifacts = Artifacts::embedded();
     let notary_signer = required_address(&cfg.accounts.notary, "accounts.notary")?;
     let notary_fee = cfg.notary_service.fee()?;
     // The operational owner the factory should END up with; defaults to
-    // the deployer (on real networks the KMS genesis admin IS the deployer).
+    // the deployer.
     let operational_owner = cfg.accounts.owner_address()?.unwrap_or(sender);
 
     let mut summary = Summary::default();
@@ -308,7 +316,7 @@ pub async fn run(
     // ── Step 0: the deterministic-deployment substrate ────────────────────
     // The keyless CREATE2 deployer and the LibidFactory are the hard
     // onboarding gate: a chain that cannot host them cannot host the stack.
-    let predicted_factory = predict_factory_address(&artifacts)?;
+    let predicted_factory = genesis.address(&artifacts)?;
     let factory_was_present = code_present(&provider, predicted_factory).await?;
 
     // The fresh-deploy guard keys on CHAIN STATE, not config emptiness: a
@@ -329,7 +337,7 @@ pub async fn run(
     ensure_create2_deployer(&provider)
         .await
         .context("the canonical CREATE2 deployer is the onboarding gate")?;
-    let libid_factory = ensure_factory(&provider, &artifacts).await?;
+    let libid_factory = genesis.ensure(&provider, &artifacts).await?;
 
     // CANARY: after any install the factory must sit at exactly the
     // predicted address. A mismatch (or missing code) means the chain does
@@ -380,8 +388,8 @@ pub async fn run(
     let jwt_roots_present = code_present(&provider, jwt_roots).await?;
 
     // Does anything need `factory.deploy` (owner-gated)? Only then must the
-    // apply signer own the factory. On real networks the signer IS the KMS
-    // genesis owner; on dev chains ownership is impersonation-transferred.
+    // apply signer own the factory: it does from genesis, unless an earlier
+    // apply handed the factory to a different operational owner.
     let mut needs_factory_deploy = !(notary_service_present
         && proof_verifier_present
         && identity_registry_present
@@ -398,7 +406,7 @@ pub async fn run(
         needs_factory_deploy |= !code_present(&provider, predicted).await?;
     }
     if needs_factory_deploy {
-        ensure_factory_ownership(&provider, libid_factory, sender, opts.dev).await?;
+        ensure_factory_ownership(&provider, libid_factory, sender).await?;
     }
 
     // ── 1. The Notary Service: everything else takes its proxy address ───
@@ -877,17 +885,14 @@ async fn detect_dev_client<P: Provider>(provider: &P) -> Result<(bool, String)> 
 /// - Signer already the owner: nothing to do.
 /// - Signer is the pending owner (an interrupted Ownable2Step handover):
 ///   `acceptOwnership`.
-/// - Otherwise, ONLY on a dev chain (anvil/hardhat, confirmed via
-///   `web3_clientVersion` regardless of the `--dev` flag): impersonate the
-///   current owner (the baked genesis admin nobody holds a dev key for) and
-///   Ownable2Step-transfer ownership to the signer. On any other chain this
-///   is a hard error: the apply signer must BE the factory owner — the
-///   libID deployer KMS key.
+/// - Otherwise a hard error: the signer is the deployer, the factory's
+///   genesis admin, so another owner means an earlier apply handed the
+///   factory to a different `accounts.owner`, and that key has to hand it
+///   back before anything new can deploy.
 async fn ensure_factory_ownership<P: Provider>(
     provider: &P,
     factory: Address,
     sender: Address,
-    dev_requested: bool,
 ) -> Result<()> {
     let contract = LibidFactory::new(factory, provider);
     let owner = contract
@@ -913,68 +918,11 @@ async fn ensure_factory_ownership<P: Provider>(
         info!("factory ownership accepted: {owner:#x} -> {sender:#x}");
         return Ok(());
     }
-
-    let (is_dev, version) = detect_dev_client(provider).await?;
-    if !is_dev {
-        if dev_requested {
-            bail!(
-                "--dev was passed but the RPC client is '{version}', not \
-                 anvil/hardhat — refusing to impersonate the factory owner on \
-                 what looks like a real chain"
-            );
-        }
-        bail!(
-            "the factory at {factory:#x} is owned by {owner:#x} but apply signs \
-             as {sender:#x}. factory.deploy is owner-gated: on real networks the \
-             apply signer must BE the factory owner (the libID deployer KMS \
-             key). Impersonation is only available on dev chains (anvil/hardhat)."
-        );
-    }
-
-    // Dev chain: impersonate the current owner and hand ownership over,
-    // exactly the pattern libid-contracts' own anvil test uses.
-    info!(
-        "dev chain ({version}): impersonating the factory owner {owner:#x} to \
-         transfer ownership to {sender:#x}"
-    );
-    provider
-        .raw_request::<_, serde_json::Value>(
-            "anvil_setBalance".into(),
-            (owner, "0xde0b6b3a7640000"),
-        )
-        .await
-        .map_err(|e| anyhow!("anvil_setBalance failed: {e}"))?;
-    provider
-        .raw_request::<_, serde_json::Value>("anvil_impersonateAccount".into(), (owner,))
-        .await
-        .map_err(|e| anyhow!("anvil_impersonateAccount failed: {e}"))?;
-    let transfer = LibidFactory::transferOwnershipCall { newOwner: sender }.abi_encode();
-    provider
-        .raw_request::<_, serde_json::Value>(
-            "eth_sendTransaction".into(),
-            (serde_json::json!({
-                "from": owner,
-                "to": factory,
-                "data": Bytes::from(transfer),
-            }),),
-        )
-        .await
-        .map_err(|e| anyhow!("impersonated transferOwnership failed: {e}"))?;
-    provider
-        .raw_request::<_, serde_json::Value>(
-            "anvil_stopImpersonatingAccount".into(),
-            (owner,),
-        )
-        .await
-        .map_err(|e| anyhow!("anvil_stopImpersonatingAccount failed: {e}"))?;
-    send_with_nonce_retry!(
-        contract.acceptOwnership(),
-        "LibidFactory.acceptOwnership",
-        provider,
-        sender
-    )?;
-    info!("factory ownership transferred (dev): {owner:#x} -> {sender:#x}");
-    Ok(())
+    bail!(
+        "the factory at {factory:#x} is owned by {owner:#x} but apply signs as \
+         {sender:#x}. factory.deploy is owner-gated and the deployer is its genesis \
+         admin, so that owner must transferOwnership back to the deployer first"
+    )
 }
 
 /// CREATE3-deploy `creation_code` under `name` through the factory, with an

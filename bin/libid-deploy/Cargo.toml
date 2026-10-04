@@ -1,6 +1,6 @@
 [package]
 name = "libid-deploy"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 rust-version = "1.94.1"
 license = "MIT OR Apache-2.0"
@@ -9,7 +9,7 @@ description = "Applies per-network declarative configuration to chains: every ca
 publish = false
 
 [dependencies]
-libid-contracts = "0.16.0"
+libid-contracts = "0.17.0"
 # The handle transform's generated table: platform keys (whose keccak256 is
 # the on-chain platform id) and the normalization rules `setPlatform` stores.
 # Retyping either here would hash handles to nodes no deployed reader looks

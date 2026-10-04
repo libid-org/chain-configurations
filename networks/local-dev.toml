@@ -9,11 +9,11 @@
 #
 #   docker compose up -d anvil
 #   libid-deploy apply --network networks/local-dev.toml --yes \
-#     --confirm-fresh-deploy --dev
+#     --confirm-fresh-deploy
 #
 #   anvil --host 127.0.0.1 --port 8545 &
 #   libid-deploy apply --network networks/local-dev.toml \
-#     --rpc-url http://127.0.0.1:8545 --yes --confirm-fresh-deploy --dev
+#     --rpc-url http://127.0.0.1:8545 --yes --confirm-fresh-deploy
 #
 # Anvil ships the CREATE2 deployer predeployed, so the factory bootstrap is
 # one transaction; start it with `--disable-default-create2-deployer` to
@@ -49,14 +49,16 @@ kms_deployer = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 
 # The ADDRESSES OF KEYS, not contracts.
 [accounts]
+# Anvil account #0, the address of the key above: the factory's genesis
+# admin, so every address under [contracts] follows from it.
+deployer = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 # Anvil account #1. Separate from the deployer on purpose: the notary
 # signer and the contract owner are different roles, and a local stack that
 # collapses them hides a wiring mistake that a real deployment would show.
 notary = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
-# Anvil account #0 — the same identity as the deployer above, named
-# explicitly so the ownership handover is exercised rather than defaulted.
-# On a dev chain apply completes the Ownable2Step acceptance by
-# impersonation, so the stack ends fully owned.
+# Anvil account #0 — the deployer, named explicitly. A different owner
+# would make apply start the Ownable2Step handover; on a dev chain it
+# completes the acceptance by impersonation, so the stack ends fully owned.
 owner = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 
 [notary_service]
@@ -69,17 +71,17 @@ fee_wei = "1000000000000000"
 # this one included. Do not hand-edit; regenerate with
 # `libid-deploy plan --print-addresses`.
 [contracts]
-factory = "0xa92244c3f4462aad08bd1a33c3940b9b936321ad"
-notary_service = "0xbb5871167b0128939cab6850877981421e8dcbf5"
-ceremony_proof_verifier = "0x76bdc18f21c2db0ff796c7cc50348528b2899275"
-identity_registry = "0x0531b83b010a6b0c24c2c2c1a6beecc90cc71366"
+factory = "0x49852bc32a52a5cb5cdda135d1b244f5f5d57226"
+notary_service = "0x562ff3231d8d3f8b0615914186e858c7cbfc2994"
+ceremony_proof_verifier = "0xbf95e2ecad436a807f3204ac4cf388f3fa7b7b77"
+identity_registry = "0x105b32e3daa9fda3572e89992c73b85a8a1065b3"
 # Initialized with identity_registry above, which it resolves every handle
 # through for life: no setter moves it.
-handle_escrow = "0xf7e3ad279f913ffe2ef74614e3046c15cbdabb9a"
-google_jwt_roots = "0xb7a2ce28e71dbb9c877d2b5a48de33b5f0e6838d"
-x_platform_verifier = "0xcfc880f62f2744dc000687edf47a98b585d9eb35"
-github_platform_verifier = "0xac878389da7a1b58826182da0d8b4cae5e6e4178"
-google_platform_verifier = "0xf3d537022362d187715b28bc547f8b2532e6d0cf"
+handle_escrow = "0xcd1fb9627c011cce322dabfcbcb4a09f66b26432"
+google_jwt_roots = "0x70580b148be716ad86da3f94243c9a8f3d5768bc"
+x_platform_verifier = "0x2a529253505b724a2ebd284ad40fcde5cc1dd5a7"
+github_platform_verifier = "0x12126c434c906ae8fc9731a96845bbf7bb679b9b"
+google_platform_verifier = "0xc32fca530bfe3c7f54bcb69cec8d965d4a52c73d"
 
 # The ceremony circuit verifiers are NOT declared here. `libid-deploy`
 # carries them: `libid-contracts` embeds each circuit's bb-generated
