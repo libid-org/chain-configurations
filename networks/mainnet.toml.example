@@ -36,13 +36,21 @@ kms_deployer = ""
 # adds it when it is missing. Dropping an outgoing key is a separate
 # governance call, so a rotation can overlap.
 #
-# `owner` is the OPERATIONAL OWNER the factory should end up with. On real
-# networks this is the KMS genesis admin — the libID deployer key baked
-# into the factory's frozen init code, i.e. the SAME identity as the apply
-# signer — so leaving it empty (= default to the deployer) is exact. Set it
-# only to hand the factory to a different key: apply then INITIATES the
-# Ownable2Step transfer and that key must acceptOwnership itself.
+# `deployer` is the address `kms_deployer` derives to: the genesis admin baked
+# into the factory's init code, so the whole `[contracts]` table below follows
+# from it. The placeholder is anvil account #0, and the table below is ITS
+# table; set the real deployer, then regenerate the table with
+# `plan --network <this file> --print-addresses`. Mainnet's deployer is its
+# own key (the libid-mainnet AWS account), so mainnet's table differs from
+# testnet's.
+#
+# `owner` is the OPERATIONAL OWNER the factory should end up with. The
+# deployer owns it from genesis and is the apply signer, so leaving it empty
+# (= default to the deployer) is exact. Set it only to hand the factory to a
+# different key: apply then INITIATES the Ownable2Step transfer and that key
+# must acceptOwnership itself.
 [accounts]
+deployer = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 notary = ""
 owner = ""
 
@@ -53,9 +61,11 @@ owner = ""
 # apply send `setFee`.
 fee_wei = "0"
 
-# DECLARED canonical addresses — identical on every EVM network; validated
-# to equal predict_address(factory, name). Do not edit: a different value
-# is a validation error naming the expected one.
+# DECLARED canonical addresses — the deployer's table, identical on every
+# EVM network that deployer deploys to; validated to equal
+# predict_address(factory, name). Do not hand-edit: regenerate with
+# `plan --print-addresses` after setting `accounts.deployer`; a different
+# value is a validation error naming the expected one.
 #
 # `factory` is the deterministic LibidFactory proxy (CREATE2, frozen init
 # code). `notary_service` is the Notary Service PROXY — the one place a
@@ -68,15 +78,15 @@ fee_wei = "0"
 # `google_jwt_roots` starts EMPTY on-chain — point a keeper at it, or every
 # Google binding reverts UntrustedModulus().
 [contracts]
-factory = "0xa92244c3f4462aad08bd1a33c3940b9b936321ad"
-notary_service = "0xbb5871167b0128939cab6850877981421e8dcbf5"
-ceremony_proof_verifier = "0x76bdc18f21c2db0ff796c7cc50348528b2899275"
-identity_registry = "0x0531b83b010a6b0c24c2c2c1a6beecc90cc71366"
-handle_escrow = "0xf7e3ad279f913ffe2ef74614e3046c15cbdabb9a"
-google_jwt_roots = "0xb7a2ce28e71dbb9c877d2b5a48de33b5f0e6838d"
-x_platform_verifier = "0xcfc880f62f2744dc000687edf47a98b585d9eb35"
-github_platform_verifier = "0xac878389da7a1b58826182da0d8b4cae5e6e4178"
-google_platform_verifier = "0xf3d537022362d187715b28bc547f8b2532e6d0cf"
+factory = "0x49852bc32a52a5cb5cdda135d1b244f5f5d57226"
+notary_service = "0x562ff3231d8d3f8b0615914186e858c7cbfc2994"
+ceremony_proof_verifier = "0xbf95e2ecad436a807f3204ac4cf388f3fa7b7b77"
+identity_registry = "0x105b32e3daa9fda3572e89992c73b85a8a1065b3"
+handle_escrow = "0xcd1fb9627c011cce322dabfcbcb4a09f66b26432"
+google_jwt_roots = "0x70580b148be716ad86da3f94243c9a8f3d5768bc"
+x_platform_verifier = "0x2a529253505b724a2ebd284ad40fcde5cc1dd5a7"
+github_platform_verifier = "0x12126c434c906ae8fc9731a96845bbf7bb679b9b"
+google_platform_verifier = "0xc32fca530bfe3c7f54bcb69cec8d965d4a52c73d"
 
 # The ceremony circuit verifiers are NOT declared here. `libid-deploy`
 # carries them: `libid-contracts` embeds each circuit's bb-generated

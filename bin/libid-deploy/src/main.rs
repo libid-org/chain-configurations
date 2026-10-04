@@ -65,9 +65,10 @@ enum Command {
         /// Emit the plan as JSON instead of the human rendering.
         #[arg(long)]
         json: bool,
-        /// Print the canonical predicted address table (network-invariant,
-        /// computed offline — works before the chain even exists) and exit
-        /// without contacting the RPC. For config pre-fill.
+        /// Print the file's deployer's canonical address table (computed
+        /// offline from `accounts.deployer` — works before the chain even
+        /// exists, and before `[contracts]` is filled in) and exit without
+        /// contacting the RPC. For config pre-fill.
         #[arg(long, conflicts_with = "rpc_url")]
         print_addresses: bool,
         #[command(flatten)]
@@ -102,11 +103,6 @@ enum Command {
         /// With the factory present, apply converges incrementally.
         #[arg(long)]
         confirm_fresh_deploy: bool,
-        /// Dev-chain mode: allow taking factory ownership from the baked
-        /// genesis admin by impersonation. Only honoured when the RPC's
-        /// web3_clientVersion reports anvil/hardhat; a real chain refuses.
-        #[arg(long)]
-        dev: bool,
     },
 }
 
@@ -166,7 +162,9 @@ async fn main() -> Result<()> {
             rpc,
         } => {
             if print_addresses {
-                print!("{}", libid_deploy::names::render_address_table()?);
+                let genesis =
+                    NetworkConfig::read(&network)?.accounts.factory_genesis()?;
+                print!("{}", libid_deploy::names::render_address_table(genesis)?);
                 return Ok(());
             }
             let cfg = NetworkConfig::load(&network)?;
@@ -185,7 +183,6 @@ async fn main() -> Result<()> {
             upgrade,
             yes,
             confirm_fresh_deploy,
-            dev,
         } => {
             let cfg = NetworkConfig::load(&network)?;
             let rpc = RpcEndpoint::resolve(&cfg, rpc.rpc_url.as_deref())?;
@@ -211,7 +208,6 @@ async fn main() -> Result<()> {
             let opts = apply::Options {
                 upgrades: upgrade,
                 confirm_fresh_deploy,
-                dev,
             };
             let summary = apply::run(&network, &cfg, &rpc, &signer, &opts).await?;
             print!("{}", summary.render());

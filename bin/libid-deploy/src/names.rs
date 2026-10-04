@@ -2,8 +2,9 @@
 //!
 //! Every top-level (entry) contract is deployed through the deterministic
 //! `LibidFactory` via CREATE3 with `salt = keccak256(name)`, so its address
-//! is a pure function of the name: the same on every EVM network,
-//! computable before anything is deployed.
+//! is a pure function of the factory's deployer and the name: the same on
+//! every EVM network that deployer deploys to, computable before anything
+//! is deployed.
 //!
 //! CRITICAL: renaming an entry here = a NEW address, forever, on every
 //! network. Names are append-only; a name already deployed on any real
@@ -18,7 +19,10 @@
 //! its verification key: a new circuits release must be a new address,
 //! not a silent replacement. Neither is declared in a network file.
 
-use libid_contracts::factory::predict_address;
+use libid_contracts::factory::{
+    predict_address,
+    FactoryGenesis,
+};
 
 /// One canonical (factory-deployed) contract.
 #[derive(Debug, Clone, Copy)]
@@ -100,22 +104,21 @@ pub fn canonical_name(key: &str) -> Option<&'static str> {
         .map(|c| c.name)
 }
 
-/// Render the full network-invariant address table: the CREATE2 deployer,
-/// the factory, and every canonical contract. Pure computation — no RPC.
-pub fn render_address_table() -> anyhow::Result<String> {
+/// Render the full address table of one deployer: the CREATE2 deployer, the
+/// factory, and every canonical contract. The same on every EVM chain that
+/// deployer deploys to. Pure computation — no RPC.
+pub fn render_address_table(genesis: FactoryGenesis) -> anyhow::Result<String> {
     use std::fmt::Write;
 
-    use libid_contracts::factory::{
-        predict_factory_address,
-        CREATE2_DEPLOYER,
-    };
+    use libid_contracts::factory::CREATE2_DEPLOYER;
 
     let artifacts = libid_contracts::Artifacts::embedded();
-    let factory = predict_factory_address(&artifacts)?;
+    let factory = genesis.address(&artifacts)?;
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "Canonical addresses (network-invariant — the same on every EVM chain):"
+        "Canonical addresses of deployer {:#x} (the same on every EVM chain it deploys to):",
+        genesis.admin
     );
     let _ = writeln!(
         out,
@@ -136,7 +139,7 @@ pub fn render_address_table() -> anyhow::Result<String> {
             c.name
         );
     }
-    // Not declared in any network file, but just as network-invariant: an
+    // Not declared in any network file, but just as deterministic: an
     // operator reading this table is reading every address apply will land
     // on. The verifiers go through the same factory, under a name carrying
     // the circuits release.

@@ -40,7 +40,7 @@ use libid_contracts::{
     },
     factory::{
         predict_address,
-        predict_factory_address,
+        FactoryGenesis,
         CREATE2_DEPLOYER,
     },
     Artifacts,
@@ -217,7 +217,7 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
 
     // ── The onboarding gate ──────────────────────────────────────────────
     let artifacts = Artifacts::embedded();
-    let predicted_factory = predict_factory_address(&artifacts)?;
+    let predicted_factory = cfg.accounts.factory_genesis()?.address(&artifacts)?;
     let deployer_present = !provider
         .get_code_at(CREATE2_DEPLOYER)
         .await
@@ -734,11 +734,11 @@ async fn plan_factory_records<P: Provider>(
     }
 }
 
-/// The canonical address a component would land at — the prediction the
-/// declarative table is built from.
-pub fn predicted(key: &str) -> Result<Address> {
+/// The canonical address a component would land at under `genesis`'s
+/// factory — the prediction the declarative table is built from.
+pub fn predicted(genesis: FactoryGenesis, key: &str) -> Result<Address> {
     let artifacts = Artifacts::embedded();
-    let factory = predict_factory_address(&artifacts)?;
+    let factory = genesis.address(&artifacts)?;
     let name = names::canonical_name(key)
         .ok_or_else(|| anyhow!("{key} is not a canonical contract"))?;
     Ok(predict_address(factory, name))

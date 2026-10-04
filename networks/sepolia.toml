@@ -30,16 +30,22 @@ chain_id = 11155111
 
 [aws]
 region = "eu-central-1"
-# The deployer's KMS key: eden-testnet's, and necessarily so. It is the FACTORY
-# GENESIS ADMIN: this alias derives to 0x5bb76b0f81f028de363150602cc6d0ca929e3c31,
-# the address baked into the factory's frozen init code (FactoryGenesis.sol).
-# `factory.deploy` is owner-gated and impersonation is refused on real chains,
-# so no other key can perform this apply. It pays Sepolia ETH for gas: a fresh
-# deploy of the whole stack is 29 transactions and about 31.4M gas.
-kms_deployer = "alias/dyaka-testnet-deployer"
+# The deployer's KMS key: eden-testnet's, in the libid-testnet AWS account, and
+# necessarily so — one testnet deployer means one factory address and one table
+# on both networks. It is the factory's genesis admin: this alias derives to
+# accounts.deployer below, the address baked into the factory's init code, and
+# `factory.deploy` is owner-gated, so no other key can perform this apply. It
+# pays Sepolia ETH for gas: a fresh deploy of the whole stack is 29 transactions
+# and about 31.4M gas.
+kms_deployer = "alias/libid-testnet-deployer"
 
 # The ADDRESSES OF KEYS, not contracts.
 [accounts]
+# The deployer, the address of aws.kms_deployer: the genesis admin of the
+# factory, which every address under [contracts] is predicted from. The
+# testnet deployer lives in the libid-testnet AWS account, so testnet has its
+# own factory and its own table, apart from mainnet's.
+deployer = "0xdaeb247f5a90c53f2d7a80a81f6cb6acb0d8b907"
 # The notary SIGNER — the identity whose attestations the whole stack accepts.
 # The identity notary at testnet.notary.lib.id signs with this key for
 # eden-testnet as well: an attestation names no chain, so one notary serves
@@ -48,7 +54,7 @@ kms_deployer = "alias/dyaka-testnet-deployer"
 # separate governance call on purpose: the service holds a SET so a rotation
 # can overlap, and which key to stop trusting is not something this file can
 # say.
-notary = "0x7a3646e8431a4b0c8bb586a7d26d7da7ae4aa2b5"
+notary = "0x569ae51d9c356f838c2811389a932b681cb6491c"
 
 # The operational owner the factory ends up with. Empty = the deployer, which
 # on this network IS the KMS genesis admin, so the default is exact.
@@ -66,21 +72,21 @@ fee_wei = "100000000000000"
 
 # OUTPUT: the canonical contract addresses. Do not hand-edit.
 [contracts]
-factory = "0xa92244c3f4462aad08bd1a33c3940b9b936321ad"
-notary_service = "0xbb5871167b0128939cab6850877981421e8dcbf5"
-ceremony_proof_verifier = "0x76bdc18f21c2db0ff796c7cc50348528b2899275"
-identity_registry = "0x0531b83b010a6b0c24c2c2c1a6beecc90cc71366"
+factory = "0x9dbf2b5f96cb31a48cca4e25d2c8348be414ebc8"
+notary_service = "0xa773ec5e7500d1c87827ab1b899bbd992c1b5931"
+ceremony_proof_verifier = "0xa795b14a2e09daf273bc6971058b0462c7d6be42"
+identity_registry = "0x25f29c8c765db2f27d1e2b23987a7b0655c7d640"
 # Initialized with identity_registry above, which it resolves every handle
 # through for life: no setter moves it.
-handle_escrow = "0xf7e3ad279f913ffe2ef74614e3046c15cbdabb9a"
+handle_escrow = "0x57355e1d1bcf61fec9b2e5cad60dcccdddc4d8e5"
 # Deploys EMPTY. Until a keeper lands a notarized reading of Google's live JWKS,
 # every Google binding reverts with UntrustedModulus(). The deployment repo runs
 # the keeper hourly against this network too; the first tick has to be run
 # deliberately, right after this apply.
-google_jwt_roots = "0xb7a2ce28e71dbb9c877d2b5a48de33b5f0e6838d"
-x_platform_verifier = "0xcfc880f62f2744dc000687edf47a98b585d9eb35"
-github_platform_verifier = "0xac878389da7a1b58826182da0d8b4cae5e6e4178"
-google_platform_verifier = "0xf3d537022362d187715b28bc547f8b2532e6d0cf"
+google_jwt_roots = "0x8a14a5dda7662f88a5448b9b8b2ca9f1d5742904"
+x_platform_verifier = "0x9f655c2fe778260d90f3202d97da0a46510aa3d0"
+github_platform_verifier = "0xb5fdf35eedf7c849f3d1e41675d8b8a41487e248"
+google_platform_verifier = "0x5cfb807545e0e2ce4d7dac7d97ab0583e3fbe1c6"
 
 # The ceremony circuit verifiers are NOT declared here. `libid-deploy`
 # carries them: `libid-contracts` embeds each circuit's bb-generated
