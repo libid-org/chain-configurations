@@ -58,9 +58,12 @@ notary = "0xcb5bf326745666041f57af74c27a43da822081c1"
 owner = ""
 
 [notary_service]
-# What one attestation verification costs, in wei. Zero until a mainnet price
-# is chosen; editing it makes apply send `setFee`.
-fee_wei = "0"
+# What one attestation verification costs, in wei: 0.00018 ETH, about $0.50 at
+# $2,718 per ETH (2026-10-05). A TLSNotary profile carries two attestations,
+# so an X or GitHub binding pays 0.00036 ETH; Google's carries none. The fee
+# accrues in the Notary Service until its owner withdraws it. Editing it makes
+# apply send `setFee`.
+fee_wei = "180000000000000"
 
 # DECLARED canonical addresses — the mainnet deployer's table, identical on
 # every EVM network that deployer deploys to; validated to equal
