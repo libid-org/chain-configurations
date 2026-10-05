@@ -34,7 +34,7 @@ on:
         # A network's FIRST apply needs confirm_fresh_deploy: the factory
         # is virgin on that chain. local-dev is deliberately absent: it has
         # no KMS key and its chain exists only inside a CI run.
-        options: [eden-testnet, sepolia]
+        options: [eden-testnet, sepolia, ethereum]
         default: eden-testnet
       mode:
         description: "plan is read-only; apply sends transactions"

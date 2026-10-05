@@ -163,6 +163,21 @@ forever, on every network — names are frozen. The testnet table, deployer
 | `contracts.github_platform_verifier` | `libid.GitHubPlatformVerifier` | `0xb5fdf35eedf7c849f3d1e41675d8b8a41487e248` |
 | `contracts.google_platform_verifier` | `libid.GooglePlatformVerifier` | `0x5cfb807545e0e2ce4d7dac7d97ab0583e3fbe1c6` |
 
+The mainnet table, deployer `0x7e00d33b5c571ca2b2879309c4846ddd80f4128e`
+(Ethereum, `networks/ethereum.toml`):
+
+| Config key | Address (mainnet) |
+|---|---|
+| `contracts.factory` | `0xb7432c991be3167689d5e80c9e2bf1ff5cccd2e0` |
+| `contracts.notary_service` | `0x2feee7c87bec78853afc223135735d4786e75177` |
+| `contracts.ceremony_proof_verifier` | `0x36e6d6cf465cb9f0615ceb0fc37ef30927dac66e` |
+| `contracts.identity_registry` | `0xbefd300aff7d4a67fb381afe8b3596793d3e9a83` |
+| `contracts.handle_escrow` | `0x17a244e23ef1f12071298a1862194fea3d00bbf7` |
+| `contracts.google_jwt_roots` | `0x1f3d9b49efde0c12ed2ffeab67165ebe0c97517a` |
+| `contracts.x_platform_verifier` | `0x61d79debf1b7e512ae8b305ba76c6f82f4609142` |
+| `contracts.github_platform_verifier` | `0xdd7d34f2302bc2ccac36bdcec5fdafe0ca91f888` |
+| `contracts.google_platform_verifier` | `0x727f4a1c9040a94ca27f74667c70d1c2951a0b5a` |
+
 The circuit verifiers go through the same factory but are not in that
 table and not in any network file: their names carry the circuits release
 `libid-contracts` vendors, so they move when the contracts pin does. At
@@ -172,6 +187,9 @@ table and not in any network file: their names carry the circuits release
 |---|---|---|
 | `circuits.bearer-link` | `libid.circuits.bearer-link.0.6.0` | `0xb152321148f37c13147f4313a82c72d4e1a95d14` |
 | `circuits.oidc-google` | `libid.circuits.oidc-google.0.6.0` | `0x5301b6c527410565c82dff20b44a71c3e1d151b2` |
+
+On mainnet they are `0x8bcd52dd0f75c0936f00c40ab78fb9430df50d91` and
+`0x14b342b4faf09f0462bbd611906d33622e33fdfc`.
 
 `plan --print-addresses` prints all of them together with the canonical
 table.
