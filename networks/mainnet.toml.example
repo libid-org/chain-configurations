@@ -1,7 +1,7 @@
 # Mainnet — TEMPLATE. Copy to <network>.toml and fill the INPUT keys (chain,
 # AWS, accounts, Notary Fee); the endpoint is the `RPC_URL` secret of the
-# GitHub environment named after the file, never this file. The address keys are ALREADY
-# final:
+# GitHub environment named after the file, never this file. The address keys
+# are ALREADY final:
 # every canonical contract deploys through the deterministic LibidFactory
 # via CREATE3, so its address is a pure function of its frozen name — the
 # same on every EVM network, known before the chain has anything on it.

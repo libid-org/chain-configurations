@@ -75,7 +75,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # A GitHub Environment protection rule on a production network (e.g.
-    # `mainnet`) is what gates an apply behind a human approval. Configure
+    # `ethereum`) is what gates an apply behind a human approval. Configure
     # required reviewers there; this workflow deliberately does not
     # implement its own approval gate.
     environment:
