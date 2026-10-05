@@ -1,0 +1,88 @@
+# Ethereum mainnet — desired state for the libid identity stack.
+#
+# Every address under [contracts] is CANONICAL: each entry deploys through
+# LibidFactory via CREATE3 with `salt = keccak256(canonical name)`, so an address
+# depends only on the contract's name and the factory's genesis admin — not its
+# bytecode, not its constructor arguments, not which chain it is on. `validate`
+# enforces that equality offline. Regenerate the table with
+# `libid-deploy plan --print-addresses`, never by hand.
+#
+# The first apply needs `confirm_fresh_deploy: true` while the factory is not yet
+# deployed here; that guard reads chain state, not this file.
+#
+# HOW TO READ THIS FILE
+#
+# Every value here is public: contract addresses, accounts, the fee. The
+# endpoint is not here: it is the `RPC_URL` secret of the `ethereum` GitHub
+# environment (`--rpc-url` on a host), whose required reviewers gate every
+# apply. The other secret in the flow is the KMS key, which never leaves AWS.
+#
+# INPUT keys describe what should exist: the accounts the contracts trust and the
+# Notary Fee. You edit these.
+#
+# OUTPUT keys are everything under [contracts]. They are pre-filled and
+# declarative: `apply` reads chain state to decide what is missing and NEVER
+# rewrites this file.
+
+[network]
+name = "ethereum"
+chain_id = 1
+
+[aws]
+region = "eu-central-1"
+# The mainnet deployer's KMS key, in the libid-mainnet AWS account. It is the
+# factory's genesis admin: this alias derives to accounts.deployer below, the
+# address baked into the factory's init code, and `factory.deploy` is
+# owner-gated, so no other key can perform this apply. It pays ETH for gas: a
+# fresh deploy of the whole stack is 29 transactions and about 31.4M gas.
+kms_deployer = "alias/libid-mainnet-deployer"
+
+# The ADDRESSES OF KEYS, not contracts.
+[accounts]
+# The deployer, the address of aws.kms_deployer: the genesis admin of the
+# factory, which every address under [contracts] is predicted from. Mainnet's
+# deployer is its own key, so mainnet has its own factory and its own table,
+# apart from testnet's.
+deployer = "0x7e00d33b5c571ca2b2879309c4846ddd80f4128e"
+# The notary SIGNER — the identity whose attestations the whole stack accepts:
+# alias/libid-mainnet-notary, the key of the mainnet notary. `apply`
+# initializes the Notary Service with this key and adds it to the trusted set
+# when it is missing. Dropping an outgoing key is a separate governance call:
+# the service holds a SET so a rotation can overlap.
+notary = "0xcb5bf326745666041f57af74c27a43da822081c1"
+
+# The operational owner the factory ends up with. Empty = the deployer, which
+# on this network IS the KMS genesis admin, so the default is exact.
+owner = ""
+
+[notary_service]
+# What one attestation verification costs, in wei. Zero until a mainnet price
+# is chosen; editing it makes apply send `setFee`.
+fee_wei = "0"
+
+# DECLARED canonical addresses — the mainnet deployer's table, identical on
+# every EVM network that deployer deploys to; validated to equal
+# predict_address(factory, name).
+#
+# `handle_escrow` is initialized with `identity_registry` and resolves every
+# handle through it for life: no setter moves it.
+#
+# `google_jwt_roots` starts EMPTY on-chain — point a keeper at it, or every
+# Google binding reverts UntrustedModulus().
+[contracts]
+factory = "0xb7432c991be3167689d5e80c9e2bf1ff5cccd2e0"
+notary_service = "0x2feee7c87bec78853afc223135735d4786e75177"
+ceremony_proof_verifier = "0x36e6d6cf465cb9f0615ceb0fc37ef30927dac66e"
+identity_registry = "0xbefd300aff7d4a67fb381afe8b3596793d3e9a83"
+handle_escrow = "0x17a244e23ef1f12071298a1862194fea3d00bbf7"
+google_jwt_roots = "0x1f3d9b49efde0c12ed2ffeab67165ebe0c97517a"
+x_platform_verifier = "0x61d79debf1b7e512ae8b305ba76c6f82f4609142"
+github_platform_verifier = "0xdd7d34f2302bc2ccac36bdcec5fdafe0ca91f888"
+google_platform_verifier = "0x727f4a1c9040a94ca27f74667c70d1c2951a0b5a"
+
+# The ceremony circuit verifiers are NOT declared here. `libid-deploy`
+# carries them: `libid-contracts` embeds each circuit's bb-generated
+# UltraHonk verifier from the libid-circuits release it pins, and apply
+# deploys it through the factory under a CREATE3 name carrying that
+# release and reads its code hash off the chain for the Platform Verifier
+# to pin.
