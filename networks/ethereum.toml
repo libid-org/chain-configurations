@@ -15,7 +15,8 @@
 # Every value here is public: contract addresses, accounts, the fee. The
 # endpoint is not here: it is the `RPC_URL` secret of the `ethereum` GitHub
 # environment (`--rpc-url` on a host), whose required reviewers gate every
-# apply. The other secret in the flow is the KMS key, which never leaves AWS.
+# apply, admins included. The other secret in the flow is the KMS key, which
+# never leaves AWS.
 #
 # INPUT keys describe what should exist: the accounts the contracts trust and the
 # Notary Fee. You edit these.
@@ -34,7 +35,8 @@ region = "eu-central-1"
 # factory's genesis admin: this alias derives to accounts.deployer below, the
 # address baked into the factory's init code, and `factory.deploy` is
 # owner-gated, so no other key can perform this apply. It pays ETH for gas: a
-# fresh deploy of the whole stack is 29 transactions and about 31.4M gas.
+# fresh deploy of the whole stack is 27 transactions and about 31.3M gas, the
+# keyless CREATE2 deployer being already on Ethereum.
 kms_deployer = "alias/libid-mainnet-deployer"
 
 # The ADDRESSES OF KEYS, not contracts.

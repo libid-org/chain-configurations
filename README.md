@@ -181,7 +181,7 @@ The mainnet table, deployer `0x7e00d33b5c571ca2b2879309c4846ddd80f4128e`
 The circuit verifiers go through the same factory but are not in that
 table and not in any network file: their names carry the circuits release
 `libid-contracts` vendors, so they move when the contracts pin does. At
-`libid-circuits` 0.6.0 (`libid-contracts` 0.16.0) they are
+`libid-circuits` 0.6.0 (`libid-contracts` 0.17.0) they are
 
 | Component | Name | Address (testnet) |
 |---|---|---|
