@@ -9,22 +9,19 @@
 //!
 //! # The verifier: CREATE3, under a name carrying the circuits release
 //!
-//! `PlatformVerifierBase._setTrustRoots` pins the verifier a platform's
-//! proofs are checked under BY ADDRESS AND BY CODE HASH: it reads
-//! `address(honkVerifier_).codehash` and refuses a value that does not
-//! match the hash the caller named, and refuses the empty and zero hashes
-//! outright. A bb verifier embeds its verification key as code constants
-//! and exposes no getter, so the code hash is the only handle on which
-//! circuit a deployed verifier answers for.
+//! Each Platform Verifier implementation compiles in the runtime code hash
+//! of its circuit's verifier (`circuitCodehash()`), and `initialize`,
+//! `setTrustRoots` and `verify` revert `WrongCircuit` for any other code.
+//! A bb verifier embeds its verification key as code constants, so the
+//! code hash is the only handle on which circuit a deployed verifier
+//! answers for.
 //!
-//! Apply therefore deploys the verifier itself and reads the hash back off
-//! the chain. The verifier goes through the factory under [`factory_name`]
-//! — a CREATE3 name carrying the circuit and the circuits release the
-//! crate vendors — so its address is a pure function of which artifact it
-//! is: a converged chain is recognised without a redeploy, and a circuits
-//! release is a new name, a new address and a `setTrustRoots`. The verifier
-//! is one self-contained contract, so its code hash, the one the Platform
-//! Verifiers pin, is the same on every chain.
+//! The verifier goes through the factory under [`factory_name`] — a CREATE3
+//! name carrying the circuit and the circuits release the crate vendors —
+//! so its address is a pure function of which artifact it is: a converged
+//! chain is recognised without a redeploy. A circuits release is a new
+//! name, a new address, and a Platform Verifier upgrade onto an
+//! implementation that pins the new hash, followed by `setTrustRoots`.
 
 use anyhow::Result;
 pub use libid_contracts::circuits::Circuit;
@@ -41,12 +38,11 @@ pub fn version() -> Result<String> {
 
 /// The CREATE3 name `circuit`'s verifier deploys under.
 ///
-/// Deliberately NOT in [`crate::names`]' canonical table: that is the set of
-/// entry contracts a network file declares, and these are referenced by the
-/// Platform Verifier that pins them instead. The version is part of the
-/// name because a Honk verifier IS its verification key — a new circuits
-/// release is a different contract, so it must be a different address
-/// rather than a silent replacement.
+/// Not in [`crate::names`]' canonical table, which holds the entry
+/// contracts a network file declares: the Platform Verifier that pins a
+/// circuit verifier references it. The version is part of the name because
+/// a Honk verifier IS its verification key, so a new circuits release lands
+/// at a new address.
 pub fn factory_name(circuit: Circuit) -> Result<String> {
     Ok(format!("libid.circuits.{}.{}", circuit.name(), version()?))
 }

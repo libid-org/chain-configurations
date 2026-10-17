@@ -15,7 +15,6 @@ use alloy::{
     primitives::{
         keccak256,
         Address,
-        B256,
     },
     providers::{
         Provider,
@@ -32,7 +31,7 @@ use libid_contracts::{
             CeremonyProofVerifier,
             GoogleJwtRoots,
             NotaryService,
-            TlsNotaryPlatformVerifier,
+            PlatformVerifierBase,
         },
         escrow::HandleEscrow,
         factory::LibidFactory,
@@ -48,6 +47,7 @@ use libid_contracts::{
 use serde::Serialize;
 
 use crate::{
+    apply::Upgrade,
     circuits::{
         self,
         Circuit,
@@ -296,22 +296,6 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
         plan_identity_registry(&mut b, &provider, identity_registry, proof_verifier)
             .await;
     }
-    // The rules are written, not read: apply re-sends `setPlatform` every
-    // run, which is owner-only and idempotent.
-    for platform in platforms::LAUNCH {
-        b.push(
-            format!("identity_registry.platform.{}", platform.key),
-            if identity_registry_present {
-                Status::Configure
-            } else {
-                Status::Deploy
-            },
-            format!(
-                "setPlatform({:#x}) re-sent every run",
-                platforms::platform_id(platform.key)
-            ),
-        );
-    }
 
     let handle_escrow =
         required_address(&cfg.contracts.handle_escrow, "contracts.handle_escrow")?;
@@ -335,7 +319,7 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
     // apply deploys these through the factory under a name carrying the
     // pinned circuits release, so the address is a pure function of which
     // artifact it is — known here before the chain has anything on it.
-    let mut verifiers: BTreeMap<Circuit, (Address, Option<B256>)> = BTreeMap::new();
+    let mut verifiers: BTreeMap<Circuit, Address> = BTreeMap::new();
     for circuit in Circuit::ALL {
         let name = circuits::factory_name(circuit)?;
         let address = predict_address(declared_factory, &name);
@@ -344,7 +328,8 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
             .await
             .map_err(|e| anyhow!("get_code({name}) failed: {e}"))?;
         let component = format!("circuits.{}", circuit.name());
-        let hash = if code.is_empty() {
+        let vendored = circuit.runtime_codehash(&artifacts)?;
+        if code.is_empty() {
             b.push(
                 &component,
                 Status::Deploy,
@@ -353,17 +338,23 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
                      '{name}' there"
                 ),
             );
-            None
-        } else {
-            let hash = keccak256(&code);
+        } else if keccak256(&code) == vendored {
             b.push(
                 &component,
                 Status::Ok,
-                format!("{address:#x} (codehash {hash:#x}, '{name}')"),
+                format!("{address:#x} (codehash {vendored:#x}, '{name}')"),
             );
-            Some(hash)
-        };
-        verifiers.insert(circuit, (address, hash));
+        } else {
+            b.push(
+                &component,
+                Status::Warn,
+                format!(
+                    "{address:#x} holds codehash {:#x}, not the vendored {vendored:#x}",
+                    keccak256(&code)
+                ),
+            );
+        }
+        verifiers.insert(circuit, address);
     }
 
     // ── The Platform Verifiers ───────────────────────────────────────────
@@ -374,6 +365,7 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
         plan_platform_verifier(
             &mut b,
             &provider,
+            &artifacts,
             cfg,
             platform,
             circuit,
@@ -381,6 +373,9 @@ pub async fn build(cfg: &NetworkConfig, rpc: &RpcEndpoint) -> Result<Plan> {
             proof_verifier_present,
         )
         .await?;
+        if identity_registry_present {
+            plan_accepts_bindings(&mut b, &provider, identity_registry, platform).await;
+        }
     }
 
     // ── Factory bookkeeping ──────────────────────────────────────────────
@@ -498,6 +493,34 @@ async fn plan_identity_registry<P: Provider>(
     }
 }
 
+/// Whether the registry accepts the platform's bindings: true once the
+/// Proof Verifier routes the platform to a registered verifier.
+async fn plan_accepts_bindings<P: Provider>(
+    b: &mut Builder,
+    provider: &P,
+    identity_registry: Address,
+    platform: &Platform,
+) {
+    let component = format!("identity_registry.accepts.{}", platform.key);
+    match IdentityRegistry::new(identity_registry, provider)
+        .acceptsBindings(platforms::platform_id(platform.key))
+        .call()
+        .await
+    {
+        Ok(true) => b.push(component, Status::Ok, "accepts bindings"),
+        Ok(false) => b.push(
+            component,
+            Status::Configure,
+            "accepts no binding until apply registers the platform's verifier",
+        ),
+        Err(e) => b.push(
+            component,
+            Status::Warn,
+            format!("acceptsBindings read failed: {e}"),
+        ),
+    }
+}
+
 /// The escrow pays out to whoever its identity registry says holds a
 /// handle, and has no setter to move it to another one.
 async fn plan_handle_escrow<P: Provider>(
@@ -576,24 +599,27 @@ async fn plan_jwt_roots<P: Provider>(
     }
 }
 
-/// One platform's Platform Verifier: whether it exists, whether it pins
-/// the circuit verifier its circuit resolves to, and whether it is
-/// registered in the Supported Version Set.
+/// One platform's Platform Verifier: whether it exists, whether its
+/// implementation pins the vendored circuit verifier and its trust roots
+/// point at the deployed one, and whether it is registered in the Supported
+/// Version Set.
 ///
-/// `circuit` is that verifier's address and — once it has code — the hash
-/// the Platform Verifier must be holding.
+/// `circuit_address` is where the circuit verifier is (or would be)
+/// deployed.
+#[allow(clippy::too_many_arguments)]
 async fn plan_platform_verifier<P: Provider>(
     b: &mut Builder,
     provider: &P,
+    artifacts: &Artifacts,
     cfg: &NetworkConfig,
     platform: &Platform,
-    circuit: (Address, Option<B256>),
+    circuit_address: Address,
     proof_verifier: Address,
     proof_verifier_present: bool,
 ) -> Result<()> {
     let component = format!("contracts.{}", platform.contracts_key);
     let registration = format!("ceremony.{}.registration", platform.key);
-    let (circuit_address, circuit_hash) = circuit;
+    let vendored = platform.circuit().runtime_codehash(artifacts)?;
 
     let proxy = required_address(
         cfg.contracts.raw(platform.contracts_key).ok_or_else(|| {
@@ -604,33 +630,36 @@ async fn plan_platform_verifier<P: Provider>(
 
     let present = check_code(b, provider, &component, proxy).await?;
     if present {
-        let verifier = TlsNotaryPlatformVerifier::new(proxy, provider);
+        let verifier = PlatformVerifierBase::new(proxy, provider);
         let wired = verifier.honkVerifier().call().await;
-        let wired_hash = verifier.honkVerifierCodehash().call().await;
-        match (wired, wired_hash) {
-            (Ok(addr), Ok(hash))
-                if addr == circuit_address && Some(hash) == circuit_hash =>
-            {
-                b.push(
-                    format!("{component}.trust_roots"),
-                    Status::Ok,
-                    format!("pins {addr:#x} ({})", platform.circuit().name()),
-                );
-            }
+        let pinned = verifier.circuitCodehash().call().await;
+        let trust_roots = format!("{component}.trust_roots");
+        match (wired, pinned) {
+            (Ok(_), Ok(hash)) if hash != vendored => b.push(
+                trust_roots,
+                Status::Warn,
+                format!(
+                    "the implementation pins circuit codehash {hash:#x}, the vendored \
+                     {} verifier is {vendored:#x} — apply needs --upgrade {}",
+                    platform.circuit().name(),
+                    Upgrade::from(platform.verifier)
+                ),
+            ),
+            (Ok(addr), Ok(_)) if addr == circuit_address => b.push(
+                trust_roots,
+                Status::Ok,
+                format!("pins {addr:#x} ({})", platform.circuit().name()),
+            ),
             (Ok(addr), Ok(_)) => b.push(
-                format!("{component}.trust_roots"),
+                trust_roots,
                 Status::Configure,
                 format!(
-                    "pins {addr:#x}, the pinned {} verifier is {circuit_address:#x} — \
-                     apply sends setTrustRoots",
+                    "pins {addr:#x}, the {} verifier is {circuit_address:#x} — apply \
+                     sends setTrustRoots",
                     platform.circuit().name()
                 ),
             ),
-            _ => b.push(
-                format!("{component}.trust_roots"),
-                Status::Warn,
-                "trust-root read failed",
-            ),
+            _ => b.push(trust_roots, Status::Warn, "trust-root read failed"),
         }
     }
 

@@ -72,28 +72,27 @@ fee_wei = "100000000000000"
 
 # OUTPUT: the canonical contract addresses. Do not hand-edit.
 [contracts]
-factory = "0x9dbf2b5f96cb31a48cca4e25d2c8348be414ebc8"
-notary_service = "0xa773ec5e7500d1c87827ab1b899bbd992c1b5931"
-ceremony_proof_verifier = "0xa795b14a2e09daf273bc6971058b0462c7d6be42"
-identity_registry = "0x25f29c8c765db2f27d1e2b23987a7b0655c7d640"
+factory = "0x5294f6c0f1f086f70c9b510ba7990085d5976281"
+notary_service = "0x99b890bc54e682340ddffb719a3d00a2886d7484"
+ceremony_proof_verifier = "0x6e4585c4f1ac48a20f49bb61163c466dc4f35004"
+identity_registry = "0x58ac0cd5ec19c850a75d6183b3c3b2de692fb20d"
 # Initialized with identity_registry above, which it resolves every handle
 # through for life: no setter moves it.
-handle_escrow = "0x57355e1d1bcf61fec9b2e5cad60dcccdddc4d8e5"
+handle_escrow = "0xf3f81c31c889ddf1ec83b91b3dfed601c04f5e50"
 # Deploys EMPTY. Until a keeper lands a notarized reading of Google's live JWKS,
 # every Google binding reverts with UntrustedModulus(). The deployment repo runs
 # the keeper hourly against this network too; the first tick has to be run
 # deliberately, right after this apply.
-google_jwt_roots = "0x8a14a5dda7662f88a5448b9b8b2ca9f1d5742904"
-x_platform_verifier = "0x9f655c2fe778260d90f3202d97da0a46510aa3d0"
-github_platform_verifier = "0xb5fdf35eedf7c849f3d1e41675d8b8a41487e248"
-google_platform_verifier = "0x5cfb807545e0e2ce4d7dac7d97ab0583e3fbe1c6"
+google_jwt_roots = "0xa6ffb649c768191353dadd7af74d2885f7e5c8ec"
+x_platform_verifier = "0x655be95a91a26b4ade476a8992ee25c98bb774a6"
+github_platform_verifier = "0x13cdf6d5666a42e0eb586809f46ce10e469d11f7"
+google_platform_verifier = "0x355143c93a645ae914b1315eb1b580072207e0f2"
 
 # The ceremony circuit verifiers are NOT declared here. `libid-deploy`
 # carries them: `libid-contracts` embeds each circuit's bb-generated
 # UltraHonk verifier from the libid-circuits release it pins, and apply
 # deploys it through the factory under a CREATE3 name carrying that
-# release and reads its code hash off the chain for the Platform Verifier
-# to pin. Moving the contracts pin to a new circuits release and
-# re-applying is the rotation path — a new release is a new name, a new
-# address and a `setTrustRoots`, with the proxy and its registration
-# untouched.
+# release. Each Platform Verifier implementation compiles in the code
+# hash of its circuit's verifier, so a new circuits release is a new name,
+# a new address, an `--upgrade` of the Platform Verifiers and a
+# `setTrustRoots`, with the proxies and their registrations untouched.
