@@ -35,7 +35,7 @@ region = "eu-central-1"
 # factory's genesis admin: this alias derives to accounts.deployer below, the
 # address baked into the factory's init code, and `factory.deploy` is
 # owner-gated, so no other key can perform this apply. It pays ETH for gas: a
-# fresh deploy of the whole stack is 27 transactions and about 31.3M gas, the
+# fresh deploy of the whole stack is 24 transactions and about 31.3M gas, the
 # keyless CREATE2 deployer being already on Ethereum.
 kms_deployer = "alias/libid-mainnet-deployer"
 
@@ -75,19 +75,19 @@ fee_wei = "180000000000000"
 # `google_jwt_roots` starts EMPTY on-chain — point a keeper at it, or every
 # Google binding reverts UntrustedModulus().
 [contracts]
-factory = "0xb7432c991be3167689d5e80c9e2bf1ff5cccd2e0"
-notary_service = "0x2feee7c87bec78853afc223135735d4786e75177"
-ceremony_proof_verifier = "0x36e6d6cf465cb9f0615ceb0fc37ef30927dac66e"
-identity_registry = "0xbefd300aff7d4a67fb381afe8b3596793d3e9a83"
-handle_escrow = "0x17a244e23ef1f12071298a1862194fea3d00bbf7"
-google_jwt_roots = "0x1f3d9b49efde0c12ed2ffeab67165ebe0c97517a"
-x_platform_verifier = "0x61d79debf1b7e512ae8b305ba76c6f82f4609142"
-github_platform_verifier = "0xdd7d34f2302bc2ccac36bdcec5fdafe0ca91f888"
-google_platform_verifier = "0x727f4a1c9040a94ca27f74667c70d1c2951a0b5a"
+factory = "0x4ab4177683b8c3f40c487f9e765f77f0c5f5a023"
+notary_service = "0xe8a461a5bdbd3f71a0aa712936cc7e2850908426"
+ceremony_proof_verifier = "0xcfee504d5a290d72c52b9ffd61d54444d727233b"
+identity_registry = "0xf39343febda25caa8c3861954e33f8a0189d4fda"
+handle_escrow = "0xd38474f12d887a1d97ac7a62cf0b3c17e4d2c100"
+google_jwt_roots = "0x9f06aa33abb2028472166a3bc605bfa3e2d3d15d"
+x_platform_verifier = "0xe9b6d548a070fcaa5b43344c0b495d982aaa9fc4"
+github_platform_verifier = "0x4f6d4a3486a00b260a1dd91f9dde6f333de6861f"
+google_platform_verifier = "0x731f3943879ccf40a21a7b84e9b7ec01776cb9cc"
 
 # The ceremony circuit verifiers are NOT declared here. `libid-deploy`
 # carries them: `libid-contracts` embeds each circuit's bb-generated
 # UltraHonk verifier from the libid-circuits release it pins, and apply
 # deploys it through the factory under a CREATE3 name carrying that
-# release and reads its code hash off the chain for the Platform Verifier
-# to pin.
+# release. Each Platform Verifier implementation compiles in the code
+# hash of its circuit's verifier.

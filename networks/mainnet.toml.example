@@ -78,22 +78,21 @@ fee_wei = "0"
 # `google_jwt_roots` starts EMPTY on-chain — point a keeper at it, or every
 # Google binding reverts UntrustedModulus().
 [contracts]
-factory = "0x49852bc32a52a5cb5cdda135d1b244f5f5d57226"
-notary_service = "0x562ff3231d8d3f8b0615914186e858c7cbfc2994"
-ceremony_proof_verifier = "0xbf95e2ecad436a807f3204ac4cf388f3fa7b7b77"
-identity_registry = "0x105b32e3daa9fda3572e89992c73b85a8a1065b3"
-handle_escrow = "0xcd1fb9627c011cce322dabfcbcb4a09f66b26432"
-google_jwt_roots = "0x70580b148be716ad86da3f94243c9a8f3d5768bc"
-x_platform_verifier = "0x2a529253505b724a2ebd284ad40fcde5cc1dd5a7"
-github_platform_verifier = "0x12126c434c906ae8fc9731a96845bbf7bb679b9b"
-google_platform_verifier = "0xc32fca530bfe3c7f54bcb69cec8d965d4a52c73d"
+factory = "0x13089b18e7fdcdedde55f6b85451561a8b725825"
+notary_service = "0x7cbd1447f94fd8911e7c4541ceab9828b22f110b"
+ceremony_proof_verifier = "0x145307aaf8dc22fb850aae44aea19628df20e9f6"
+identity_registry = "0x155090a3a2dded2fbdf385bac8cffeb3a51a18ae"
+handle_escrow = "0x1297ddf98efc4d72ce4c5799e057dd61052cfe29"
+google_jwt_roots = "0x0dd8f6dff1d434f53aae0afde9b2b9624ac5c15d"
+x_platform_verifier = "0x37be0160c6e2e2e089010d178c7be3ee27602628"
+github_platform_verifier = "0x1aafd47fb1e7c68a1c9afc19d06ccccd958cc4d6"
+google_platform_verifier = "0xfcb24d6491120569c91370dd8fa5441adb1d94ee"
 
 # The ceremony circuit verifiers are NOT declared here. `libid-deploy`
 # carries them: `libid-contracts` embeds each circuit's bb-generated
 # UltraHonk verifier from the libid-circuits release it pins, and apply
 # deploys it through the factory under a CREATE3 name carrying that
-# release and reads its code hash off the chain for the Platform Verifier
-# to pin. Moving the contracts pin to a new circuits release and
-# re-applying is the rotation path — a new release is a new name, a new
-# address and a `setTrustRoots`, with the proxy and its registration
-# untouched.
+# release. Each Platform Verifier implementation compiles in the code
+# hash of its circuit's verifier, so a new circuits release is a new name,
+# a new address, an `--upgrade` of the Platform Verifiers and a
+# `setTrustRoots`, with the proxies and their registrations untouched.

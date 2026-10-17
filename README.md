@@ -49,14 +49,13 @@ after the identity registry it resolves through:
    Verifier answers for a `(platformId, verifierVersion)` pair. Without it
    the identity registry's `proofVerifier` reads zero and every resolver
    reverts.
-3. **IdentityRegistry** — the identity registry, pointed at the Proof
-   Verifier and given handle rules per platform key (`x`, `github`,
-   `google`) from `libid-identity`'s generated table.
-4. **HandleEscrow** — value sent to a handle before anyone holds it,
+3. **IdentityRegistry** — the identity registry, keyed by the SHA-256
+   nodes the circuits prove and pointed at the Proof Verifier. Which
+   platforms it knows is compiled in from the ceremony profiles.
+4. **HandleEscrow** — value sent to a handle node before anyone holds it,
    claimed by the holder the registry binds the handle to. `initialize`
-   takes the registry's address and refuses one that does not answer the
-   escrow's reads. No setter moves the escrow to another registry
-   afterwards.
+   takes the registry's address and refuses one whose `nodeKeyed()` is not
+   true. No setter moves the escrow to another registry afterwards.
 5. **GoogleJwtRoots** — the Google signing keys the `google/v1` Platform
    Verifier trusts, verified through the Notary Service like any other
    notarized session. It deploys **EMPTY**: point a keeper at it, or every
@@ -69,12 +68,12 @@ Then two steps `Deploy.s.sol` does not have:
    factory under a CREATE3 name carrying the pinned circuits release.
 7. **A Platform Verifier per platform** — `XPlatformVerifier`,
    `GitHubPlatformVerifier`, `GooglePlatformVerifier` — deployed behind its
-   own CREATE3 proxy, pinned to its circuit's verifier by address and code
-   hash, and registered into the Supported Version Set with
+   own CREATE3 proxy, initialized with `(owner, notary, honkVerifier)`
+   (Google: the JWT root list instead of a notary), and registered into the
+   Supported Version Set with
    `CeremonyProofVerifier.setVerifier(platformId, 1, verifier)`. Until that
-   registration lands, a platform has its rules and can verify nothing:
-   `bind` reverts `UnknownVersion` and every resolver reverts
-   `UnknownPlatform`.
+   registration lands, `acceptsBindings` is false for the platform and
+   `bind` reverts `UnknownVersion`.
 
 ## The ceremony contracts
 
@@ -94,22 +93,20 @@ moves from — the circuits release the Honk verifiers derive from included
 The circuits release the embedded verifiers came from is read back out of
 the crate (`libid_contracts::circuits::version`) and becomes part of each
 verifier's factory name below, so the name follows the pin and cannot be
-restated. The crate's own tests hold the bindings to the artifacts: every
-bound selector against `methodIdentifiers`, and `verify(bytes,bytes32[])`
-on every circuit verifier.
+restated. The crate's bindings are `sol!` over the compiled ABIs, so they
+cannot drift from the artifacts.
 
 ### How the circuit verifier is wired
 
-`PlatformVerifierBase._setTrustRoots` pins the verifier a platform's proofs
-are checked under **by address and by code hash**: it reads
-`address(honkVerifier_).codehash` and refuses a value that does not match
-the hash the caller named, refusing the zero and empty hashes outright. A
-bb verifier embeds its verification key as code constants and exposes no
-getter, so the code hash is the only handle on which circuit a deployed
-verifier answers for.
+Each Platform Verifier implementation compiles in the runtime code hash of
+its circuit's verifier (`circuitCodehash()`): `initialize`, `setTrustRoots`
+and `verify` revert `WrongCircuit` for any other code. A bb verifier embeds
+its verification key as code constants and exposes no getter, so the code
+hash is the only handle on which circuit a deployed verifier answers for.
 
-So apply deploys the verifier and reads the hash back off the chain. There
-are two circuits, not three: `oidc-google` proves the Google JWT, and
+Apply deploys the verifier and checks its on-chain code hash against the
+vendored one (`circuit_codehash_at`) before wiring it. There are two
+circuits, not three: `oidc-google` proves the Google JWT, and
 `bearer-link` ties a token exchange to an identity for X and GitHub alike,
 because their statements are byte-identical — so both TLSNotary platforms
 pin one deployed verifier.
@@ -117,10 +114,11 @@ pin one deployed verifier.
 Each one deploys through the factory under
 `libid.circuits.<circuit>.<version>`, so its address is a pure function of
 which artifact it is. That is what makes apply idempotent here: a second
-run finds code at the same address and sends nothing. It is also the
-rotation path — a circuits release is a new name, a new address and a
-`setTrustRoots`, while the Platform Verifier proxy and its registration do
-not move.
+run finds code at the same address and sends nothing. A circuits release
+is a new name and a new address, and a new Platform Verifier
+implementation that pins its hash: apply rotates onto it only with
+`--upgrade <platform>-platform-verifier` in the same run, then sends
+`setTrustRoots`. The proxy and its registration do not move.
 
 Each verifier is bb's optimized template, one contract that links
 nothing: a fresh chain pays for two verifiers, and a verifier's code hash —
@@ -153,43 +151,43 @@ forever, on every network — names are frozen. The testnet table, deployer
 
 | Config key | Canonical name | Address (testnet) |
 |---|---|---|
-| `contracts.factory` | — (CREATE2, frozen init code) | `0x9dbf2b5f96cb31a48cca4e25d2c8348be414ebc8` |
-| `contracts.notary_service` | `libid.NotaryService` | `0xa773ec5e7500d1c87827ab1b899bbd992c1b5931` |
-| `contracts.ceremony_proof_verifier` | `libid.CeremonyProofVerifier` | `0xa795b14a2e09daf273bc6971058b0462c7d6be42` |
-| `contracts.identity_registry` | `libid.IdentityRegistry` | `0x25f29c8c765db2f27d1e2b23987a7b0655c7d640` |
-| `contracts.handle_escrow` | `libid.HandleEscrow.2` | `0x57355e1d1bcf61fec9b2e5cad60dcccdddc4d8e5` |
-| `contracts.google_jwt_roots` | `libid.GoogleJwtRoots` | `0x8a14a5dda7662f88a5448b9b8b2ca9f1d5742904` |
-| `contracts.x_platform_verifier` | `libid.XPlatformVerifier` | `0x9f655c2fe778260d90f3202d97da0a46510aa3d0` |
-| `contracts.github_platform_verifier` | `libid.GitHubPlatformVerifier` | `0xb5fdf35eedf7c849f3d1e41675d8b8a41487e248` |
-| `contracts.google_platform_verifier` | `libid.GooglePlatformVerifier` | `0x5cfb807545e0e2ce4d7dac7d97ab0583e3fbe1c6` |
+| `contracts.factory` | — (CREATE2, frozen init code) | `0x5294f6c0f1f086f70c9b510ba7990085d5976281` |
+| `contracts.notary_service` | `libid.NotaryService.2` | `0x99b890bc54e682340ddffb719a3d00a2886d7484` |
+| `contracts.ceremony_proof_verifier` | `libid.CeremonyProofVerifier.2` | `0x6e4585c4f1ac48a20f49bb61163c466dc4f35004` |
+| `contracts.identity_registry` | `libid.IdentityRegistry.2` | `0x58ac0cd5ec19c850a75d6183b3c3b2de692fb20d` |
+| `contracts.handle_escrow` | `libid.HandleEscrow.3` | `0xf3f81c31c889ddf1ec83b91b3dfed601c04f5e50` |
+| `contracts.google_jwt_roots` | `libid.GoogleJwtRoots.2` | `0xa6ffb649c768191353dadd7af74d2885f7e5c8ec` |
+| `contracts.x_platform_verifier` | `libid.XPlatformVerifier.2` | `0x655be95a91a26b4ade476a8992ee25c98bb774a6` |
+| `contracts.github_platform_verifier` | `libid.GitHubPlatformVerifier.2` | `0x13cdf6d5666a42e0eb586809f46ce10e469d11f7` |
+| `contracts.google_platform_verifier` | `libid.GooglePlatformVerifier.2` | `0x355143c93a645ae914b1315eb1b580072207e0f2` |
 
 The mainnet table, deployer `0x7e00d33b5c571ca2b2879309c4846ddd80f4128e`
 (Ethereum, `networks/ethereum.toml`):
 
 | Config key | Address (mainnet) |
 |---|---|
-| `contracts.factory` | `0xb7432c991be3167689d5e80c9e2bf1ff5cccd2e0` |
-| `contracts.notary_service` | `0x2feee7c87bec78853afc223135735d4786e75177` |
-| `contracts.ceremony_proof_verifier` | `0x36e6d6cf465cb9f0615ceb0fc37ef30927dac66e` |
-| `contracts.identity_registry` | `0xbefd300aff7d4a67fb381afe8b3596793d3e9a83` |
-| `contracts.handle_escrow` | `0x17a244e23ef1f12071298a1862194fea3d00bbf7` |
-| `contracts.google_jwt_roots` | `0x1f3d9b49efde0c12ed2ffeab67165ebe0c97517a` |
-| `contracts.x_platform_verifier` | `0x61d79debf1b7e512ae8b305ba76c6f82f4609142` |
-| `contracts.github_platform_verifier` | `0xdd7d34f2302bc2ccac36bdcec5fdafe0ca91f888` |
-| `contracts.google_platform_verifier` | `0x727f4a1c9040a94ca27f74667c70d1c2951a0b5a` |
+| `contracts.factory` | `0x4ab4177683b8c3f40c487f9e765f77f0c5f5a023` |
+| `contracts.notary_service` | `0xe8a461a5bdbd3f71a0aa712936cc7e2850908426` |
+| `contracts.ceremony_proof_verifier` | `0xcfee504d5a290d72c52b9ffd61d54444d727233b` |
+| `contracts.identity_registry` | `0xf39343febda25caa8c3861954e33f8a0189d4fda` |
+| `contracts.handle_escrow` | `0xd38474f12d887a1d97ac7a62cf0b3c17e4d2c100` |
+| `contracts.google_jwt_roots` | `0x9f06aa33abb2028472166a3bc605bfa3e2d3d15d` |
+| `contracts.x_platform_verifier` | `0xe9b6d548a070fcaa5b43344c0b495d982aaa9fc4` |
+| `contracts.github_platform_verifier` | `0x4f6d4a3486a00b260a1dd91f9dde6f333de6861f` |
+| `contracts.google_platform_verifier` | `0x731f3943879ccf40a21a7b84e9b7ec01776cb9cc` |
 
 The circuit verifiers go through the same factory but are not in that
 table and not in any network file: their names carry the circuits release
 `libid-contracts` vendors, so they move when the contracts pin does. At
-`libid-circuits` 0.6.0 (`libid-contracts` 0.17.0) they are
+`libid-circuits` 0.7.1 (`libid-contracts` 0.18.0) they are
 
 | Component | Name | Address (testnet) |
 |---|---|---|
-| `circuits.bearer-link` | `libid.circuits.bearer-link.0.6.0` | `0xb152321148f37c13147f4313a82c72d4e1a95d14` |
-| `circuits.oidc-google` | `libid.circuits.oidc-google.0.6.0` | `0x5301b6c527410565c82dff20b44a71c3e1d151b2` |
+| `circuits.bearer-link` | `libid.circuits.bearer-link.0.7.1` | `0x90aefe0648a496183c18bef07245c5ed253bee2c` |
+| `circuits.oidc-google` | `libid.circuits.oidc-google.0.7.1` | `0x787117a19f0bb1df86be05094a749c47d2bd1633` |
 
-On mainnet they are `0x8bcd52dd0f75c0936f00c40ab78fb9430df50d91` and
-`0x14b342b4faf09f0462bbd611906d33622e33fdfc`.
+On mainnet they are `0xae0674895f5a8a63d2fa94a9e50f41152b9de50b` and
+`0xaa3e32ccd6bb0c497bf203deb3608eb986d3b571`.
 
 `plan --print-addresses` prints all of them together with the canonical
 table.
@@ -278,8 +276,8 @@ Declared-address semantics:
   is required exactly when the FACTORY has no code on-chain (a virgin
   network — that first apply publishes the entire declared stack). With
   the factory present, apply converges incrementally without the flag.
-- The three platforms' handle rules are **re-sent every run**; the call is
-  owner-only and idempotent.
+- After registration apply reads `acceptsBindings` for every platform and
+  fails if the registry still refuses one.
 
 ## Running locally
 
