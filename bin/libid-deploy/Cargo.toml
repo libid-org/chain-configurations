@@ -30,8 +30,13 @@ alloy = { version = "2", features = [
 # KMS-backed signing: `signer-aws` re-exports `alloy::signers::aws::AwsSigner`,
 # but constructing one needs an aws_sdk_kms::Client, so the SDK crates are
 # direct dependencies pinned to the 1.x line cargo unifies with alloy's.
+# The KMS SDK takes the default HTTPS client (hyper 1, rustls 0.23) without
+# its `rustls` feature, which adds the hyper 0.14 / rustls 0.21 connector.
 aws-config = "1"
-aws-sdk-kms = "1"
+aws-sdk-kms = { version = "1", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
