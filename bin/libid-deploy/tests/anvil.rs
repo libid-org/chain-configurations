@@ -72,7 +72,10 @@ use libid_contracts::{
     Artifacts,
 };
 use libid_deploy::{
-    apply,
+    apply::{
+        self,
+        Applier,
+    },
     circuits::{
         self,
         Circuit,
@@ -81,6 +84,7 @@ use libid_deploy::{
     names,
     plan::{
         self,
+        Plan,
         Status,
     },
     platforms::{
@@ -226,7 +230,10 @@ fn file_rpc(cfg: &NetworkConfig) -> RpcEndpoint {
 async fn apply_with(path: &Path, opts: apply::Options) -> apply::Summary {
     let cfg = NetworkConfig::load(path).expect("config loads");
     let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
-    apply::run(path, &cfg, &file_rpc(&cfg), &signer, &opts)
+    Applier::connect(&cfg, &file_rpc(&cfg), &signer, opts)
+        .await
+        .expect("apply connects")
+        .run(path)
         .await
         .expect("apply converges")
 }
@@ -239,10 +246,8 @@ async fn assert_declared_and_present<P: Provider>(provider: &P, cfg: &NetworkCon
     for c in names::CANONICAL_CONTRACTS {
         let declared: Address = cfg
             .contracts
-            .raw(c.key)
-            .unwrap_or_else(|| panic!("{} declared", c.key))
-            .parse()
-            .unwrap_or_else(|e| panic!("{} parses: {e}", c.key));
+            .address(c.key)
+            .unwrap_or_else(|e| panic!("{} declared: {e}", c.key));
         assert_eq!(
             declared,
             predict_address(factory, c.name),
@@ -298,7 +303,7 @@ async fn declarative_apply_cycle_never_touches_the_config() {
     let cfg = NetworkConfig::load(&path).expect("config loads");
 
     // Virgin chain: the plan wants everything, including the onboarding gate.
-    let virgin = plan::build(&cfg, &file_rpc(&cfg))
+    let virgin = Plan::build(&cfg, &file_rpc(&cfg))
         .await
         .expect("plan on a virgin chain");
     assert_eq!(virgin.status_of("create2_deployer"), Some(Status::Deploy));
@@ -312,14 +317,12 @@ async fn declarative_apply_cycle_never_touches_the_config() {
     // A fresh deploy without the flag is refused: the guard reads chain
     // state, and a virgin chain means this apply publishes the whole stack.
     let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
-    let refused = apply::run(
-        &path,
-        &cfg,
-        &file_rpc(&cfg),
-        &signer,
-        &apply::Options::default(),
-    )
-    .await;
+    let refused =
+        Applier::connect(&cfg, &file_rpc(&cfg), &signer, apply::Options::default())
+            .await
+            .expect("apply connects")
+            .run(&path)
+            .await;
     assert!(
         refused
             .expect_err("a virgin chain needs the flag")
@@ -348,10 +351,10 @@ async fn declarative_apply_cycle_never_touches_the_config() {
     assert_declared_and_present(&provider, &cfg).await;
 
     // The wiring the stack is useless without.
-    let notary_service: Address = cfg.contracts.notary_service.parse().unwrap();
-    let proof_verifier: Address = cfg.contracts.ceremony_proof_verifier.parse().unwrap();
-    let identity_registry: Address = cfg.contracts.identity_registry.parse().unwrap();
-    let jwt_roots: Address = cfg.contracts.google_jwt_roots.parse().unwrap();
+    let notary_service: Address = cfg.contracts.notary_service.get().unwrap();
+    let proof_verifier: Address = cfg.contracts.ceremony_proof_verifier.get().unwrap();
+    let identity_registry: Address = cfg.contracts.identity_registry.get().unwrap();
+    let jwt_roots: Address = cfg.contracts.google_jwt_roots.get().unwrap();
 
     let service = NotaryService::new(notary_service, &provider);
     assert!(service
@@ -411,7 +414,7 @@ async fn declarative_apply_cycle_never_touches_the_config() {
     }
 
     // Factory ownership ended at the declared operational owner.
-    let factory: Address = cfg.contracts.factory.parse().unwrap();
+    let factory: Address = cfg.contracts.factory.get().unwrap();
     assert_eq!(
         LibidFactory::new(factory, &provider)
             .owner()
@@ -428,7 +431,7 @@ async fn declarative_apply_cycle_never_touches_the_config() {
         "the second apply deployed {:?}",
         again.deployed
     );
-    let settled = plan::build(&cfg, &file_rpc(&cfg))
+    let settled = Plan::build(&cfg, &file_rpc(&cfg))
         .await
         .expect("plan after apply");
     assert!(
@@ -461,7 +464,7 @@ async fn declarative_apply_cycle_never_touches_the_config() {
     );
     assert_eq!(roots.notaryService().call().await.unwrap(), notary_service);
     assert_eq!(
-        HandleEscrow::new(cfg.contracts.handle_escrow.parse().unwrap(), &provider)
+        HandleEscrow::new(cfg.contracts.handle_escrow.get().unwrap(), &provider)
             .registry()
             .call()
             .await
@@ -496,9 +499,9 @@ async fn apply_converges_drifted_wiring_without_redeploying() {
     .await;
 
     let cfg = NetworkConfig::load(&path).expect("config loads");
-    let notary_service: Address = cfg.contracts.notary_service.parse().unwrap();
-    let proof_verifier: Address = cfg.contracts.ceremony_proof_verifier.parse().unwrap();
-    let identity_registry: Address = cfg.contracts.identity_registry.parse().unwrap();
+    let notary_service: Address = cfg.contracts.notary_service.get().unwrap();
+    let proof_verifier: Address = cfg.contracts.ceremony_proof_verifier.get().unwrap();
+    let identity_registry: Address = cfg.contracts.identity_registry.get().unwrap();
 
     // Drift: the owner (the anvil #0 key, which is also the apply signer)
     // points the identity registry somewhere else and changes the fee.
@@ -523,7 +526,7 @@ async fn apply_converges_drifted_wiring_without_redeploying() {
         .await
         .unwrap();
 
-    let drifted = plan::build(&cfg, &file_rpc(&cfg))
+    let drifted = Plan::build(&cfg, &file_rpc(&cfg))
         .await
         .expect("plan sees the drift");
     assert_eq!(
@@ -582,8 +585,8 @@ async fn apply_upgrades_a_proxy_before_reading_through_it() {
     .await;
 
     let cfg = NetworkConfig::load(&path).expect("config loads");
-    let proof_verifier: Address = cfg.contracts.ceremony_proof_verifier.parse().unwrap();
-    let identity_registry: Address = cfg.contracts.identity_registry.parse().unwrap();
+    let proof_verifier: Address = cfg.contracts.ceremony_proof_verifier.get().unwrap();
+    let identity_registry: Address = cfg.contracts.identity_registry.get().unwrap();
 
     let key: PrivateKeySigner = ANVIL_KEY.parse().unwrap();
     let owned = ProviderBuilder::new()
@@ -615,7 +618,7 @@ async fn apply_upgrades_a_proxy_before_reading_through_it() {
     );
 
     // Plan warns and names the flag that lets apply through.
-    let stale = plan::build(&cfg, &file_rpc(&cfg))
+    let stale = Plan::build(&cfg, &file_rpc(&cfg))
         .await
         .expect("plan on the stale implementation");
     let item = stale
@@ -632,16 +635,13 @@ async fn apply_upgrades_a_proxy_before_reading_through_it() {
 
     // Without the upgrade, apply stops at that read.
     let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
-    let err = apply::run(
-        &path,
-        &cfg,
-        &file_rpc(&cfg),
-        &signer,
-        &apply::Options::default(),
-    )
-    .await
-    .expect_err("the stale getter aborts a plain apply")
-    .to_string();
+    let err = Applier::connect(&cfg, &file_rpc(&cfg), &signer, apply::Options::default())
+        .await
+        .expect("apply connects")
+        .run(&path)
+        .await
+        .expect_err("the stale getter aborts a plain apply")
+        .to_string();
     assert!(err.contains("proofVerifier read failed"), "got: {err}");
 
     // With it, the same run upgrades first and converges the rest.
@@ -664,7 +664,7 @@ async fn apply_upgrades_a_proxy_before_reading_through_it() {
         proof_verifier,
         "the binding to the proof verifier survives the round trip"
     );
-    let settled = plan::build(&cfg, &file_rpc(&cfg))
+    let settled = Plan::build(&cfg, &file_rpc(&cfg))
         .await
         .expect("plan after the upgrade");
     assert_eq!(
@@ -710,8 +710,8 @@ async fn fresh_apply_addresses_are_network_invariant() {
     let second = NetworkConfig::load(&instances[1].1).unwrap();
     for c in names::CANONICAL_CONTRACTS {
         assert_eq!(
-            first.contracts.raw(c.key),
-            second.contracts.raw(c.key),
+            first.contracts.declared(c.key),
+            second.contracts.declared(c.key),
             "{} diverged between chains",
             c.key
         );
@@ -789,22 +789,17 @@ async fn platform_verifiers_deploy_wire_and_register() {
         "both platforms would verify under one circuit"
     );
 
-    let notary_service: Address = cfg.contracts.notary_service.parse().unwrap();
-    let proof_verifier: Address = cfg.contracts.ceremony_proof_verifier.parse().unwrap();
-    let identity_registry: Address = cfg.contracts.identity_registry.parse().unwrap();
-    let jwt_roots: Address = cfg.contracts.google_jwt_roots.parse().unwrap();
+    let notary_service: Address = cfg.contracts.notary_service.get().unwrap();
+    let proof_verifier: Address = cfg.contracts.ceremony_proof_verifier.get().unwrap();
+    let identity_registry: Address = cfg.contracts.identity_registry.get().unwrap();
+    let jwt_roots: Address = cfg.contracts.google_jwt_roots.get().unwrap();
 
     let version_set = CeremonyProofVerifier::new(proof_verifier, &provider);
     let registry = IdentityRegistry::new(identity_registry, &provider);
 
     for platform in platforms::LAUNCH {
         let platform_id = platforms::platform_id(platform.key);
-        let proxy: Address = cfg
-            .contracts
-            .raw(platform.contracts_key)
-            .unwrap()
-            .parse()
-            .unwrap();
+        let proxy: Address = cfg.contracts.address(platform.contracts_key).unwrap();
         let verifier = PlatformVerifierBase::new(proxy, &provider);
 
         // It answers for its own platform, and pins the verifier of the
@@ -897,9 +892,9 @@ async fn platform_verifiers_deploy_wire_and_register() {
 
     // X and GitHub prove the same statement, so they share one deployed
     // verifier rather than paying for two copies of it.
-    let x_proxy: Address = cfg.contracts.x_platform_verifier.parse().unwrap();
-    let github_proxy: Address = cfg.contracts.github_platform_verifier.parse().unwrap();
-    let google_proxy: Address = cfg.contracts.google_platform_verifier.parse().unwrap();
+    let x_proxy: Address = cfg.contracts.x_platform_verifier.get().unwrap();
+    let github_proxy: Address = cfg.contracts.github_platform_verifier.get().unwrap();
+    let google_proxy: Address = cfg.contracts.google_platform_verifier.get().unwrap();
     let mut pinned = Vec::new();
     for proxy in [x_proxy, github_proxy, google_proxy] {
         pinned.push(
@@ -918,7 +913,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
     let again = apply_with(&path, apply::Options::default()).await;
     assert!(again.deployed.is_empty(), "{:?}", again.deployed);
     assert!(again.configured.is_empty(), "{:?}", again.configured);
-    let settled = plan::build(&cfg, &file_rpc(&cfg))
+    let settled = Plan::build(&cfg, &file_rpc(&cfg))
         .await
         .expect("plan after apply");
     assert!(
@@ -959,12 +954,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
     .await;
     assert_eq!(upgraded.upgraded.len(), apply::Upgrade::VALUES.len());
     for platform in platforms::LAUNCH {
-        let proxy: Address = cfg
-            .contracts
-            .raw(platform.contracts_key)
-            .unwrap()
-            .parse()
-            .unwrap();
+        let proxy: Address = cfg.contracts.address(platform.contracts_key).unwrap();
         let circuit = circuit_verifier_address(platform.circuit());
         assert_eq!(
             PlatformVerifierBase::new(proxy, &provider)
@@ -1003,8 +993,8 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
 
     let cfg = NetworkConfig::load(&path).expect("config loads");
     let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
-    let notary_service: Address = cfg.contracts.notary_service.parse().unwrap();
-    let x_proxy: Address = cfg.contracts.x_platform_verifier.parse().unwrap();
+    let notary_service: Address = cfg.contracts.notary_service.get().unwrap();
+    let x_proxy: Address = cfg.contracts.x_platform_verifier.get().unwrap();
     let pinned = circuit_verifier_address(platforms::X.circuit());
 
     // Drift: the owner points X at a copy of its verifier off the
@@ -1025,7 +1015,7 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
         .await
         .unwrap();
 
-    let drifted = plan::build(&cfg, &file_rpc(&cfg))
+    let drifted = Plan::build(&cfg, &file_rpc(&cfg))
         .await
         .expect("plan sees the pin drift");
     assert_eq!(
@@ -1042,7 +1032,7 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
     // The proxy did not move: the registration still points at it.
     assert_eq!(
         CeremonyProofVerifier::new(
-            cfg.contracts.ceremony_proof_verifier.parse().unwrap(),
+            cfg.contracts.ceremony_proof_verifier.get().unwrap(),
             &provider
         )
         .verifierOf(
@@ -1077,8 +1067,8 @@ async fn apply_refuses_a_rotation_onto_code_the_implementation_does_not_pin() {
 
     let cfg = NetworkConfig::load(&path).expect("config loads");
     let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
-    let notary_service: Address = cfg.contracts.notary_service.parse().unwrap();
-    let x_proxy: Address = cfg.contracts.x_platform_verifier.parse().unwrap();
+    let notary_service: Address = cfg.contracts.notary_service.get().unwrap();
+    let x_proxy: Address = cfg.contracts.x_platform_verifier.get().unwrap();
     let pinned = circuit_verifier_address(platforms::X.circuit());
 
     let copy =
@@ -1089,7 +1079,7 @@ async fn apply_refuses_a_rotation_onto_code_the_implementation_does_not_pin() {
         .connect_http(anvil.endpoint_url());
     for proxy in [
         x_proxy,
-        cfg.contracts.github_platform_verifier.parse().unwrap(),
+        cfg.contracts.github_platform_verifier.get().unwrap(),
     ] {
         PlatformVerifierBase::new(proxy, &owned)
             .setTrustRoots(notary_service, copy)
@@ -1105,7 +1095,7 @@ async fn apply_refuses_a_rotation_onto_code_the_implementation_does_not_pin() {
         .await
         .expect("anvil_setCode");
 
-    let drifted = plan::build(&cfg, &file_rpc(&cfg))
+    let drifted = Plan::build(&cfg, &file_rpc(&cfg))
         .await
         .expect("plan sees the foreign code");
     assert_eq!(
@@ -1114,15 +1104,12 @@ async fn apply_refuses_a_rotation_onto_code_the_implementation_does_not_pin() {
     );
 
     let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
-    let err = apply::run(
-        &path,
-        &cfg,
-        &file_rpc(&cfg),
-        &signer,
-        &apply::Options::default(),
-    )
-    .await
-    .expect_err("apply cannot rotate onto code the implementation refuses");
+    let err = Applier::connect(&cfg, &file_rpc(&cfg), &signer, apply::Options::default())
+        .await
+        .expect("apply connects")
+        .run(&path)
+        .await
+        .expect_err("apply cannot rotate onto code the implementation refuses");
     let message = format!("{err:#}");
     assert!(
         message.contains("--upgrade x-platform-verifier"),
@@ -1167,8 +1154,8 @@ async fn the_handle_escrow_resolves_through_the_identity_registry_beside_it() {
     .await;
 
     let cfg = NetworkConfig::load(&path).expect("config loads");
-    let identity_registry: Address = cfg.contracts.identity_registry.parse().unwrap();
-    let handle_escrow: Address = cfg.contracts.handle_escrow.parse().unwrap();
+    let identity_registry: Address = cfg.contracts.identity_registry.get().unwrap();
+    let handle_escrow: Address = cfg.contracts.handle_escrow.get().unwrap();
 
     // The escrow's initializer reads the registry, so the registry lands
     // first.
@@ -1240,7 +1227,7 @@ async fn the_handle_escrow_resolves_through_the_identity_registry_beside_it() {
     let again = apply_with(&path, apply::Options::default()).await;
     assert!(again.deployed.is_empty(), "{:?}", again.deployed);
     assert!(again.configured.is_empty(), "{:?}", again.configured);
-    let settled = plan::build(&cfg, &file_rpc(&cfg))
+    let settled = Plan::build(&cfg, &file_rpc(&cfg))
         .await
         .expect("plan after apply");
     assert!(!settled.has_deploys(), "{}", settled.render());
@@ -1277,8 +1264,8 @@ async fn apply_stops_at_an_escrow_bound_to_another_identity_registry() {
     .await;
 
     let cfg = NetworkConfig::load(&path).expect("config loads");
-    let identity_registry: Address = cfg.contracts.identity_registry.parse().unwrap();
-    let handle_escrow: Address = cfg.contracts.handle_escrow.parse().unwrap();
+    let identity_registry: Address = cfg.contracts.identity_registry.get().unwrap();
+    let handle_escrow: Address = cfg.contracts.handle_escrow.get().unwrap();
     let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
 
     // The slot really is the one `registry()` reads, or this proves nothing.
@@ -1305,7 +1292,7 @@ async fn apply_stops_at_an_escrow_bound_to_another_identity_registry() {
         elsewhere
     );
 
-    let drifted = plan::build(&cfg, &file_rpc(&cfg))
+    let drifted = Plan::build(&cfg, &file_rpc(&cfg))
         .await
         .expect("plan sees the escrow's registry");
     assert_eq!(
@@ -1314,16 +1301,13 @@ async fn apply_stops_at_an_escrow_bound_to_another_identity_registry() {
     );
 
     let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
-    let err = apply::run(
-        &path,
-        &cfg,
-        &file_rpc(&cfg),
-        &signer,
-        &apply::Options::default(),
-    )
-    .await
-    .expect_err("apply cannot rebind the escrow")
-    .to_string();
+    let err = Applier::connect(&cfg, &file_rpc(&cfg), &signer, apply::Options::default())
+        .await
+        .expect("apply connects")
+        .run(&path)
+        .await
+        .expect_err("apply cannot rebind the escrow")
+        .to_string();
     assert!(err.contains("resolves through"), "got: {err}");
     assert!(err.contains(&format!("{elsewhere:#x}")), "got: {err}");
 }
@@ -1352,16 +1336,18 @@ async fn the_committed_local_dev_file_converges_an_anvil_through_rpc_url() {
     // --signer, no AWS.
     let signer = SignerSource::from_spec(&cfg.aws.kms_deployer).expect("signer spec");
     assert_eq!(signer.describe(), "local private key");
-    apply::run(
-        &path,
+    Applier::connect(
         &cfg,
         &rpc,
         &signer,
-        &apply::Options {
+        apply::Options {
             confirm_fresh_deploy: true,
             ..Default::default()
         },
     )
+    .await
+    .expect("apply connects")
+    .run(&path)
     .await
     .expect("local-dev converges");
 
@@ -1376,7 +1362,7 @@ async fn the_committed_local_dev_file_converges_an_anvil_through_rpc_url() {
 
     // The roles the file separates stay separate on chain: the notary
     // signer is anvil #1, the owner is anvil #0.
-    let notary_service: Address = cfg.contracts.notary_service.parse().unwrap();
+    let notary_service: Address = cfg.contracts.notary_service.get().unwrap();
     let service = NotaryService::new(notary_service, &provider);
     assert!(service
         .isTrustedNotary(ANVIL_NOTARY.parse().unwrap())
@@ -1394,7 +1380,7 @@ async fn the_committed_local_dev_file_converges_an_anvil_through_rpc_url() {
         "the local fee must stay non-zero so a wrong-value client fails here"
     );
     assert_eq!(
-        LibidFactory::new(cfg.contracts.factory.parse().unwrap(), &provider)
+        LibidFactory::new(cfg.contracts.factory.get().unwrap(), &provider)
             .owner()
             .call()
             .await
@@ -1419,7 +1405,7 @@ async fn rpc_override_moves_only_the_transport() {
     let cfg = NetworkConfig::load(&path).expect("config loads");
 
     // The file's own endpoint really is unusable, or this proves nothing.
-    plan::build(&cfg, &file_rpc(&cfg))
+    Plan::build(&cfg, &file_rpc(&cfg))
         .await
         .expect_err("nothing listens where the file points");
 
@@ -1429,14 +1415,17 @@ async fn rpc_override_moves_only_the_transport() {
         confirm_fresh_deploy: true,
         ..Default::default()
     };
-    let summary = apply::run(&path, &cfg, &rpc, &signer, &opts)
+    let summary = Applier::connect(&cfg, &rpc, &signer, opts)
+        .await
+        .expect("apply connects")
+        .run(&path)
         .await
         .expect("apply converges through the override");
 
     // Every canonical component deployed, at exactly the file's address.
     let factory = factory_address();
     for c in names::CANONICAL_CONTRACTS {
-        let declared: Address = cfg.contracts.raw(c.key).unwrap().parse().unwrap();
+        let declared: Address = cfg.contracts.address(c.key).unwrap();
         let landed = summary
             .deployed
             .iter()
@@ -1465,12 +1454,15 @@ async fn rpc_override_moves_only_the_transport() {
         Some(dead.as_str())
     );
 
-    let settled = plan::build(&cfg, &rpc)
+    let settled = Plan::build(&cfg, &rpc)
         .await
         .expect("plan through the override");
     assert_eq!(settled.rpc_origin, rpc.origin());
     assert!(!settled.has_deploys(), "{}", settled.render());
-    let again = apply::run(&path, &cfg, &rpc, &signer, &apply::Options::default())
+    let again = Applier::connect(&cfg, &rpc, &signer, apply::Options::default())
+        .await
+        .expect("apply connects")
+        .run(&path)
         .await
         .expect("second apply through the override");
     assert!(again.deployed.is_empty(), "{:?}", again.deployed);
@@ -1488,7 +1480,7 @@ async fn rpc_override_never_falls_back_to_the_file() {
     let dead = closed_endpoint();
     let rpc = override_rpc(&cfg, &dead);
 
-    let err = plan::build(&cfg, &rpc)
+    let err = Plan::build(&cfg, &rpc)
         .await
         .expect_err("plan must not fall back to the file's endpoint")
         .to_string();
@@ -1500,9 +1492,10 @@ async fn rpc_override_never_falls_back_to_the_file() {
         confirm_fresh_deploy: true,
         ..Default::default()
     };
-    let err = apply::run(&path, &cfg, &rpc, &signer, &opts)
+    let err = Applier::connect(&cfg, &rpc, &signer, opts)
         .await
-        .expect_err("apply must not fall back to the file's endpoint")
+        .err()
+        .expect("apply must not fall back to the file's endpoint")
         .to_string();
     assert!(err.contains(&dead), "{err}");
 
@@ -1529,7 +1522,7 @@ async fn rpc_override_still_enforces_the_declared_chain_id() {
     assert_eq!(cfg.network.chain_id, 31337);
     let rpc = override_rpc(&cfg, &other.endpoint());
 
-    let plan = plan::build(&cfg, &rpc).await.expect("plan is read-only");
+    let plan = Plan::build(&cfg, &rpc).await.expect("plan is read-only");
     assert_eq!(plan.chain_id_actual, 31338);
     assert_eq!(plan.status_of("network.chain_id"), Some(Status::Warn));
 
@@ -1538,9 +1531,10 @@ async fn rpc_override_still_enforces_the_declared_chain_id() {
         confirm_fresh_deploy: true,
         ..Default::default()
     };
-    let err = apply::run(&path, &cfg, &rpc, &signer, &opts)
+    let err = Applier::connect(&cfg, &rpc, &signer, opts)
         .await
-        .expect_err("apply refuses the wrong chain")
+        .err()
+        .expect("apply refuses the wrong chain")
         .to_string();
     assert!(err.contains("chain id mismatch"), "{err}");
     assert!(err.contains("31337") && err.contains("31338"), "{err}");

@@ -67,6 +67,22 @@ impl Platform {
         self.verifier.circuit()
     }
 
+    /// The on-chain platform id.
+    pub fn id(&self) -> FixedBytes<32> {
+        platform_id(self.key)
+    }
+
+    /// The plan and summary name of its Platform Verifier proxy.
+    pub fn component(&self) -> String {
+        format!("contracts.{}", self.contracts_key)
+    }
+
+    /// Whether its Platform Verifier reads trusted keys through the Google
+    /// JWT root list.
+    pub fn reads_jwt_roots(&self) -> bool {
+        self.verifier == PlatformVerifier::Google
+    }
+
     /// What the Platform Verifier initializes with, shaped by what the
     /// profile notarizes: a TLSNotary profile pins the Notary Service, and
     /// Google reads the JWT root list instead. `Initializer::check` refuses
