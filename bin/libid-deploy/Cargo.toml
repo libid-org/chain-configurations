@@ -21,6 +21,7 @@ libid-profiles = "0.16.0"
 alloy = { version = "1", features = [
     "contract",
     "providers",
+    "provider-anvil-api",
     "network",
     "transport-http",
     "serde",

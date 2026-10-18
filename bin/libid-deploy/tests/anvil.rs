@@ -21,9 +21,11 @@ use alloy::{
         keccak256,
         Address,
         Bytes,
+        B256,
         U256,
     },
     providers::{
+        ext::AnvilApi,
         Provider,
         ProviderBuilder,
     },
@@ -1188,13 +1190,10 @@ async fn apply_stops_at_an_escrow_bound_to_another_identity_registry() {
     );
     let elsewhere = Address::repeat_byte(0x99);
     provider
-        .raw_request::<_, serde_json::Value>(
-            "anvil_setStorageAt".into(),
-            (
-                handle_escrow,
-                slot,
-                alloy::primitives::B256::left_padding_from(elsewhere.as_slice()),
-            ),
+        .anvil_set_storage_at(
+            handle_escrow,
+            slot,
+            B256::left_padding_from(elsewhere.as_slice()),
         )
         .await
         .expect("anvil_setStorageAt");

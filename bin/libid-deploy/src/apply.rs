@@ -56,11 +56,13 @@ use crate::{
 use alloy::{
     network::TransactionBuilder,
     primitives::{
+        utils::Unit,
         Address,
         Bytes,
         B256,
     },
     providers::{
+        ext::AnvilApi,
         Provider,
         ProviderBuilder,
     },
@@ -826,36 +828,23 @@ async fn converge_factory_owner<P: Provider>(
         // Complete the two-step locally: impersonate the operational owner
         // (e.g. the anvil #0 wallet) and accept.
         provider
-            .raw_request::<_, serde_json::Value>(
-                "anvil_setBalance".into(),
-                (desired, "0xde0b6b3a7640000"),
-            )
+            .anvil_set_balance(desired, Unit::ETHER.wei())
             .await
             .map_err(|e| anyhow!("anvil_setBalance failed: {e}"))?;
         provider
-            .raw_request::<_, serde_json::Value>(
-                "anvil_impersonateAccount".into(),
-                (desired,),
-            )
+            .anvil_impersonate_account(desired)
             .await
             .map_err(|e| anyhow!("anvil_impersonateAccount failed: {e}"))?;
-        let accept = LibidFactory::acceptOwnershipCall {}.abi_encode();
+        let accept = TransactionRequest::default()
+            .with_from(desired)
+            .with_to(factory)
+            .with_input(LibidFactory::acceptOwnershipCall {}.abi_encode());
         provider
-            .raw_request::<_, serde_json::Value>(
-                "eth_sendTransaction".into(),
-                (serde_json::json!({
-                    "from": desired,
-                    "to": factory,
-                    "data": Bytes::from(accept),
-                }),),
-            )
+            .eth_send_unsigned_transaction(accept)
             .await
             .map_err(|e| anyhow!("impersonated acceptOwnership failed: {e}"))?;
         provider
-            .raw_request::<_, serde_json::Value>(
-                "anvil_stopImpersonatingAccount".into(),
-                (desired,),
-            )
+            .anvil_stop_impersonating_account(desired)
             .await
             .map_err(|e| anyhow!("anvil_stopImpersonatingAccount failed: {e}"))?;
         tracing::info!(from = %sender, to = %desired, "factory ownership converged (dev)");
@@ -874,8 +863,8 @@ async fn converge_factory_owner<P: Provider>(
 /// Whether the RPC's `web3_clientVersion` reports a dev chain (anvil or
 /// hardhat). Returns the raw version string for error messages.
 async fn detect_dev_client<P: Provider>(provider: &P) -> Result<(bool, String)> {
-    let version: String = provider
-        .raw_request("web3_clientVersion".into(), ())
+    let version = provider
+        .get_client_version()
         .await
         .map_err(|e| anyhow!("web3_clientVersion failed: {e}"))?;
     let lower = version.to_lowercase();
