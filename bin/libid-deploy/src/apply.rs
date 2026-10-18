@@ -35,6 +35,24 @@ use std::{
     path::Path,
 };
 
+use crate::{
+    circuits::{
+        self,
+        Circuit,
+    },
+    config::{
+        required_address,
+        NetworkConfig,
+    },
+    names,
+    platforms::{
+        self,
+        Platform,
+        LAUNCH_VERIFIER_VERSION,
+    },
+    rpc::RpcEndpoint,
+    signer::SignerSource,
+};
 use alloy::{
     network::TransactionBuilder,
     primitives::{
@@ -83,29 +101,6 @@ use libid_contracts::{
     },
     send_with_nonce_retry,
     Artifacts,
-};
-use tracing::{
-    info,
-    warn,
-};
-
-use crate::{
-    circuits::{
-        self,
-        Circuit,
-    },
-    config::{
-        required_address,
-        NetworkConfig,
-    },
-    names,
-    platforms::{
-        self,
-        Platform,
-        LAUNCH_VERIFIER_VERSION,
-    },
-    rpc::RpcEndpoint,
-    signer::SignerSource,
 };
 
 /// A component an operator can explicitly upgrade. Every one is a UUPS
@@ -267,10 +262,11 @@ pub async fn run(
     opts: &Options,
 ) -> Result<Summary> {
     let (wallet, sender) = signer.build_wallet(None).await?;
-    info!(
-        "applying as {sender:#x} via {} against {}",
-        signer.describe(),
-        rpc.describe()
+    tracing::info!(
+        %sender,
+        signer = %signer.describe(),
+        rpc = %rpc.describe(),
+        "applying"
     );
     let provider = ProviderBuilder::new()
         .wallet(wallet)
@@ -355,7 +351,7 @@ pub async fn run(
         );
     }
     if !factory_was_present {
-        info!("LibidFactory installed at its canonical address {libid_factory:#x}");
+        tracing::info!(%libid_factory, "LibidFactory installed at its canonical address");
         summary
             .deployed
             .push(("contracts.factory".into(), libid_factory));
@@ -428,9 +424,10 @@ pub async fn run(
             sender,
         )
         .await?;
-        info!(
-            "NotaryService proxy deployed at {addr:#x} ({})",
-            names::NOTARY_SERVICE
+        tracing::info!(
+            %addr,
+            name = names::NOTARY_SERVICE,
+            "NotaryService proxy deployed"
         );
         debug_assert_eq!(addr, notary_service);
         summary
@@ -466,7 +463,7 @@ pub async fn run(
             &provider,
             sender
         )?;
-        info!("notary key {notary_signer:#x} is now trusted");
+        tracing::info!(%notary_signer, "notary key trusted");
         summary
             .configured
             .push(format!("notary key {notary_signer:#x} trusted"));
@@ -484,7 +481,7 @@ pub async fn run(
             &provider,
             sender
         )?;
-        info!("notary fee set: {on_chain_fee} -> {notary_fee} wei");
+        tracing::info!(from_wei = %on_chain_fee, to_wei = %notary_fee, "notary fee set");
         summary
             .configured
             .push(format!("notary fee {on_chain_fee} -> {notary_fee} wei"));
@@ -505,9 +502,10 @@ pub async fn run(
             sender,
         )
         .await?;
-        info!(
-            "CeremonyProofVerifier proxy deployed at {addr:#x} ({})",
-            names::CEREMONY_PROOF_VERIFIER
+        tracing::info!(
+            %addr,
+            name = names::CEREMONY_PROOF_VERIFIER,
+            "CeremonyProofVerifier proxy deployed"
         );
         debug_assert_eq!(addr, proof_verifier);
         summary
@@ -541,9 +539,10 @@ pub async fn run(
             sender,
         )
         .await?;
-        info!(
-            "IdentityRegistry proxy deployed at {addr:#x} ({})",
-            names::IDENTITY_REGISTRY
+        tracing::info!(
+            %addr,
+            name = names::IDENTITY_REGISTRY,
+            "IdentityRegistry proxy deployed"
         );
         debug_assert_eq!(addr, identity_registry);
         summary
@@ -575,7 +574,7 @@ pub async fn run(
             &provider,
             sender
         )?;
-        info!("IdentityRegistry dispatches through {proof_verifier:#x}");
+        tracing::info!(%proof_verifier, "IdentityRegistry dispatches through the proof verifier");
         summary.configured.push(format!(
             "identity registry -> proof verifier {proof_verifier:#x}"
         ));
@@ -591,7 +590,7 @@ pub async fn run(
             &provider,
             sender
         )?;
-        info!("rules configured for {} ({platform_id:#x})", platform.label);
+        tracing::info!(platform = platform.label, %platform_id, "rules configured");
     }
 
     // ── 4. The handle escrow, bound to the identity registry above ───────
@@ -615,10 +614,11 @@ pub async fn run(
             sender,
         )
         .await?;
-        info!(
-            "HandleEscrow proxy deployed at {addr:#x} ({}), resolving through \
-             {identity_registry:#x}",
-            names::HANDLE_ESCROW
+        tracing::info!(
+            %addr,
+            name = names::HANDLE_ESCROW,
+            %identity_registry,
+            "HandleEscrow proxy deployed"
         );
         debug_assert_eq!(addr, handle_escrow);
         summary
@@ -672,10 +672,11 @@ pub async fn run(
             sender,
         )
         .await?;
-        info!(
-            "GoogleJwtRoots proxy deployed at {addr:#x} ({}) — the trust list starts \
-             EMPTY; point a keeper at it, or every Google binding reverts",
-            names::GOOGLE_JWT_ROOTS
+        tracing::info!(
+            %addr,
+            name = names::GOOGLE_JWT_ROOTS,
+            "GoogleJwtRoots proxy deployed; the trust list starts EMPTY: point a \
+             keeper at it, or every Google binding reverts"
         );
         debug_assert_eq!(addr, jwt_roots);
         summary
@@ -707,7 +708,7 @@ pub async fn run(
             &provider,
             sender
         )?;
-        info!("GoogleJwtRoots verifies through {notary_service:#x}");
+        tracing::info!(%notary_service, "GoogleJwtRoots verifies through the notary service");
         summary
             .configured
             .push(format!("jwt roots -> notary service {notary_service:#x}"));
@@ -791,9 +792,12 @@ async fn converge_factory_owner<P: Provider>(
     if current != sender {
         // Nothing this signer can do; say so instead of failing the whole
         // apply after the chain already converged.
-        warn!(
-            "factory owner is {current:#x}, not the apply signer {sender:#x} — \
-             cannot hand ownership to accounts.owner {desired:#x}"
+        tracing::warn!(
+            owner = %current,
+            signer = %sender,
+            wanted = %desired,
+            "factory owner is not the apply signer: cannot hand ownership to \
+             accounts.owner"
         );
         summary.configured.push(format!(
             "factory ownership NOT converged: owned by {current:#x}, wanted \
@@ -814,7 +818,7 @@ async fn converge_factory_owner<P: Provider>(
             provider,
             sender
         )?;
-        info!("factory ownership handover initiated: {sender:#x} -> {desired:#x}");
+        tracing::info!(from = %sender, to = %desired, "factory ownership handover initiated");
     }
 
     let (is_dev, _) = detect_dev_client(provider).await?;
@@ -854,7 +858,7 @@ async fn converge_factory_owner<P: Provider>(
             )
             .await
             .map_err(|e| anyhow!("anvil_stopImpersonatingAccount failed: {e}"))?;
-        info!("factory ownership converged (dev): {sender:#x} -> {desired:#x}");
+        tracing::info!(from = %sender, to = %desired, "factory ownership converged (dev)");
         summary.configured.push(format!(
             "factory ownership transferred to accounts.owner {desired:#x} (dev)"
         ));
@@ -915,7 +919,7 @@ async fn ensure_factory_ownership<P: Provider>(
             provider,
             sender
         )?;
-        info!("factory ownership accepted: {owner:#x} -> {sender:#x}");
+        tracing::info!(from = %owner, to = %sender, "factory ownership accepted");
         return Ok(());
     }
     bail!(
@@ -950,7 +954,7 @@ pub(crate) async fn factory_deploy_named<P: Provider>(
         .await
         .map_err(|e| anyhow!("factory deployedAt({name}) read failed: {e}"))?;
     if existing != Address::ZERO {
-        info!("{name} already deployed by the factory at {existing:#x} — reusing");
+        tracing::info!(name, %existing, "already deployed by the factory; reusing");
         if existing != predicted {
             bail!(
                 "factory record for {name} is {existing:#x} but predict says \
@@ -1084,9 +1088,11 @@ async fn ensure_circuit_verifier<P: Provider>(
         let creation_code = artifacts.bytecode(circuit.contract())?;
         let deployed =
             factory_deploy_named(provider, factory, &name, creation_code, sender).await?;
-        info!(
-            "{} circuit verifier deployed at {deployed:#x} ({name})",
-            circuit.name()
+        tracing::info!(
+            circuit = circuit.name(),
+            %deployed,
+            %name,
+            "circuit verifier deployed"
         );
         debug_assert_eq!(deployed, address);
         summary
@@ -1160,9 +1166,11 @@ async fn apply_platform_verifier<P: Provider>(
             sender,
         )
         .await?;
-        info!(
-            "{} Platform Verifier deployed at {deployed:#x} ({})",
-            platform.label, platform.canonical_name
+        tracing::info!(
+            platform = platform.label,
+            %deployed,
+            name = platform.canonical_name,
+            "Platform Verifier deployed"
         );
         debug_assert_eq!(deployed, proxy);
         summary
@@ -1236,9 +1244,11 @@ async fn converge_trust_roots<P: Provider>(
         provider,
         sender
     )?;
-    info!(
-        "{} circuit verifier rotated: {wired:#x} -> {circuit:#x}",
-        platform.label
+    tracing::info!(
+        platform = platform.label,
+        from = %wired,
+        to = %circuit,
+        "circuit verifier rotated"
     );
     summary.configured.push(format!(
         "{} circuit verifier {wired:#x} -> {circuit:#x}",
@@ -1271,7 +1281,7 @@ async fn converge_jwt_roots<P: Provider>(
         provider,
         sender
     )?;
-    info!("Google verifier reads roots from {jwt_roots:#x}");
+    tracing::info!(%jwt_roots, "Google verifier reads roots from GoogleJwtRoots");
     summary
         .configured
         .push(format!("google verifier -> jwt roots {jwt_roots:#x}"));
@@ -1305,9 +1315,11 @@ async fn register_verifier<P: Provider>(
         provider,
         sender
     )?;
-    info!(
-        "{} registered at version {LAUNCH_VERIFIER_VERSION} -> {proxy:#x}",
-        platform.label
+    tracing::info!(
+        platform = platform.label,
+        version = LAUNCH_VERIFIER_VERSION,
+        %proxy,
+        "Platform Verifier registered"
     );
     summary.configured.push(format!(
         "{} verifier v{LAUNCH_VERIFIER_VERSION} -> {proxy:#x}",
@@ -1366,9 +1378,11 @@ async fn upgrade_if_requested<P: Provider>(
             sender,
         )
         .await?;
-        info!(
-            "{} upgraded: proxy {proxy:#x} now points at {new_impl:#x}",
-            upgrade.contract()
+        tracing::info!(
+            contract = upgrade.contract(),
+            %proxy,
+            %new_impl,
+            "proxy upgraded"
         );
         summary
             .upgraded
