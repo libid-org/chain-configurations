@@ -24,6 +24,11 @@ use libid_contracts::factory::{
     FactoryGenesis,
 };
 
+use crate::circuits::{
+    self,
+    Circuit,
+};
+
 /// One canonical (factory-deployed) contract.
 #[derive(Debug, Clone, Copy)]
 pub struct CanonicalContract {
@@ -143,8 +148,8 @@ pub fn render_address_table(genesis: FactoryGenesis) -> anyhow::Result<String> {
     // operator reading this table is reading every address apply will land
     // on. The verifiers go through the same factory, under a name carrying
     // the circuits release.
-    for circuit in crate::circuits::Circuit::ALL {
-        let name = crate::circuits::factory_name(circuit)?;
+    for circuit in Circuit::ALL {
+        let name = circuits::factory_name(circuit)?;
         let addr = predict_address(factory, &name);
         let _ = writeln!(
             out,

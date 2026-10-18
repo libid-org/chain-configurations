@@ -33,6 +33,7 @@
 use std::{
     collections::BTreeMap,
     path::Path,
+    str::FromStr,
 };
 
 use crate::{
@@ -180,7 +181,7 @@ impl Upgrade {
     ];
 }
 
-impl std::str::FromStr for Upgrade {
+impl FromStr for Upgrade {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self> {
