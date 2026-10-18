@@ -10,6 +10,9 @@
 //! network. Names are append-only; a name already deployed on any real
 //! network must never change.
 //!
+//! A name is unique per factory: a new factory gives every name a new
+//! address, so a stack under a new factory keeps the plain names.
+//!
 //! Two kinds of contract are NOT in this table. Proxy implementations
 //! deploy via plain CREATE: their addresses are referenced by a proxy
 //! slot, and an upgrade replaces one without moving any entry address. The
@@ -44,17 +47,13 @@ pub const NOTARY_SERVICE: &str = "libid.NotaryService";
 /// The Proof Verifier proxy: the Supported Version Set the identity
 /// registry dispatches bindings through.
 pub const CEREMONY_PROOF_VERIFIER: &str = "libid.CeremonyProofVerifier";
-/// The IdentityRegistry proxy — the contract consumers resolve against. A
-/// new contract name starts without a suffix. The registries before it,
-/// `libid.IdentityNames` to `libid.IdentityNames.3`, keep their storage
-/// under another ERC-7201 root and stay on chain; none of their bindings
-/// move here.
+/// The IdentityRegistry proxy — the contract consumers resolve against.
+/// It keys identities by the SHA-256 nodes the circuits prove.
 pub const IDENTITY_REGISTRY: &str = "libid.IdentityRegistry";
-/// The HandleEscrow proxy: value sent to a handle before anyone holds it,
-/// claimed through the IdentityRegistry it was initialized with. No setter
-/// moves it off that registry; only an upgrade can. `.2`: `libid.HandleEscrow`
-/// stays bound to `libid.IdentityNames.3`.
-pub const HANDLE_ESCROW: &str = "libid.HandleEscrow.2";
+/// The HandleEscrow proxy: value sent to a handle node before anyone holds
+/// it, claimed through the IdentityRegistry it was initialized with. No
+/// setter moves it off that registry.
+pub const HANDLE_ESCROW: &str = "libid.HandleEscrow";
 /// The Google JWT root list proxy, read by the Google Platform Verifier.
 pub const GOOGLE_JWT_ROOTS: &str = "libid.GoogleJwtRoots";
 /// The `x/v1` Platform Verifier proxy.

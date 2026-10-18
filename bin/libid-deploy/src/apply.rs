@@ -22,45 +22,26 @@
 //! The stack order is `script/Deploy.s.sol`'s: the Notary Service every
 //! notarized session is authenticated through, the Proof Verifier the
 //! identity registry dispatches bindings through, the identity registry
-//! itself with handle rules per platform, and the Google JWT root list that
-//! pays the Notary Service for each rotation. Two steps that script does
-//! not have: the handle escrow, right after the identity registry it
-//! resolves through, and at the end the ceremony circuits' Honk verifiers
-//! and a Platform Verifier per platform pinned to one of them and
-//! registered into the Supported Version Set, without which a platform has
-//! its rules and can verify nothing.
+//! itself, and the Google JWT root list that pays the Notary Service for
+//! each rotation. Two steps that script does not have: the handle escrow,
+//! right after the identity registry it resolves through, and at the end
+//! the ceremony circuits' Honk verifiers and a Platform Verifier per
+//! platform pinned to one of them and registered into the Supported Version
+//! Set, without which the registry accepts no binding for the platform.
 
 use std::{
     collections::BTreeMap,
+    fmt,
     path::Path,
     str::FromStr,
 };
 
-use crate::{
-    circuits::{
-        self,
-        Circuit,
-    },
-    config::{
-        required_address,
-        NetworkConfig,
-    },
-    names,
-    platforms::{
-        self,
-        Platform,
-        LAUNCH_VERIFIER_VERSION,
-    },
-    rpc::RpcEndpoint,
-    signer::SignerSource,
-};
 use alloy::{
     network::TransactionBuilder,
     primitives::{
         utils::Unit,
         Address,
         Bytes,
-        B256,
     },
     providers::{
         ext::AnvilApi,
@@ -86,7 +67,7 @@ use libid_contracts::{
             GoogleJwtRoots,
             GooglePlatformVerifier,
             NotaryService,
-            TlsNotaryPlatformVerifier,
+            PlatformVerifierBase,
         },
         escrow::HandleEscrow,
         factory::LibidFactory,
@@ -98,12 +79,28 @@ use libid_contracts::{
         ensure_create2_deployer,
         predict_address,
     },
-    platform_verifier::{
-        codehash_at,
-        PlatformVerifier,
-    },
+    platform_verifier::PlatformVerifier,
     send_with_nonce_retry,
     Artifacts,
+};
+
+use crate::{
+    circuits::{
+        self,
+        Circuit,
+    },
+    config::{
+        required_address,
+        NetworkConfig,
+    },
+    names,
+    platforms::{
+        self,
+        Platform,
+        LAUNCH_VERIFIER_VERSION,
+    },
+    rpc::RpcEndpoint,
+    signer::SignerSource,
 };
 
 /// A component an operator can explicitly upgrade. Every one is a UUPS
@@ -115,8 +112,7 @@ pub enum Upgrade {
     NotaryService,
     /// The Proof Verifier — the Supported Version Set survives.
     ProofVerifier,
-    /// The identity registry — every binding and every platform's rules
-    /// survive.
+    /// The identity registry — every binding survives.
     IdentityRegistry,
     /// The handle escrow — every deposit, and the identity registry it
     /// resolves through, survive.
@@ -179,6 +175,31 @@ impl Upgrade {
         "github-platform-verifier",
         "google-platform-verifier",
     ];
+}
+
+impl From<PlatformVerifier> for Upgrade {
+    fn from(verifier: PlatformVerifier) -> Self {
+        match verifier {
+            PlatformVerifier::X => Self::XPlatformVerifier,
+            PlatformVerifier::GitHub => Self::GitHubPlatformVerifier,
+            PlatformVerifier::Google => Self::GooglePlatformVerifier,
+        }
+    }
+}
+
+impl fmt::Display for Upgrade {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotaryService => "notary-service",
+            Self::ProofVerifier => "proof-verifier",
+            Self::IdentityRegistry => "identity-registry",
+            Self::HandleEscrow => "handle-escrow",
+            Self::GoogleJwtRoots => "google-jwt-roots",
+            Self::XPlatformVerifier => "x-platform-verifier",
+            Self::GitHubPlatformVerifier => "github-platform-verifier",
+            Self::GooglePlatformVerifier => "google-platform-verifier",
+        })
+    }
 }
 
 impl FromStr for Upgrade {
@@ -527,7 +548,7 @@ pub async fn run(
     )
     .await?;
 
-    // ── 3. The identity registry, with handle rules per platform ─────────
+    // ── 3. The identity registry ─────────────────────────────────────────
     if !identity_registry_present {
         let addr = deploy_named_proxy(
             &provider,
@@ -583,23 +604,9 @@ pub async fn run(
         ));
     }
 
-    // Handle rules per platform, re-sent every run: the call is owner-only
-    // and idempotent.
-    for platform in platforms::LAUNCH {
-        let platform_id = platforms::platform_id(platform.key);
-        send_with_nonce_retry!(
-            registry.setPlatform(platform_id, platform.rules.clone()),
-            format!("IdentityRegistry.setPlatform({})", platform.label),
-            &provider,
-            sender
-        )?;
-        tracing::info!(platform = platform.label, %platform_id, "rules configured");
-    }
-
     // ── 4. The handle escrow, bound to the identity registry above ───────
-    // `initialize` refuses a registry that does not answer `handleBinding`,
-    // `acceptsBindings` and `handleNodeOfHash`, so the registry and any
-    // upgrade of it land first.
+    // `initialize` refuses a registry whose `nodeKeyed()` is not true, so
+    // the registry and any upgrade of it land first.
     if !handle_escrow_present {
         let addr = deploy_named_proxy(
             &provider,
@@ -735,6 +742,24 @@ pub async fn run(
             &mut summary,
         )
         .await?;
+    }
+
+    // The registry accepts a platform's bindings once its Proof Verifier
+    // routes the platform to a registered verifier.
+    for platform in platforms::LAUNCH {
+        let platform_id = platforms::platform_id(platform.key);
+        let accepts = registry
+            .acceptsBindings(platform_id)
+            .call()
+            .await
+            .map_err(|e| anyhow!("IdentityRegistry.acceptsBindings read failed: {e}"))?;
+        if !accepts {
+            bail!(
+                "IdentityRegistry {identity_registry:#x} accepts no {} binding after \
+                 apply registered its verifier",
+                platform.label
+            );
+        }
     }
 
     // Every requested upgrade ran inside its component's section above; a
@@ -1043,23 +1068,17 @@ fn declared_verifier(cfg: &NetworkConfig, platform: &Platform) -> Result<Address
 /// resolve the same verifier twice.
 #[derive(Debug, Default)]
 struct CircuitCache {
-    /// Circuit -> its verifier's address and on-chain code hash.
-    verifiers: BTreeMap<Circuit, (Address, B256)>,
+    /// Circuit -> its verifier's address.
+    verifiers: BTreeMap<Circuit, Address>,
 }
 
-/// The circuit verifier for `circuit`: deployed if the chain lacks it, and
-/// its code hash read back off the chain either way.
+/// The circuit verifier for `circuit`, deployed if the chain lacks it.
 ///
 /// The verifier goes through the factory under
 /// [`circuits::factory_name`], so its address is a pure function of which
 /// artifact it is. That is what makes this idempotent: a second apply
 /// finds code at the same address and sends nothing, and a circuits
-/// release is a different name, a different address and a rotation rather
-/// than a silent replacement.
-///
-/// The code hash is READ, never computed: the hash the Platform Verifier
-/// checks is the one the chain holds, and the crate embeds only creation
-/// code.
+/// release is a different name and a different address.
 async fn ensure_circuit_verifier<P: Provider>(
     provider: &P,
     artifacts: &Artifacts,
@@ -1068,9 +1087,9 @@ async fn ensure_circuit_verifier<P: Provider>(
     circuit: Circuit,
     cache: &mut CircuitCache,
     summary: &mut Summary,
-) -> Result<(Address, B256)> {
-    if let Some(known) = cache.verifiers.get(&circuit) {
-        return Ok(*known);
+) -> Result<Address> {
+    if let Some(&known) = cache.verifiers.get(&circuit) {
+        return Ok(known);
     }
     let name = circuits::factory_name(circuit)?;
     let address = predict_address(factory, &name);
@@ -1089,16 +1108,8 @@ async fn ensure_circuit_verifier<P: Provider>(
             .deployed
             .push((format!("circuits.{}", circuit.name()), deployed));
     }
-
-    let codehash = codehash_at(provider, address).await.map_err(|e| {
-        anyhow!(
-            "the {} circuit verifier at {address:#x}: {e} — the Platform Verifier pins \
-             it by code hash and would refuse it",
-            circuit.name()
-        )
-    })?;
-    cache.verifiers.insert(circuit, (address, codehash));
-    Ok((address, codehash))
+    cache.verifiers.insert(circuit, address);
+    Ok(address)
 }
 
 /// Deploy, wire and register one platform's Platform Verifier, on the
@@ -1119,7 +1130,7 @@ async fn apply_platform_verifier<P: Provider>(
     summary: &mut Summary,
 ) -> Result<()> {
     let proxy = declared_verifier(cfg, platform)?;
-    let (circuit, codehash) = ensure_circuit_verifier(
+    let circuit = ensure_circuit_verifier(
         provider,
         artifacts,
         factory,
@@ -1132,19 +1143,16 @@ async fn apply_platform_verifier<P: Provider>(
 
     if !code_present(provider, proxy).await? {
         // The initializer knows the contract's rules — a Notary Service
-        // exactly where the profile notarizes — and reads the code hash it
-        // pins off the chain, so a mis-wiring fails here rather than at the
-        // proxy's constructor.
+        // exactly where the profile notarizes — and the code at `circuit`
+        // must be the verifier the implementation compiles in, so a
+        // mis-wiring fails here rather than at the proxy's constructor.
+        platform
+            .verifier
+            .circuit_codehash_at(provider, artifacts, circuit)
+            .await?;
         let init = platform
             .initializer(sender, notary_service, circuit, jwt_roots)
-            .call(provider)
-            .await?;
-        if init.honk_verifier_codehash() != codehash {
-            bail!(
-                "the {} circuit verifier at {circuit:#x} changed code between reads",
-                platform.circuit().name()
-            );
-        }
+            .call()?;
         let deployed = deploy_named_proxy(
             provider,
             artifacts,
@@ -1180,7 +1188,7 @@ async fn apply_platform_verifier<P: Provider>(
     .await?;
 
     converge_trust_roots(
-        provider, platform, proxy, circuit, codehash, sender, summary,
+        provider, artifacts, platform, proxy, circuit, sender, summary,
     )
     .await?;
     if platform.verifier == PlatformVerifier::Google {
@@ -1190,46 +1198,51 @@ async fn apply_platform_verifier<P: Provider>(
 }
 
 /// Point a Platform Verifier at its circuit's verifier when the two have
-/// drifted. Moving the contracts pin to a new circuits release and
-/// re-applying IS the rotation path: the release is a new artifact under a
-/// new factory name, and the verifier must be told which one it answers
-/// for.
+/// drifted. A new circuits release lands under a new factory name, and the
+/// proxy's implementation compiles in the code hash it accepts, so the
+/// rotation needs `--upgrade` of that Platform Verifier in the same run;
+/// without it apply stops before sending `setTrustRoots`.
 ///
-/// The reads and the write go through the TLSNotary binding for every
-/// platform — this surface is `PlatformVerifierBase`'s, identical in every
-/// Platform Verifier — and only the Notary Service argument differs, which
-/// is what the profile decides.
+/// The surface is `PlatformVerifierBase`'s, identical in every Platform
+/// Verifier. The Notary Service the proxy holds is kept: zero for Google,
+/// whose profile notarizes nothing.
 async fn converge_trust_roots<P: Provider>(
     provider: &P,
+    artifacts: &Artifacts,
     platform: &Platform,
     proxy: Address,
     circuit: Address,
-    codehash: B256,
     sender: Address,
     summary: &mut Summary,
 ) -> Result<()> {
-    let verifier = TlsNotaryPlatformVerifier::new(proxy, provider);
+    let verifier = PlatformVerifierBase::new(proxy, provider);
     let wired = verifier
         .honkVerifier()
         .call()
         .await
         .map_err(|e| anyhow!("{}.honkVerifier read failed: {e}", platform.label))?;
-    let wired_hash = verifier.honkVerifierCodehash().call().await.map_err(|e| {
-        anyhow!("{}.honkVerifierCodehash read failed: {e}", platform.label)
-    })?;
-    if wired == circuit && wired_hash == codehash {
+    if wired == circuit {
         return Ok(());
     }
-    let notary = match platform.verifier {
-        PlatformVerifier::X | PlatformVerifier::GitHub => {
-            verifier.notaryService().call().await.map_err(|e| {
-                anyhow!("{}.notaryService read failed: {e}", platform.label)
-            })?
-        }
-        PlatformVerifier::Google => Address::ZERO,
-    };
+    platform
+        .verifier
+        .rotation_codehash_at(provider, artifacts, proxy, circuit)
+        .await
+        .with_context(|| {
+            format!(
+                "{} pins {wired:#x}; rotating it onto {circuit:#x} takes \
+                 --upgrade {} in the same apply",
+                platform.label,
+                Upgrade::from(platform.verifier)
+            )
+        })?;
+    let notary = verifier
+        .notaryService()
+        .call()
+        .await
+        .map_err(|e| anyhow!("{}.notaryService read failed: {e}", platform.label))?;
     send_with_nonce_retry!(
-        verifier.setTrustRoots(notary, circuit, codehash),
+        verifier.setTrustRoots(notary, circuit),
         format!("{}.setTrustRoots", platform.label),
         provider,
         sender
@@ -1403,6 +1416,7 @@ mod tests {
     fn every_upgrade_value_parses_and_names_a_canonical_proxy() {
         for value in Upgrade::VALUES {
             let upgrade: Upgrade = value.parse().expect("value parses");
+            assert_eq!(upgrade.to_string(), *value);
             assert!(
                 names::canonical_name(upgrade.contracts_key()).is_some(),
                 "{value} names no canonical contract"

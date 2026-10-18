@@ -1,6 +1,6 @@
 [package]
 name = "libid-deploy"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2021"
 rust-version = "1.94.1"
 license = "MIT OR Apache-2.0"
@@ -9,16 +9,15 @@ description = "Applies per-network declarative configuration to chains: every ca
 publish = false
 
 [dependencies]
-libid-contracts = "0.17.0"
-# The handle transform's generated table: platform keys (whose keccak256 is
-# the on-chain platform id) and the normalization rules `setPlatform` stores.
-# Retyping either here would hash handles to nodes no deployed reader looks
-# up.
-libid-identity = "0.16.0"
+libid-contracts = "0.18"
+# The generated platform table: platform keys, whose keccak256 is the
+# on-chain platform id. A key retyped here would name a platform no deployed
+# verifier serves.
+libid-identity = "0.18"
 # The ceremony profile table: which sessions a platform notarizes, hence
 # whether its Platform Verifier holds a Notary Service at all.
-libid-profiles = "0.16.0"
-alloy = { version = "1", features = [
+libid-profiles = "0.18"
+alloy = { version = "2", features = [
     "contract",
     "providers",
     "provider-anvil-api",
@@ -32,8 +31,13 @@ alloy = { version = "1", features = [
 # KMS-backed signing: `signer-aws` re-exports `alloy::signers::aws::AwsSigner`,
 # but constructing one needs an aws_sdk_kms::Client, so the SDK crates are
 # direct dependencies pinned to the 1.x line cargo unifies with alloy's.
+# The KMS SDK takes the default HTTPS client (hyper 1, rustls 0.23) without
+# its `rustls` feature, which adds the hyper 0.14 / rustls 0.21 connector.
 aws-config = "1"
-aws-sdk-kms = "1"
+aws-sdk-kms = { version = "1", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -45,5 +49,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
 [dev-dependencies]
-alloy = { version = "1", features = ["node-bindings"] }
+alloy = { version = "2", features = ["node-bindings"] }
 tempfile = "3"

@@ -49,15 +49,20 @@ use libid_contracts::{
             CeremonyProofVerifier,
             GoogleJwtRoots,
             GooglePlatformVerifier,
+            IPlatformVerifier,
             NotaryService,
-            TlsNotaryPlatformVerifier,
+            PlatformVerifierBase,
         },
-        circuits::HonkVerifier,
+        circuits::{
+            HonkVerifier,
+            IHonkVerifierErrors,
+        },
         escrow::HandleEscrow,
         factory::LibidFactory,
         identity::IdentityRegistry,
         proxy::IUUPSUpgradeable,
     },
+    circuits::deploy_honk_verifier,
     deploy::deploy_contract_from,
     factory::{
         predict_address,
@@ -198,24 +203,18 @@ google_platform_verifier = "{google}"
     path
 }
 
-/// Some other contract with code, to drift a trust root onto. What
-/// `setTrustRoots` requires of an address is that its code hash matches the
-/// one named, so any deployed contract drifts the pin exactly — and could
-/// never accept a proof, which is why apply must pull it back.
-async fn deploy_stand_in(rpc: &str, key: &str) -> Address {
+/// A second copy of `circuit`'s verifier at a plain CREATE address, to drift
+/// a trust root onto. `setTrustRoots` accepts any address holding the code
+/// the implementation pins, so a copy off the canonical CREATE3 address is
+/// the drift apply must pull back.
+async fn deploy_verifier_copy(rpc: &str, key: &str, circuit: Circuit) -> Address {
     let signer: PrivateKeySigner = key.parse().unwrap();
     let provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
         .connect_http(rpc.parse().unwrap());
-    let artifacts = Artifacts::embedded();
-    deploy_contract_from(
-        &provider,
-        artifacts.bytecode("WTIA9").unwrap(),
-        "circuit verifier stand-in",
-        None,
-    )
-    .await
-    .expect("stand-in deploys")
+    deploy_honk_verifier(&provider, &Artifacts::embedded(), circuit, None)
+        .await
+        .expect("the verifier copy deploys")
 }
 
 /// The endpoint the file itself names — no `--rpc-url`.
@@ -270,9 +269,10 @@ async fn honk_log_n<P: Provider>(provider: &P, verifier: Address) -> u64 {
     let data = err
         .as_revert_data()
         .expect("the verifier reverted with data");
-    let decoded = HonkVerifier::ProofLengthWrongWithLogN::abi_decode(&data)
+    let decoded = IHonkVerifierErrors::ProofLengthWrongWithLogN::abi_decode(&data)
         .expect("only a Honk verifier raises ProofLengthWrongWithLogN");
-    decoded.logN.to::<u64>()
+    // bb's `ProofLengthWrongWithLogN(logN, actualLength, expectedLength)`.
+    decoded._0.to::<u64>()
 }
 
 /// The address apply deploys a circuit's Honk verifier to: CREATE3 under a
@@ -380,10 +380,9 @@ async fn declarative_apply_cycle_never_touches_the_config() {
     // name can bind. That is a keeper's job, not apply's.
     assert!(roots.needsRotation().call().await.unwrap());
 
-    // Every launch platform has its rules AND can verify: one apply
-    // builds the circuit verifiers, deploys a Platform Verifier on each and
-    // registers it, so the identity registry resolves instead of reverting
-    // UnknownPlatform.
+    // Every launch platform can verify: one apply builds the circuit
+    // verifiers, deploys a Platform Verifier on each and registers it, so the
+    // identity registry accepts its bindings.
     let verifier = CeremonyProofVerifier::new(proof_verifier, &provider);
     for platform in platforms::LAUNCH {
         let platform_id = platforms::platform_id(platform.key);
@@ -392,12 +391,21 @@ async fn declarative_apply_cycle_never_touches_the_config() {
             "{} has no verifier registered",
             platform.label
         );
-        assert_eq!(
+        assert!(
             registry
-                .resolveId(platform_id, "12345".into())
+                .acceptsBindings(platform_id)
                 .call()
                 .await
-                .expect("a wired platform resolves"),
+                .expect("a launch platform is known"),
+            "{} accepts no binding",
+            platform.label
+        );
+        assert_eq!(
+            registry
+                .resolveId(B256::repeat_byte(0x12))
+                .call()
+                .await
+                .expect("an unbound id node resolves"),
             Address::ZERO
         );
     }
@@ -797,13 +805,17 @@ async fn platform_verifiers_deploy_wire_and_register() {
             .unwrap()
             .parse()
             .unwrap();
-        let verifier = TlsNotaryPlatformVerifier::new(proxy, &provider);
+        let verifier = PlatformVerifierBase::new(proxy, &provider);
 
         // It answers for its own platform, and pins the verifier of the
         // circuit its proofs are made under — nonzero, at the address the
         // circuits pin derives, with the code hash the CHAIN reports.
         assert_eq!(
-            verifier.platformId().call().await.unwrap(),
+            IPlatformVerifier::new(proxy, &provider)
+                .platformId()
+                .call()
+                .await
+                .unwrap(),
             platform_id,
             "{} serves the wrong platform",
             platform.label
@@ -813,9 +825,9 @@ async fn platform_verifiers_deploy_wire_and_register() {
         assert_ne!(wired, Address::ZERO, "{} pins nothing", platform.label);
         assert_eq!(wired, circuit, "{} pins the wrong circuit", platform.label);
         assert_eq!(
-            verifier.honkVerifierCodehash().call().await.unwrap(),
+            verifier.circuitCodehash().call().await.unwrap(),
             keccak256(provider.get_code_at(wired).await.unwrap()),
-            "{} recorded a hash the chain does not hold",
+            "{} pins a hash the chain does not hold",
             platform.label
         );
 
@@ -857,14 +869,11 @@ async fn platform_verifiers_deploy_wire_and_register() {
             .call()
             .await
             .unwrap());
-        assert_eq!(
-            registry
-                .resolveId(platform_id, "12345".into())
-                .call()
-                .await
-                .expect("a wired platform resolves"),
-            Address::ZERO
-        );
+        assert!(registry
+            .acceptsBindings(platform_id)
+            .call()
+            .await
+            .expect("a launch platform is known"));
 
         // One Notary Fee per attestation the profile requires, quoted end
         // to end through the identity registry.
@@ -894,7 +903,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
     let mut pinned = Vec::new();
     for proxy in [x_proxy, github_proxy, google_proxy] {
         pinned.push(
-            TlsNotaryPlatformVerifier::new(proxy, &provider)
+            PlatformVerifierBase::new(proxy, &provider)
                 .honkVerifier()
                 .call()
                 .await
@@ -958,12 +967,12 @@ async fn platform_verifiers_deploy_wire_and_register() {
             .unwrap();
         let circuit = circuit_verifier_address(platform.circuit());
         assert_eq!(
-            TlsNotaryPlatformVerifier::new(proxy, &provider)
-                .honkVerifierCodehash()
+            PlatformVerifierBase::new(proxy, &provider)
+                .honkVerifier()
                 .call()
                 .await
                 .unwrap(),
-            keccak256(provider.get_code_at(circuit).await.unwrap())
+            circuit
         );
     }
 
@@ -998,20 +1007,17 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
     let x_proxy: Address = cfg.contracts.x_platform_verifier.parse().unwrap();
     let pinned = circuit_verifier_address(platforms::X.circuit());
 
-    // Drift: the owner points X at some other contract with code. It would
-    // never accept a proof, which is why apply must pull the pin back.
-    let elsewhere = deploy_stand_in(&anvil.endpoint(), ANVIL_KEY).await;
+    // Drift: the owner points X at a copy of its verifier off the
+    // canonical address.
+    let elsewhere =
+        deploy_verifier_copy(&anvil.endpoint(), ANVIL_KEY, platforms::X.circuit()).await;
     assert_ne!(elsewhere, pinned);
     let key: PrivateKeySigner = ANVIL_KEY.parse().unwrap();
     let owned = ProviderBuilder::new()
         .wallet(EthereumWallet::from(key))
         .connect_http(anvil.endpoint_url());
-    TlsNotaryPlatformVerifier::new(x_proxy, &owned)
-        .setTrustRoots(
-            notary_service,
-            elsewhere,
-            keccak256(provider.get_code_at(elsewhere).await.unwrap()),
-        )
+    PlatformVerifierBase::new(x_proxy, &owned)
+        .setTrustRoots(notary_service, elsewhere)
         .send()
         .await
         .unwrap()
@@ -1030,12 +1036,9 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
 
     let repaired = apply_with(&path, apply::Options::default()).await;
     assert!(repaired.deployed.is_empty(), "{:?}", repaired.deployed);
-    let x = TlsNotaryPlatformVerifier::new(x_proxy, &provider);
+    let x = PlatformVerifierBase::new(x_proxy, &provider);
     assert_eq!(x.honkVerifier().call().await.unwrap(), pinned);
-    assert_eq!(
-        x.honkVerifierCodehash().call().await.unwrap(),
-        keccak256(provider.get_code_at(pinned).await.unwrap())
-    );
+    assert_eq!(x.notaryService().call().await.unwrap(), notary_service);
     // The proxy did not move: the registration still points at it.
     assert_eq!(
         CeremonyProofVerifier::new(
@@ -1050,6 +1053,89 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
         .await
         .unwrap(),
         x_proxy
+    );
+}
+
+/// A canonical circuit verifier whose code is not the one the Platform
+/// Verifier implementation pins cannot be rotated onto: plan warns, and
+/// apply stops before `setTrustRoots`, naming the `--upgrade` that ships
+/// an implementation pinning it. The test swaps the code under the
+/// canonical address, as a circuits release would move it.
+#[tokio::test]
+async fn apply_refuses_a_rotation_onto_code_the_implementation_does_not_pin() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prefilled_network_file(dir.path(), &anvil.endpoint());
+    apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let notary_service: Address = cfg.contracts.notary_service.parse().unwrap();
+    let x_proxy: Address = cfg.contracts.x_platform_verifier.parse().unwrap();
+    let pinned = circuit_verifier_address(platforms::X.circuit());
+
+    let copy =
+        deploy_verifier_copy(&anvil.endpoint(), ANVIL_KEY, platforms::X.circuit()).await;
+    let key: PrivateKeySigner = ANVIL_KEY.parse().unwrap();
+    let owned = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(key))
+        .connect_http(anvil.endpoint_url());
+    for proxy in [
+        x_proxy,
+        cfg.contracts.github_platform_verifier.parse().unwrap(),
+    ] {
+        PlatformVerifierBase::new(proxy, &owned)
+            .setTrustRoots(notary_service, copy)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+    }
+    provider
+        .raw_request::<_, ()>("anvil_setCode".into(), (pinned, Bytes::from(vec![0x00])))
+        .await
+        .expect("anvil_setCode");
+
+    let drifted = plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan sees the foreign code");
+    assert_eq!(
+        drifted.status_of("circuits.bearer-link"),
+        Some(Status::Warn)
+    );
+
+    let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
+    let err = apply::run(
+        &path,
+        &cfg,
+        &file_rpc(&cfg),
+        &signer,
+        &apply::Options::default(),
+    )
+    .await
+    .expect_err("apply cannot rotate onto code the implementation refuses");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("--upgrade x-platform-verifier"),
+        "got: {message}"
+    );
+    assert_eq!(
+        PlatformVerifierBase::new(x_proxy, &provider)
+            .honkVerifier()
+            .call()
+            .await
+            .unwrap(),
+        copy,
+        "the trust roots moved anyway"
     );
 }
 
@@ -1111,13 +1197,14 @@ async fn the_handle_escrow_resolves_through_the_identity_registry_beside_it() {
     let registry = IdentityRegistry::new(identity_registry, &provider);
     let x = platforms::platform_id(platforms::X.key);
     assert!(registry.acceptsBindings(x).call().await.unwrap());
-    let handle_hash = registry
-        .handleHashOf(x, "alice".into())
+    // A platform no ceremony profile names is refused, not reported idle.
+    assert!(registry
+        .acceptsBindings(platforms::platform_id("discord"))
         .call()
         .await
-        .unwrap();
+        .is_err());
     let node = registry
-        .handleNodeOfHash(x, handle_hash)
+        .handleNodeOf(x, "alice".into())
         .call()
         .await
         .unwrap();
@@ -1128,7 +1215,7 @@ async fn the_handle_escrow_resolves_through_the_identity_registry_beside_it() {
         .wallet(EthereumWallet::from(key))
         .connect_http(anvil.endpoint_url());
     HandleEscrow::new(handle_escrow, &owned)
-        .deposit(x, handle_hash, native, U256::from(1), refund_to)
+        .depositToHandle(x, "alice".into(), native, U256::from(1), refund_to)
         .value(U256::from(1))
         .send()
         .await
