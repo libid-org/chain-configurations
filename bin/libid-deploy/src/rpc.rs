@@ -56,13 +56,6 @@ enum Source {
     File,
 }
 
-/// An endpoint as a line of output names it: scheme, host and port. A
-/// private endpoint carries its provider's key in the path or the query,
-/// and these lines reach terminals and step summaries.
-fn origin_of(url: &Url) -> String {
-    url.origin().ascii_serialization()
-}
-
 impl RpcEndpoint {
     /// The endpoint the flag or the file names, if either names one:
     /// `--rpc-url` when given, else the file's `network.rpc_url`. An
@@ -78,7 +71,8 @@ impl RpcEndpoint {
                 source: Source::Flag {
                     file: file
                         .map(|f| {
-                            parse_rpc_url(f, "network.rpc_url").map(|u| origin_of(&u))
+                            parse_rpc_url(f, "network.rpc_url")
+                                .map(|u| u.origin().ascii_serialization())
                         })
                         .transpose()?,
                 },
@@ -119,7 +113,7 @@ impl RpcEndpoint {
     /// The endpoint by origin: scheme, host and port, never the path or
     /// the query, where a private endpoint carries its key.
     pub fn origin(&self) -> String {
-        origin_of(&self.url)
+        self.url.origin().ascii_serialization()
     }
 
     /// For prompts, logs and errors: the endpoint, by origin, and its

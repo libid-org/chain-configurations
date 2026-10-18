@@ -13,11 +13,21 @@
 //! name)` — exactly the addresses the file declared before the chain even
 //! existed.
 
-use std::path::PathBuf;
+use std::{
+    net::TcpListener,
+    path::{
+        Path,
+        PathBuf,
+    },
+    process::Command,
+};
 
 use alloy::{
     network::EthereumWallet,
-    node_bindings::AnvilInstance,
+    node_bindings::{
+        Anvil,
+        AnvilInstance,
+    },
     primitives::{
         keccak256,
         Address,
@@ -26,6 +36,7 @@ use alloy::{
         U256,
     },
     providers::{
+        ext::AnvilApi,
         Provider,
         ProviderBuilder,
     },
@@ -116,14 +127,14 @@ fn spawn_anvil() -> AnvilInstance {
         .expect("anvil spawns (is foundry on PATH?)")
 }
 
-fn anvil_builder() -> alloy::node_bindings::Anvil {
-    alloy::node_bindings::Anvil::new().arg("--disable-default-create2-deployer")
+fn anvil_builder() -> Anvil {
+    Anvil::new().arg("--disable-default-create2-deployer")
 }
 
 /// An `http://127.0.0.1:<port>` nothing listens on: the port is taken from
 /// the kernel and released again, so a connection is refused at once.
 fn closed_endpoint() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     drop(listener);
     format!("http://127.0.0.1:{port}")
@@ -131,7 +142,7 @@ fn closed_endpoint() -> String {
 
 /// The committed `networks/local-dev.toml`, read from the repository.
 fn committed_local_dev() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../networks/local-dev.toml")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../networks/local-dev.toml")
 }
 
 /// `--rpc-url <endpoint>` over `cfg`.
@@ -142,11 +153,11 @@ fn override_rpc(cfg: &NetworkConfig, endpoint: &str) -> RpcEndpoint {
 /// A network file PRE-FILLED with the full canonical address table —
 /// written before the chain has anything on it, because every address is a
 /// pure function of its name. Owner: the anvil #0 wallet, explicitly.
-fn prefilled_network_file(dir: &std::path::Path, rpc: &str) -> PathBuf {
+fn prefilled_network_file(dir: &Path, rpc: &str) -> PathBuf {
     write_network_file(dir, rpc)
 }
 
-fn write_network_file(dir: &std::path::Path, rpc: &str) -> PathBuf {
+fn write_network_file(dir: &Path, rpc: &str) -> PathBuf {
     let factory = factory_address();
     let addr = |name: &str| format!("{:#x}", predict_address(factory, name));
     let path = dir.join("anvil-local.toml");
@@ -197,9 +208,9 @@ google_platform_verifier = "{google}"
 /// the implementation pins, so a copy off the canonical CREATE3 address is
 /// the drift apply must pull back.
 async fn deploy_verifier_copy(rpc: &str, key: &str, circuit: Circuit) -> Address {
-    let signer: alloy::signers::local::PrivateKeySigner = key.parse().unwrap();
+    let signer: PrivateKeySigner = key.parse().unwrap();
     let provider = ProviderBuilder::new()
-        .wallet(alloy::network::EthereumWallet::from(signer))
+        .wallet(EthereumWallet::from(signer))
         .connect_http(rpc.parse().unwrap());
     deploy_honk_verifier(&provider, &Artifacts::embedded(), circuit, None)
         .await
@@ -212,7 +223,7 @@ fn file_rpc(cfg: &NetworkConfig) -> RpcEndpoint {
 }
 
 /// Apply `path` against the chain it names with the anvil #0 key.
-async fn apply_with(path: &std::path::Path, opts: apply::Options) -> apply::Summary {
+async fn apply_with(path: &Path, opts: apply::Options) -> apply::Summary {
     let cfg = NetworkConfig::load(path).expect("config loads");
     let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
     apply::run(path, &cfg, &file_rpc(&cfg), &signer, &opts)
@@ -491,9 +502,9 @@ async fn apply_converges_drifted_wiring_without_redeploying() {
 
     // Drift: the owner (the anvil #0 key, which is also the apply signer)
     // points the identity registry somewhere else and changes the fee.
-    let key: alloy::signers::local::PrivateKeySigner = ANVIL_KEY.parse().unwrap();
+    let key: PrivateKeySigner = ANVIL_KEY.parse().unwrap();
     let owned = ProviderBuilder::new()
-        .wallet(alloy::network::EthereumWallet::from(key))
+        .wallet(EthereumWallet::from(key))
         .connect_http(anvil.endpoint_url());
     IdentityRegistry::new(identity_registry, &owned)
         .setProofVerifier(Address::repeat_byte(0x99))
@@ -574,9 +585,9 @@ async fn apply_upgrades_a_proxy_before_reading_through_it() {
     let proof_verifier: Address = cfg.contracts.ceremony_proof_verifier.parse().unwrap();
     let identity_registry: Address = cfg.contracts.identity_registry.parse().unwrap();
 
-    let key: alloy::signers::local::PrivateKeySigner = ANVIL_KEY.parse().unwrap();
+    let key: PrivateKeySigner = ANVIL_KEY.parse().unwrap();
     let owned = ProviderBuilder::new()
-        .wallet(alloy::network::EthereumWallet::from(key))
+        .wallet(EthereumWallet::from(key))
         .connect_http(anvil.endpoint_url());
     let stale_impl = deploy_contract_from(
         &owned,
@@ -1001,9 +1012,9 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
     let elsewhere =
         deploy_verifier_copy(&anvil.endpoint(), ANVIL_KEY, platforms::X.circuit()).await;
     assert_ne!(elsewhere, pinned);
-    let key: alloy::signers::local::PrivateKeySigner = ANVIL_KEY.parse().unwrap();
+    let key: PrivateKeySigner = ANVIL_KEY.parse().unwrap();
     let owned = ProviderBuilder::new()
-        .wallet(alloy::network::EthereumWallet::from(key))
+        .wallet(EthereumWallet::from(key))
         .connect_http(anvil.endpoint_url());
     PlatformVerifierBase::new(x_proxy, &owned)
         .setTrustRoots(notary_service, elsewhere)
@@ -1199,9 +1210,9 @@ async fn the_handle_escrow_resolves_through_the_identity_registry_beside_it() {
         .unwrap();
     let native = escrow.NATIVE().call().await.unwrap();
     let refund_to: Address = ANVIL_NOTARY.parse().unwrap();
-    let key: alloy::signers::local::PrivateKeySigner = ANVIL_KEY.parse().unwrap();
+    let key: PrivateKeySigner = ANVIL_KEY.parse().unwrap();
     let owned = ProviderBuilder::new()
-        .wallet(alloy::network::EthereumWallet::from(key))
+        .wallet(EthereumWallet::from(key))
         .connect_http(anvil.endpoint_url());
     HandleEscrow::new(handle_escrow, &owned)
         .depositToHandle(x, "alice".into(), native, U256::from(1), refund_to)
@@ -1278,13 +1289,10 @@ async fn apply_stops_at_an_escrow_bound_to_another_identity_registry() {
     );
     let elsewhere = Address::repeat_byte(0x99);
     provider
-        .raw_request::<_, serde_json::Value>(
-            "anvil_setStorageAt".into(),
-            (
-                handle_escrow,
-                slot,
-                alloy::primitives::B256::left_padding_from(elsewhere.as_slice()),
-            ),
+        .anvil_set_storage_at(
+            handle_escrow,
+            slot,
+            B256::left_padding_from(elsewhere.as_slice()),
         )
         .await
         .expect("anvil_setStorageAt");
@@ -1551,7 +1559,7 @@ fn the_cli_applies_the_committed_file_through_rpc_url() {
     let before = std::fs::read(&path).unwrap();
     let bin = env!("CARGO_BIN_EXE_libid-deploy");
 
-    let apply = std::process::Command::new(bin)
+    let apply = Command::new(bin)
         .arg("apply")
         .arg("--network")
         .arg(&path)
@@ -1577,7 +1585,7 @@ fn the_cli_applies_the_committed_file_through_rpc_url() {
     }
     assert_eq!(std::fs::read(&path).unwrap(), before);
 
-    let plan = std::process::Command::new(bin)
+    let plan = Command::new(bin)
         .arg("plan")
         .arg("--network")
         .arg(&path)

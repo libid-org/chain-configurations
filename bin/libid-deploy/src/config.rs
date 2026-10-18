@@ -320,10 +320,12 @@ impl NetworkConfig {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
-    fn networks_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../networks")
+    fn networks_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../networks")
     }
 
     /// Anvil account #0: the deployer of the test configurations.
