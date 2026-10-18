@@ -10,9 +10,8 @@
 //! network. Names are append-only; a name already deployed on any real
 //! network must never change.
 //!
-//! The `.2` names (`.3` for the escrow) are the node-keyed stack of
-//! libid-contracts 0.18, whose storage and payloads differ from the stack
-//! before it.
+//! A name is unique per factory: a new factory gives every name a new
+//! address, so a stack under a new factory keeps the plain names.
 //!
 //! Two kinds of contract are NOT in this table. Proxy implementations
 //! deploy via plain CREATE: their addresses are referenced by a proxy
@@ -39,25 +38,25 @@ pub struct CanonicalContract {
 
 /// The Notary Service proxy — deploys first; every notarized session is
 /// authenticated through it.
-pub const NOTARY_SERVICE: &str = "libid.NotaryService.2";
+pub const NOTARY_SERVICE: &str = "libid.NotaryService";
 /// The Proof Verifier proxy: the Supported Version Set the identity
 /// registry dispatches bindings through.
-pub const CEREMONY_PROOF_VERIFIER: &str = "libid.CeremonyProofVerifier.2";
+pub const CEREMONY_PROOF_VERIFIER: &str = "libid.CeremonyProofVerifier";
 /// The IdentityRegistry proxy — the contract consumers resolve against.
 /// It keys identities by the SHA-256 nodes the circuits prove.
-pub const IDENTITY_REGISTRY: &str = "libid.IdentityRegistry.2";
+pub const IDENTITY_REGISTRY: &str = "libid.IdentityRegistry";
 /// The HandleEscrow proxy: value sent to a handle node before anyone holds
 /// it, claimed through the IdentityRegistry it was initialized with. No
 /// setter moves it off that registry.
-pub const HANDLE_ESCROW: &str = "libid.HandleEscrow.3";
+pub const HANDLE_ESCROW: &str = "libid.HandleEscrow";
 /// The Google JWT root list proxy, read by the Google Platform Verifier.
-pub const GOOGLE_JWT_ROOTS: &str = "libid.GoogleJwtRoots.2";
+pub const GOOGLE_JWT_ROOTS: &str = "libid.GoogleJwtRoots";
 /// The `x/v1` Platform Verifier proxy.
-pub const X_PLATFORM_VERIFIER: &str = "libid.XPlatformVerifier.2";
+pub const X_PLATFORM_VERIFIER: &str = "libid.XPlatformVerifier";
 /// The `github/v1` Platform Verifier proxy.
-pub const GITHUB_PLATFORM_VERIFIER: &str = "libid.GitHubPlatformVerifier.2";
+pub const GITHUB_PLATFORM_VERIFIER: &str = "libid.GitHubPlatformVerifier";
 /// The `google/v1` Platform Verifier proxy.
-pub const GOOGLE_PLATFORM_VERIFIER: &str = "libid.GooglePlatformVerifier.2";
+pub const GOOGLE_PLATFORM_VERIFIER: &str = "libid.GooglePlatformVerifier";
 
 /// Every canonical contract, in deploy order.
 pub const CANONICAL_CONTRACTS: &[CanonicalContract] = &[
