@@ -9,14 +9,14 @@ description = "Applies per-network declarative configuration to chains: every ca
 publish = false
 
 [dependencies]
-libid-contracts = "0.18"
+libid-contracts = "0.19"
 # The generated platform table: platform keys, whose keccak256 is the
 # on-chain platform id. A key retyped here would name a platform no deployed
 # verifier serves.
-libid-identity = "0.18"
+libid-identity = "0.19"
 # The ceremony profile table: which sessions a platform notarizes, hence
 # whether its Platform Verifier holds a Notary Service at all.
-libid-profiles = "0.18"
+libid-profiles = "0.19"
 alloy = { version = "2", features = [
     "contract",
     "providers",
