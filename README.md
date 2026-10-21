@@ -346,7 +346,9 @@ apply initiates it and, on anvil, completes it by impersonation.
 
 1. Inputs: `network` (choice), `mode` (`plan` default / `apply`), `upgrade`
    (comma list), `confirm_fresh_deploy`, `source` (`release` downloads the
-   latest release binary; `branch` builds with cargo).
+   latest release binary; `branch` builds with cargo), `contracts_ref`
+   (with `branch`: a libid-contracts commit whose artifacts are built and
+   vendored in the run, patched in for the crates.io crate).
 2. Assumes `AWS_DEPLOYER_ROLE_ARN` via GitHub OIDC in the region parsed
    from the network file.
 3. KMS preflight before any transaction: `describe-key` must report an
