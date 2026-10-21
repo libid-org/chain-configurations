@@ -153,13 +153,13 @@ forever, on every network — names are frozen. The testnet table, deployer
 |---|---|---|
 | `contracts.factory` | — (CREATE2, frozen init code) | `0x5294f6c0f1f086f70c9b510ba7990085d5976281` |
 | `contracts.notary_service` | `libid.NotaryService` | `0xfcf39134654e3542b956ee6e315ca650e6ba3b8c` |
-| `contracts.ceremony_proof_verifier` | `libid.CeremonyProofVerifier` | `0x00ad3331317e6c1b9599472bec9bba321bd38137` |
-| `contracts.identity_registry` | `libid.IdentityRegistry` | `0x4e750fb0e1e529d7a57647c0001db96c5ffb6fa1` |
-| `contracts.handle_escrow` | `libid.HandleEscrow` | `0xc7c13a7715858e60d628f867048e0f67fc683dd6` |
+| `contracts.ceremony_proof_verifier` | `libid.CeremonyProofVerifier.2` | `0x6e4585c4f1ac48a20f49bb61163c466dc4f35004` |
+| `contracts.identity_registry` | `libid.IdentityRegistry.2` | `0x58ac0cd5ec19c850a75d6183b3c3b2de692fb20d` |
+| `contracts.handle_escrow` | `libid.HandleEscrow.3` | `0xf3f81c31c889ddf1ec83b91b3dfed601c04f5e50` |
 | `contracts.google_jwt_roots` | `libid.GoogleJwtRoots` | `0x4d9c43d4cf161452b7f66415fa492f4fc42ea583` |
-| `contracts.x_platform_verifier` | `libid.XPlatformVerifier` | `0x4b395ca8dd2642bd65ddd9b1da518ff8cb7a9c84` |
-| `contracts.github_platform_verifier` | `libid.GitHubPlatformVerifier` | `0x0e957083ea529d1eeb6e49e7742e94a7173380a8` |
-| `contracts.google_platform_verifier` | `libid.GooglePlatformVerifier` | `0x141d728ce8d21d5eeda2be5a4a93cd62e174b55b` |
+| `contracts.x_platform_verifier` | `libid.XPlatformVerifier.2` | `0x655be95a91a26b4ade476a8992ee25c98bb774a6` |
+| `contracts.github_platform_verifier` | `libid.GitHubPlatformVerifier.2` | `0x13cdf6d5666a42e0eb586809f46ce10e469d11f7` |
+| `contracts.google_platform_verifier` | `libid.GooglePlatformVerifier.2` | `0x355143c93a645ae914b1315eb1b580072207e0f2` |
 
 The mainnet table, deployer `0x7e00d33b5c571ca2b2879309c4846ddd80f4128e`
 (Ethereum, `networks/ethereum.toml`):
@@ -168,18 +168,18 @@ The mainnet table, deployer `0x7e00d33b5c571ca2b2879309c4846ddd80f4128e`
 |---|---|
 | `contracts.factory` | `0x4ab4177683b8c3f40c487f9e765f77f0c5f5a023` |
 | `contracts.notary_service` | `0x4f624a90ae152e524b12258ce6aa9df6ed70ddfb` |
-| `contracts.ceremony_proof_verifier` | `0x6f6438bb5356e9a2bcdc1c7def29b1a5aee48650` |
-| `contracts.identity_registry` | `0xfecfc075ee28b85c86902ba3cce62c4264fa81b7` |
-| `contracts.handle_escrow` | `0xe88c1f6af33a80625930fb1dd3c43b5ca1fb9518` |
+| `contracts.ceremony_proof_verifier` | `0xcfee504d5a290d72c52b9ffd61d54444d727233b` |
+| `contracts.identity_registry` | `0xf39343febda25caa8c3861954e33f8a0189d4fda` |
+| `contracts.handle_escrow` | `0xd38474f12d887a1d97ac7a62cf0b3c17e4d2c100` |
 | `contracts.google_jwt_roots` | `0xa2c959b2940bdb8f97af52401c1603000a3aa46b` |
-| `contracts.x_platform_verifier` | `0x8f6b898968fd0a0192d278723398fc84ef134437` |
-| `contracts.github_platform_verifier` | `0x573639a86c8ed930f28187a1bf65050698ee9cdb` |
-| `contracts.google_platform_verifier` | `0x2d35da8986c3f7fd83c14a10474dfcb63929acc9` |
+| `contracts.x_platform_verifier` | `0xe9b6d548a070fcaa5b43344c0b495d982aaa9fc4` |
+| `contracts.github_platform_verifier` | `0x4f6d4a3486a00b260a1dd91f9dde6f333de6861f` |
+| `contracts.google_platform_verifier` | `0x731f3943879ccf40a21a7b84e9b7ec01776cb9cc` |
 
 The circuit verifiers go through the same factory but are not in that
 table and not in any network file: their names carry the circuits release
 `libid-contracts` vendors, so they move when the contracts pin does. At
-`libid-circuits` 0.7.1 (`libid-contracts` 0.18.0) they are
+`libid-circuits` 0.7.1 (`libid-contracts` 0.19.0) they are
 
 | Component | Name | Address (testnet) |
 |---|---|---|

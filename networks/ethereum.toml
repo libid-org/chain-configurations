@@ -77,13 +77,13 @@ fee_wei = "180000000000000"
 [contracts]
 factory = "0x4ab4177683b8c3f40c487f9e765f77f0c5f5a023"
 notary_service = "0x4f624a90ae152e524b12258ce6aa9df6ed70ddfb"
-ceremony_proof_verifier = "0x6f6438bb5356e9a2bcdc1c7def29b1a5aee48650"
-identity_registry = "0xfecfc075ee28b85c86902ba3cce62c4264fa81b7"
-handle_escrow = "0xe88c1f6af33a80625930fb1dd3c43b5ca1fb9518"
+ceremony_proof_verifier = "0xcfee504d5a290d72c52b9ffd61d54444d727233b"
+identity_registry = "0xf39343febda25caa8c3861954e33f8a0189d4fda"
+handle_escrow = "0xd38474f12d887a1d97ac7a62cf0b3c17e4d2c100"
 google_jwt_roots = "0xa2c959b2940bdb8f97af52401c1603000a3aa46b"
-x_platform_verifier = "0x8f6b898968fd0a0192d278723398fc84ef134437"
-github_platform_verifier = "0x573639a86c8ed930f28187a1bf65050698ee9cdb"
-google_platform_verifier = "0x2d35da8986c3f7fd83c14a10474dfcb63929acc9"
+x_platform_verifier = "0xe9b6d548a070fcaa5b43344c0b495d982aaa9fc4"
+github_platform_verifier = "0x4f6d4a3486a00b260a1dd91f9dde6f333de6861f"
+google_platform_verifier = "0x731f3943879ccf40a21a7b84e9b7ec01776cb9cc"
 
 # The ceremony circuit verifiers are NOT declared here. `libid-deploy`
 # carries them: `libid-contracts` embeds each circuit's bb-generated

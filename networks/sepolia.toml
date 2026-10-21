@@ -74,19 +74,19 @@ fee_wei = "100000000000000"
 [contracts]
 factory = "0x5294f6c0f1f086f70c9b510ba7990085d5976281"
 notary_service = "0xfcf39134654e3542b956ee6e315ca650e6ba3b8c"
-ceremony_proof_verifier = "0x00ad3331317e6c1b9599472bec9bba321bd38137"
-identity_registry = "0x4e750fb0e1e529d7a57647c0001db96c5ffb6fa1"
+ceremony_proof_verifier = "0x6e4585c4f1ac48a20f49bb61163c466dc4f35004"
+identity_registry = "0x58ac0cd5ec19c850a75d6183b3c3b2de692fb20d"
 # Initialized with identity_registry above, which it resolves every handle
 # through for life: no setter moves it.
-handle_escrow = "0xc7c13a7715858e60d628f867048e0f67fc683dd6"
+handle_escrow = "0xf3f81c31c889ddf1ec83b91b3dfed601c04f5e50"
 # Deploys EMPTY. Until a keeper lands a notarized reading of Google's live JWKS,
 # every Google binding reverts with UntrustedModulus(). The deployment repo runs
 # the keeper hourly against this network too; the first tick has to be run
 # deliberately, right after this apply.
 google_jwt_roots = "0x4d9c43d4cf161452b7f66415fa492f4fc42ea583"
-x_platform_verifier = "0x4b395ca8dd2642bd65ddd9b1da518ff8cb7a9c84"
-github_platform_verifier = "0x0e957083ea529d1eeb6e49e7742e94a7173380a8"
-google_platform_verifier = "0x141d728ce8d21d5eeda2be5a4a93cd62e174b55b"
+x_platform_verifier = "0x655be95a91a26b4ade476a8992ee25c98bb774a6"
+github_platform_verifier = "0x13cdf6d5666a42e0eb586809f46ce10e469d11f7"
+google_platform_verifier = "0x355143c93a645ae914b1315eb1b580072207e0f2"
 
 # The ceremony circuit verifiers are NOT declared here. `libid-deploy`
 # carries them: `libid-contracts` embeds each circuit's bb-generated
