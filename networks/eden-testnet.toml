@@ -66,10 +66,10 @@ fee_wei = "0"
 factory = "0x5294f6c0f1f086f70c9b510ba7990085d5976281"
 notary_service = "0xfcf39134654e3542b956ee6e315ca650e6ba3b8c"
 ceremony_proof_verifier = "0x00ad3331317e6c1b9599472bec9bba321bd38137"
-identity_registry = "0x4e750fb0e1e529d7a57647c0001db96c5ffb6fa1"
+identity_registry = "0x58ac0cd5ec19c850a75d6183b3c3b2de692fb20d"
 # Initialized with identity_registry above, which it resolves every handle
 # through for life: no setter moves it.
-handle_escrow = "0xc7c13a7715858e60d628f867048e0f67fc683dd6"
+handle_escrow = "0xf3f81c31c889ddf1ec83b91b3dfed601c04f5e50"
 # Deploys EMPTY. Until a keeper lands a notarized reading of Google's live JWKS,
 # every Google binding reverts with UntrustedModulus(). The deployment repo runs
 # the keeper hourly; the first tick has to be run deliberately, right after this

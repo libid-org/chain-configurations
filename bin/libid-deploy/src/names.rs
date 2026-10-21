@@ -13,6 +13,11 @@
 //! A name is unique per factory: a new factory gives every name a new
 //! address, so a stack under a new factory keeps the plain names.
 //!
+//! `libid.IdentityRegistry.2` is the registry with one primary handle per
+//! wallet, whose storage differs from `libid.IdentityRegistry`. The escrow
+//! moves with it as `libid.HandleEscrow.3`; `libid.HandleEscrow.2` belongs
+//! to the factory before this one.
+//!
 //! Two kinds of contract are NOT in this table. Proxy implementations
 //! deploy via plain CREATE: their addresses are referenced by a proxy
 //! slot, and an upgrade replaces one without moving any entry address. The
@@ -48,12 +53,13 @@ pub const NOTARY_SERVICE: &str = "libid.NotaryService";
 /// registry dispatches bindings through.
 pub const CEREMONY_PROOF_VERIFIER: &str = "libid.CeremonyProofVerifier";
 /// The IdentityRegistry proxy — the contract consumers resolve against.
-/// It keys identities by the SHA-256 nodes the circuits prove.
-pub const IDENTITY_REGISTRY: &str = "libid.IdentityRegistry";
+/// It keys identities by the SHA-256 nodes the circuits prove and holds one
+/// primary handle per wallet.
+pub const IDENTITY_REGISTRY: &str = "libid.IdentityRegistry.2";
 /// The HandleEscrow proxy: value sent to a handle node before anyone holds
 /// it, claimed through the IdentityRegistry it was initialized with. No
 /// setter moves it off that registry.
-pub const HANDLE_ESCROW: &str = "libid.HandleEscrow";
+pub const HANDLE_ESCROW: &str = "libid.HandleEscrow.3";
 /// The Google JWT root list proxy, read by the Google Platform Verifier.
 pub const GOOGLE_JWT_ROOTS: &str = "libid.GoogleJwtRoots";
 /// The `x/v1` Platform Verifier proxy.
