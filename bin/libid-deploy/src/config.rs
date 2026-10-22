@@ -8,11 +8,18 @@
 //! deployed is determined from CHAIN STATE (`eth_getCode`) at plan/apply
 //! time, never from config emptiness, and `apply` NEVER rewrites the file.
 
-use std::path::Path;
+use std::{
+    fmt,
+    path::Path,
+    str::FromStr,
+};
 
-use alloy::primitives::{
-    Address,
-    U256,
+use alloy::{
+    hex::FromHexError,
+    primitives::{
+        Address,
+        U256,
+    },
 };
 use anyhow::{
     anyhow,
@@ -95,25 +102,30 @@ pub struct Accounts {
     /// environment gives testnet and mainnet their own tables. `apply`
     /// refuses a signer that is not this address: `factory.deploy` is
     /// owner-gated, and this is the owner.
-    pub deployer: String,
+    pub deployer: DeclaredAddress,
     /// The notary SIGNER — the EOA/KMS identity whose attestations the
     /// stack accepts. The NotaryService CONTRACT
     /// (`contracts.notary_service`) holds the trusted key set; apply
     /// initializes it with this key and adds it when it is missing.
     /// Distinct on purpose: this is a key, not a contract.
-    pub notary: String,
+    pub notary: DeclaredAddress,
     /// The OPERATIONAL OWNER the factory should end up with. Empty =
     /// the deployer, which owns it from genesis, so the default is exact. A
     /// different key makes apply start the Ownable2Step handover; on a dev
     /// chain apply completes it by impersonation.
     #[serde(default)]
-    pub owner: String,
+    pub owner: DeclaredAddress,
 }
 
 impl Accounts {
     /// The deployer key's address.
     pub fn deployer_address(&self) -> Result<Address> {
-        required_address(&self.deployer, "accounts.deployer")
+        self.deployer.required("accounts.deployer")
+    }
+
+    /// The notary signer's address.
+    pub fn notary_address(&self) -> Result<Address> {
+        self.notary.required("accounts.notary")
     }
 
     /// The factory this network's deployer owns from genesis: what every
@@ -126,8 +138,8 @@ impl Accounts {
 
     /// The declared operational owner, if any (`None` = default to the
     /// deployer).
-    pub fn owner_address(&self) -> Result<Option<Address>> {
-        opt_address(&self.owner, "accounts.owner")
+    pub fn owner_address(&self) -> Option<Address> {
+        self.owner.get()
     }
 }
 
@@ -159,67 +171,127 @@ impl NotaryService {
 pub struct Contracts {
     /// The deterministic LibidFactory proxy — one canonical CREATE2
     /// address on every EVM network.
-    pub factory: String,
+    pub factory: DeclaredAddress,
     /// The NotaryService proxy — the ONE place a notary attestation is
     /// authenticated. Deployed FIRST; every consumer takes its address.
-    pub notary_service: String,
+    pub notary_service: DeclaredAddress,
     /// The CeremonyProofVerifier proxy: the Supported Version Set.
-    pub ceremony_proof_verifier: String,
+    pub ceremony_proof_verifier: DeclaredAddress,
     /// The IdentityRegistry proxy — the contract consumers resolve against.
-    pub identity_registry: String,
+    pub identity_registry: DeclaredAddress,
     /// The HandleEscrow proxy, initialized with `identity_registry`, which it
     /// keeps for life.
-    pub handle_escrow: String,
+    pub handle_escrow: DeclaredAddress,
     /// The GoogleJwtRoots proxy. Starts EMPTY on-chain: point a keeper at
     /// it, or every Google binding reverts.
-    pub google_jwt_roots: String,
+    pub google_jwt_roots: DeclaredAddress,
     /// The `x/v1` Platform Verifier proxy.
-    pub x_platform_verifier: String,
+    pub x_platform_verifier: DeclaredAddress,
     /// The `github/v1` Platform Verifier proxy.
-    pub github_platform_verifier: String,
+    pub github_platform_verifier: DeclaredAddress,
     /// The `google/v1` Platform Verifier proxy.
-    pub google_platform_verifier: String,
+    pub google_platform_verifier: DeclaredAddress,
 }
 
 impl Contracts {
-    /// The raw value declared for a canonical `[contracts]` key.
-    pub fn raw(&self, key: &str) -> Option<&str> {
+    /// The value declared for a canonical `[contracts]` key.
+    pub fn declared(&self, key: &str) -> Option<DeclaredAddress> {
         Some(match key {
-            "factory" => self.factory.as_str(),
-            "notary_service" => self.notary_service.as_str(),
-            "ceremony_proof_verifier" => self.ceremony_proof_verifier.as_str(),
-            "identity_registry" => self.identity_registry.as_str(),
-            "handle_escrow" => self.handle_escrow.as_str(),
-            "google_jwt_roots" => self.google_jwt_roots.as_str(),
-            "x_platform_verifier" => self.x_platform_verifier.as_str(),
-            "github_platform_verifier" => self.github_platform_verifier.as_str(),
-            "google_platform_verifier" => self.google_platform_verifier.as_str(),
+            "factory" => self.factory,
+            "notary_service" => self.notary_service,
+            "ceremony_proof_verifier" => self.ceremony_proof_verifier,
+            "identity_registry" => self.identity_registry,
+            "handle_escrow" => self.handle_escrow,
+            "google_jwt_roots" => self.google_jwt_roots,
+            "x_platform_verifier" => self.x_platform_verifier,
+            "github_platform_verifier" => self.github_platform_verifier,
+            "google_platform_verifier" => self.google_platform_verifier,
             _ => return None,
+        })
+    }
+
+    /// The address declared for a canonical `[contracts]` key.
+    pub fn address(&self, key: &str) -> Result<Address> {
+        self.declared(key)
+            .ok_or_else(|| anyhow!("{key} is not a canonical contract"))?
+            .required(&format!("contracts.{key}"))
+    }
+
+    /// The entry contracts the stack wires together.
+    pub fn stack(&self) -> Result<Stack> {
+        Ok(Stack {
+            notary_service: self.address("notary_service")?,
+            proof_verifier: self.address("ceremony_proof_verifier")?,
+            identity_registry: self.address("identity_registry")?,
+            handle_escrow: self.address("handle_escrow")?,
+            jwt_roots: self.address("google_jwt_roots")?,
         })
     }
 }
 
-/// Parse an address field that may be empty (optional keys).
-pub fn opt_address(value: &str, label: &str) -> Result<Option<Address>> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(None);
-    }
-    let addr: Address = value
-        .parse()
-        .map_err(|e| anyhow!("invalid address for {label}: {e}"))?;
-    if addr == Address::ZERO {
-        // A recorded zero address carries no information — nothing
-        // legitimate deploys to the zero address.
-        return Ok(None);
-    }
-    Ok(Some(addr))
+/// The declared addresses of the entry contracts every Platform Verifier
+/// and every wiring check refers to.
+#[derive(Debug, Clone, Copy)]
+pub struct Stack {
+    /// The Notary Service proxy.
+    pub notary_service: Address,
+    /// The Proof Verifier proxy: the Supported Version Set.
+    pub proof_verifier: Address,
+    /// The identity registry proxy.
+    pub identity_registry: Address,
+    /// The handle escrow proxy.
+    pub handle_escrow: Address,
+    /// The Google JWT root list proxy.
+    pub jwt_roots: Address,
 }
 
-/// Parse a required address field.
-pub fn required_address(value: &str, label: &str) -> Result<Address> {
-    opt_address(value, label)?
-        .ok_or_else(|| anyhow!("{label} must be set to a nonzero address"))
+/// An address field of the network file. Blank declares none, and so does
+/// the zero address: nothing legitimate deploys there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct DeclaredAddress(Option<Address>);
+
+impl DeclaredAddress {
+    /// The declared address, if any.
+    pub fn get(self) -> Option<Address> {
+        self.0
+    }
+
+    /// The declared address, or an error naming the field `label`.
+    pub fn required(self, label: &str) -> Result<Address> {
+        self.0
+            .ok_or_else(|| anyhow!("{label} must be set to a nonzero address"))
+    }
+}
+
+impl FromStr for DeclaredAddress {
+    type Err = FromHexError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let value = s.trim();
+        if value.is_empty() {
+            return Ok(Self(None));
+        }
+        let addr: Address = value.parse()?;
+        Ok(Self((addr != Address::ZERO).then_some(addr)))
+    }
+}
+
+impl TryFrom<String> for DeclaredAddress {
+    type Error = FromHexError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl fmt::Display for DeclaredAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(addr) => write!(f, "{addr}"),
+            None => Ok(()),
+        }
+    }
 }
 
 impl NetworkConfig {
@@ -253,8 +325,7 @@ impl NetworkConfig {
         if let Some(url) = self.network.rpc_url() {
             crate::rpc::parse_rpc_url(url, "network.rpc_url")?;
         }
-        required_address(&self.accounts.notary, "accounts.notary")?;
-        self.accounts.owner_address()?;
+        self.accounts.notary_address()?;
         self.notary_service.fee()?;
         if self.aws.region.trim().is_empty() {
             bail!("aws.region must not be empty");
@@ -276,11 +347,7 @@ impl NetworkConfig {
             .address(&artifacts)
             .map_err(|e| anyhow!("predicting the factory address failed: {e}"))?;
 
-        let declared_factory = required_address(
-            &self.contracts.factory,
-            "contracts.factory",
-        )
-        .map_err(|e| {
+        let declared_factory = self.contracts.address("factory").map_err(|e| {
             anyhow!("{e} — pre-fill it with the canonical factory address {factory:#x}")
         })?;
         if declared_factory != factory {
@@ -295,10 +362,10 @@ impl NetworkConfig {
             let label = format!("contracts.{}", c.key);
             let raw = self
                 .contracts
-                .raw(c.key)
+                .declared(c.key)
                 .ok_or_else(|| anyhow!("{label} is not a known canonical key"))?;
             let expected = predict_address(factory, c.name);
-            let declared = required_address(raw, &label).map_err(|e| {
+            let declared = raw.required(&label).map_err(|e| {
                 anyhow!(
                     "{e} — the declarative schema pre-fills every canonical address; \
                      set it to {expected:#x} (CREATE3 '{}')",
@@ -439,13 +506,27 @@ google_platform_verifier = "{google}"
         assert_eq!(cfg.network.rpc_url(), None);
     }
 
+    /// Blank and the zero address declare none; anything else must be an
+    /// address.
+    #[test]
+    fn a_declared_address_parses_blank_and_zero_as_none() {
+        let none: DeclaredAddress = "  ".parse().unwrap();
+        assert_eq!(none.get(), None);
+        let zero: DeclaredAddress = format!("{:#x}", Address::ZERO).parse().unwrap();
+        assert_eq!(zero.get(), None);
+        let some: DeclaredAddress = TEST_DEPLOYER.parse().unwrap();
+        assert_eq!(some.get(), Some(TEST_DEPLOYER.parse().unwrap()));
+        assert_eq!(some.to_string(), TEST_DEPLOYER);
+        assert!("0xnot-an-address".parse::<DeclaredAddress>().is_err());
+    }
+
     /// A fully pre-filled config validates.
     #[test]
     fn canonical_config_validates() {
         let cfg: NetworkConfig = toml::from_str(&canonical_toml()).unwrap();
         cfg.validate().expect("canonical config validates");
         assert_eq!(
-            cfg.accounts.owner_address().unwrap(),
+            cfg.accounts.owner_address(),
             Some(
                 "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
                     .parse()

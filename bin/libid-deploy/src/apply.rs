@@ -42,9 +42,11 @@ use alloy::{
         utils::Unit,
         Address,
         Bytes,
+        U256,
     },
     providers::{
         ext::AnvilApi,
+        DynProvider,
         Provider,
         ProviderBuilder,
     },
@@ -78,6 +80,7 @@ use libid_contracts::{
     factory::{
         ensure_create2_deployer,
         predict_address,
+        FactoryGenesis,
     },
     platform_verifier::PlatformVerifier,
     send_with_nonce_retry,
@@ -90,8 +93,8 @@ use crate::{
         Circuit,
     },
     config::{
-        required_address,
         NetworkConfig,
+        Stack,
     },
     names,
     platforms::{
@@ -223,7 +226,7 @@ impl FromStr for Upgrade {
     }
 }
 
-/// Options for [`run`].
+/// Options for [`Applier::run`].
 #[derive(Debug, Default)]
 pub struct Options {
     /// Components to explicitly upgrade.
@@ -275,1135 +278,1044 @@ impl Summary {
     }
 }
 
-/// Run the apply: converge the chain behind `rpc` onto the declared state.
-/// The file is never rewritten, and the endpoint decides nothing about what
-/// is deployed: the file's chain id is enforced against whatever answers.
-pub async fn run(
-    path: &Path,
-    cfg: &NetworkConfig,
-    rpc: &RpcEndpoint,
-    signer: &SignerSource,
-    opts: &Options,
-) -> Result<Summary> {
-    let (wallet, sender) = signer.build_wallet(None).await?;
-    tracing::info!(
-        %sender,
-        signer = %signer.describe(),
-        rpc = %rpc.describe(),
-        "applying"
-    );
-    let provider = ProviderBuilder::new()
-        .wallet(wallet)
-        .connect_http(rpc.url().clone());
+/// Converges the chain behind one endpoint onto one network file, signing
+/// as its deployer. The file is never rewritten, and the endpoint decides
+/// nothing about what is deployed: the file's chain id is enforced against
+/// whatever answers.
+pub struct Applier<'a> {
+    provider: DynProvider,
+    artifacts: Artifacts,
+    cfg: &'a NetworkConfig,
+    /// The deployer's canonical factory.
+    factory: Address,
+    sender: Address,
+    stack: Stack,
+    opts: Options,
+    summary: Summary,
+    /// Circuit -> its verifier's address, for what this run has resolved
+    /// already. Two platforms share `bearer-link`, so without this a single
+    /// apply would resolve the same verifier twice.
+    circuits: BTreeMap<Circuit, Address>,
+}
 
-    let chain_id = provider.get_chain_id().await.map_err(|e| {
-        anyhow!("failed to read the chain id from {}: {e}", rpc.describe())
-    })?;
-    if chain_id != cfg.network.chain_id {
-        bail!(
-            "chain id mismatch: {} expects {}, {} reports {chain_id} — refusing to \
-             send anything",
-            cfg.network.name,
-            cfg.network.chain_id,
-            rpc.describe()
-        );
-    }
-
-    // The signer must be the declared deployer: it is the factory's genesis
-    // admin, the only key `factory.deploy` accepts, and what every canonical
-    // address in the file was predicted from.
-    let genesis = cfg.accounts.factory_genesis()?;
-    if sender != genesis.admin {
-        bail!(
-            "apply signs as {sender:#x} but accounts.deployer of '{}' is {:#x} — the \
-             signer must be the deployer key: its factory, and every address declared \
-             in {}, follow from that key",
-            cfg.network.name,
-            genesis.admin,
-            path.display()
-        );
-    }
-
-    let artifacts = Artifacts::embedded();
-    let notary_signer = required_address(&cfg.accounts.notary, "accounts.notary")?;
-    let notary_fee = cfg.notary_service.fee()?;
-    // The operational owner the factory should END up with; defaults to
-    // the deployer.
-    let operational_owner = cfg.accounts.owner_address()?.unwrap_or(sender);
-
-    let mut summary = Summary::default();
-
-    // ── Step 0: the deterministic-deployment substrate ────────────────────
-    // The keyless CREATE2 deployer and the LibidFactory are the hard
-    // onboarding gate: a chain that cannot host them cannot host the stack.
-    let predicted_factory = genesis.address(&artifacts)?;
-    let factory_was_present = code_present(&provider, predicted_factory).await?;
-
-    // The fresh-deploy guard keys on CHAIN STATE, not config emptiness: a
-    // factory with no code means a virgin network, and this apply would
-    // publish the entire declared stack.
-    if !factory_was_present && !opts.confirm_fresh_deploy {
-        bail!(
-            "the LibidFactory has no code at its canonical address \
-             {predicted_factory:#x} on '{}' — this chain is VIRGIN, so this apply \
-             would be a FRESH DEPLOY of the whole stack declared in {}. Re-run \
-             with --confirm-fresh-deploy if the network is genuinely new; once \
-             the factory exists, apply converges incrementally without the flag.",
-            cfg.network.name,
-            path.display()
-        );
-    }
-
-    ensure_create2_deployer(&provider)
-        .await
-        .context("the canonical CREATE2 deployer is the onboarding gate")?;
-    let libid_factory = genesis.ensure(&provider, &artifacts).await?;
-
-    // CANARY: after any install the factory must sit at exactly the
-    // predicted address. A mismatch (or missing code) means the chain does
-    // not derive CREATE2 addresses the standard way — every "deterministic"
-    // address downstream would be wrong, so abort before sending anything.
-    if libid_factory != predicted_factory
-        || !code_present(&provider, predicted_factory).await?
-    {
-        bail!(
-            "FACTORY CANARY FAILED: the LibidFactory is not at its canonical \
-             predicted address {predicted_factory:#x} (got {libid_factory:#x}). \
-             This chain does not derive CREATE2 addresses the standard way \
-             (zkSync-Era-style derivation?), so cross-network address parity is \
-             impossible here — refusing to proceed."
-        );
-    }
-    if !factory_was_present {
-        tracing::info!(%libid_factory, "LibidFactory installed at its canonical address");
-        summary
-            .deployed
-            .push(("contracts.factory".into(), libid_factory));
-    }
-
-    // ── Presence: what does the CHAIN have, of what the file declares? ───
-    // Deployed-vs-not is read from chain state at the declared (canonical,
-    // validated) addresses — config emptiness no longer means anything.
-    let notary_service =
-        required_address(&cfg.contracts.notary_service, "contracts.notary_service")?;
-    let proof_verifier = required_address(
-        &cfg.contracts.ceremony_proof_verifier,
-        "contracts.ceremony_proof_verifier",
-    )?;
-    let identity_registry = required_address(
-        &cfg.contracts.identity_registry,
-        "contracts.identity_registry",
-    )?;
-    let handle_escrow =
-        required_address(&cfg.contracts.handle_escrow, "contracts.handle_escrow")?;
-    let jwt_roots = required_address(
-        &cfg.contracts.google_jwt_roots,
-        "contracts.google_jwt_roots",
-    )?;
-
-    let notary_service_present = code_present(&provider, notary_service).await?;
-    let proof_verifier_present = code_present(&provider, proof_verifier).await?;
-    let identity_registry_present = code_present(&provider, identity_registry).await?;
-    let handle_escrow_present = code_present(&provider, handle_escrow).await?;
-    let jwt_roots_present = code_present(&provider, jwt_roots).await?;
-
-    // Does anything need `factory.deploy` (owner-gated)? Only then must the
-    // apply signer own the factory: it does from genesis, unless an earlier
-    // apply handed the factory to a different operational owner.
-    let mut needs_factory_deploy = !(notary_service_present
-        && proof_verifier_present
-        && identity_registry_present
-        && handle_escrow_present
-        && jwt_roots_present);
-    for platform in platforms::LAUNCH {
-        let declared = declared_verifier(cfg, platform)?;
-        needs_factory_deploy |= !code_present(&provider, declared).await?;
-    }
-    // The circuit verifiers deploy through the factory too, under a name
-    // carrying the pinned circuits release.
-    for circuit in Circuit::ALL {
-        let predicted = predict_address(libid_factory, &circuits::factory_name(circuit)?);
-        needs_factory_deploy |= !code_present(&provider, predicted).await?;
-    }
-    if needs_factory_deploy {
-        ensure_factory_ownership(&provider, libid_factory, sender).await?;
-    }
-
-    // ── 1. The Notary Service: everything else takes its proxy address ───
-    if !notary_service_present {
-        let addr = deploy_named_proxy(
-            &provider,
-            &artifacts,
-            libid_factory,
-            names::NOTARY_SERVICE,
-            "NotaryService",
-            artifacts.bytecode("NotaryService")?,
-            NotaryService::initializeCall {
-                owner_: sender,
-                notary_: notary_signer,
-                fee_: notary_fee,
-            }
-            .abi_encode()
-            .into(),
-            sender,
-        )
-        .await?;
+impl<'a> Applier<'a> {
+    /// Sign with `signer` against `rpc`, once it reports the chain id `cfg`
+    /// declares.
+    pub async fn connect(
+        cfg: &'a NetworkConfig,
+        rpc: &RpcEndpoint,
+        signer: &SignerSource,
+        opts: Options,
+    ) -> Result<Self> {
+        let (wallet, sender) = signer.build_wallet(None).await?;
         tracing::info!(
-            %addr,
-            name = names::NOTARY_SERVICE,
-            "NotaryService proxy deployed"
+            %sender,
+            signer = %signer.describe(),
+            rpc = %rpc.describe(),
+            "applying"
         );
-        debug_assert_eq!(addr, notary_service);
-        summary
-            .deployed
-            .push(("contracts.notary_service".into(), addr));
-    }
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect_http(rpc.url().clone())
+            .erased();
 
-    upgrade_if_requested(
-        &provider,
-        &artifacts,
-        opts,
-        "notary_service",
-        notary_service,
-        sender,
-        &mut summary,
-    )
-    .await?;
-
-    // Declarative key trust: the file says which signer the stack accepts.
-    // Only the ADDITION is inferable — the service holds a SET so a
-    // rotation can overlap, and which outgoing key to stop trusting is a
-    // decision the file does not carry.
-    let service = NotaryService::new(notary_service, &provider);
-    let trusted = service
-        .isTrustedNotary(notary_signer)
-        .call()
-        .await
-        .map_err(|e| anyhow!("NotaryService.isTrustedNotary read failed: {e}"))?;
-    if !trusted {
-        send_with_nonce_retry!(
-            service.setNotary(notary_signer, true),
-            "NotaryService.setNotary",
-            &provider,
-            sender
-        )?;
-        tracing::info!(%notary_signer, "notary key trusted");
-        summary
-            .configured
-            .push(format!("notary key {notary_signer:#x} trusted"));
-    }
-
-    let on_chain_fee = service
-        .fee()
-        .call()
-        .await
-        .map_err(|e| anyhow!("NotaryService.fee read failed: {e}"))?;
-    if on_chain_fee != notary_fee {
-        send_with_nonce_retry!(
-            service.setFee(notary_fee),
-            "NotaryService.setFee",
-            &provider,
-            sender
-        )?;
-        tracing::info!(from_wei = %on_chain_fee, to_wei = %notary_fee, "notary fee set");
-        summary
-            .configured
-            .push(format!("notary fee {on_chain_fee} -> {notary_fee} wei"));
-    }
-
-    // ── 2. The Proof Verifier the identity registry dispatches through ───
-    if !proof_verifier_present {
-        let addr = deploy_named_proxy(
-            &provider,
-            &artifacts,
-            libid_factory,
-            names::CEREMONY_PROOF_VERIFIER,
-            "CeremonyProofVerifier",
-            artifacts.bytecode("CeremonyProofVerifier")?,
-            CeremonyProofVerifier::initializeCall { owner_: sender }
-                .abi_encode()
-                .into(),
-            sender,
-        )
-        .await?;
-        tracing::info!(
-            %addr,
-            name = names::CEREMONY_PROOF_VERIFIER,
-            "CeremonyProofVerifier proxy deployed"
-        );
-        debug_assert_eq!(addr, proof_verifier);
-        summary
-            .deployed
-            .push(("contracts.ceremony_proof_verifier".into(), addr));
-    }
-
-    upgrade_if_requested(
-        &provider,
-        &artifacts,
-        opts,
-        "ceremony_proof_verifier",
-        proof_verifier,
-        sender,
-        &mut summary,
-    )
-    .await?;
-
-    // ── 3. The identity registry ─────────────────────────────────────────
-    if !identity_registry_present {
-        let addr = deploy_named_proxy(
-            &provider,
-            &artifacts,
-            libid_factory,
-            names::IDENTITY_REGISTRY,
-            "IdentityRegistry",
-            artifacts.bytecode("IdentityRegistry")?,
-            IdentityRegistry::initializeCall { owner_: sender }
-                .abi_encode()
-                .into(),
-            sender,
-        )
-        .await?;
-        tracing::info!(
-            %addr,
-            name = names::IDENTITY_REGISTRY,
-            "IdentityRegistry proxy deployed"
-        );
-        debug_assert_eq!(addr, identity_registry);
-        summary
-            .deployed
-            .push(("contracts.identity_registry".into(), addr));
-    }
-
-    upgrade_if_requested(
-        &provider,
-        &artifacts,
-        opts,
-        "identity_registry",
-        identity_registry,
-        sender,
-        &mut summary,
-    )
-    .await?;
-
-    let registry = IdentityRegistry::new(identity_registry, &provider);
-    let wired = registry
-        .proofVerifier()
-        .call()
-        .await
-        .map_err(|e| anyhow!("IdentityRegistry.proofVerifier read failed: {e}"))?;
-    if wired != proof_verifier {
-        send_with_nonce_retry!(
-            registry.setProofVerifier(proof_verifier),
-            "IdentityRegistry.setProofVerifier",
-            &provider,
-            sender
-        )?;
-        tracing::info!(%proof_verifier, "IdentityRegistry dispatches through the proof verifier");
-        summary.configured.push(format!(
-            "identity registry -> proof verifier {proof_verifier:#x}"
-        ));
-    }
-
-    // ── 4. The handle escrow, bound to the identity registry above ───────
-    // `initialize` refuses a registry whose `nodeKeyed()` is not true, so
-    // the registry and any upgrade of it land first.
-    if !handle_escrow_present {
-        let addr = deploy_named_proxy(
-            &provider,
-            &artifacts,
-            libid_factory,
-            names::HANDLE_ESCROW,
-            "HandleEscrow",
-            artifacts.bytecode("HandleEscrow")?,
-            HandleEscrow::initializeCall {
-                owner_: sender,
-                registry_: identity_registry,
-            }
-            .abi_encode()
-            .into(),
-            sender,
-        )
-        .await?;
-        tracing::info!(
-            %addr,
-            name = names::HANDLE_ESCROW,
-            %identity_registry,
-            "HandleEscrow proxy deployed"
-        );
-        debug_assert_eq!(addr, handle_escrow);
-        summary
-            .deployed
-            .push(("contracts.handle_escrow".into(), addr));
-    }
-
-    upgrade_if_requested(
-        &provider,
-        &artifacts,
-        opts,
-        "handle_escrow",
-        handle_escrow,
-        sender,
-        &mut summary,
-    )
-    .await?;
-
-    // The escrow has no setter for its registry, so apply can only check
-    // it. One bound elsewhere pays out to whoever THAT contract says holds a
-    // handle.
-    let resolves_through = HandleEscrow::new(handle_escrow, &provider)
-        .registry()
-        .call()
-        .await
-        .map_err(|e| anyhow!("HandleEscrow.registry read failed: {e}"))?;
-    if resolves_through != identity_registry {
-        bail!(
-            "the HandleEscrow at {handle_escrow:#x} resolves through \
-             {resolves_through:#x}, not the declared IdentityRegistry \
-             {identity_registry:#x}. apply cannot rebind it: that takes an escrow \
-             implementation that moves it, or a new canonical escrow name"
-        );
-    }
-
-    // ── 5. The Google JWT root list, beside the verifier it serves ───────
-    if !jwt_roots_present {
-        let addr = deploy_named_proxy(
-            &provider,
-            &artifacts,
-            libid_factory,
-            names::GOOGLE_JWT_ROOTS,
-            "GoogleJwtRoots",
-            artifacts.bytecode("GoogleJwtRoots")?,
-            GoogleJwtRoots::initializeCall {
-                owner_: sender,
-                notary_: notary_service,
-            }
-            .abi_encode()
-            .into(),
-            sender,
-        )
-        .await?;
-        tracing::info!(
-            %addr,
-            name = names::GOOGLE_JWT_ROOTS,
-            "GoogleJwtRoots proxy deployed; the trust list starts EMPTY: point a \
-             keeper at it, or every Google binding reverts"
-        );
-        debug_assert_eq!(addr, jwt_roots);
-        summary
-            .deployed
-            .push(("contracts.google_jwt_roots".into(), addr));
-    }
-
-    upgrade_if_requested(
-        &provider,
-        &artifacts,
-        opts,
-        "google_jwt_roots",
-        jwt_roots,
-        sender,
-        &mut summary,
-    )
-    .await?;
-
-    let roots = GoogleJwtRoots::new(jwt_roots, &provider);
-    let roots_notary = roots
-        .notaryService()
-        .call()
-        .await
-        .map_err(|e| anyhow!("GoogleJwtRoots.notaryService read failed: {e}"))?;
-    if roots_notary != notary_service {
-        send_with_nonce_retry!(
-            roots.setNotaryService(notary_service),
-            "GoogleJwtRoots.setNotaryService",
-            &provider,
-            sender
-        )?;
-        tracing::info!(%notary_service, "GoogleJwtRoots verifies through the notary service");
-        summary
-            .configured
-            .push(format!("jwt roots -> notary service {notary_service:#x}"));
-    }
-
-    // ── 6. A Platform Verifier per platform, on its circuit's verifier ───
-    let mut circuits = CircuitCache::default();
-    for platform in platforms::LAUNCH {
-        apply_platform_verifier(
-            &provider,
-            &artifacts,
-            cfg,
-            opts,
-            libid_factory,
-            sender,
-            platform,
-            notary_service,
-            proof_verifier,
-            jwt_roots,
-            &mut circuits,
-            &mut summary,
-        )
-        .await?;
-    }
-
-    // The registry accepts a platform's bindings once its Proof Verifier
-    // routes the platform to a registered verifier.
-    for platform in platforms::LAUNCH {
-        let platform_id = platforms::platform_id(platform.key);
-        let accepts = registry
-            .acceptsBindings(platform_id)
-            .call()
-            .await
-            .map_err(|e| anyhow!("IdentityRegistry.acceptsBindings read failed: {e}"))?;
-        if !accepts {
+        let chain_id = provider.get_chain_id().await.map_err(|e| {
+            anyhow!("failed to read the chain id from {}: {e}", rpc.describe())
+        })?;
+        if chain_id != cfg.network.chain_id {
             bail!(
-                "IdentityRegistry {identity_registry:#x} accepts no {} binding after \
-                 apply registered its verifier",
-                platform.label
+                "chain id mismatch: {} expects {}, {} reports {chain_id} — refusing to \
+                 send anything",
+                cfg.network.name,
+                cfg.network.chain_id,
+                rpc.describe()
             );
         }
-    }
 
-    // Every requested upgrade ran inside its component's section above; a
-    // component none of them owns would have been silently dropped.
-    if summary.upgraded.len() != opts.upgrades.len() {
-        bail!(
-            "{} upgrade(s) requested, {} applied — a requested component has \
-             no section in apply",
-            opts.upgrades.len(),
-            summary.upgraded.len()
-        );
-    }
-
-    // ── Factory ownership converges to the declared operational owner ────
-    converge_factory_owner(
-        &provider,
-        libid_factory,
-        sender,
-        operational_owner,
-        &mut summary,
-    )
-    .await?;
-
-    // Nothing is recorded back: the file already declares every canonical
-    // address and the chain records the rest.
-    Ok(summary)
-}
-
-/// Whether `addr` has code on-chain — the declarative presence check.
-async fn code_present<P: Provider>(provider: &P, addr: Address) -> Result<bool> {
-    Ok(!provider
-        .get_code_at(addr)
-        .await
-        .map_err(|e| anyhow!("get_code({addr:#x}) failed: {e}"))?
-        .is_empty())
-}
-
-/// Hand the factory over to the declared `[accounts].owner` (default: the
-/// deployer). Ownable2Step: from the sender this INITIATES the handover;
-/// on a dev chain (anvil/hardhat) the acceptance is completed by
-/// impersonating the new owner, so local stacks end fully converged.
-async fn converge_factory_owner<P: Provider>(
-    provider: &P,
-    factory: Address,
-    sender: Address,
-    desired: Address,
-    summary: &mut Summary,
-) -> Result<()> {
-    let contract = LibidFactory::new(factory, provider);
-    let current = contract
-        .owner()
-        .call()
-        .await
-        .map_err(|e| anyhow!("LibidFactory.owner read failed: {e}"))?;
-    if current == desired {
-        return Ok(());
-    }
-    if current != sender {
-        // Nothing this signer can do; say so instead of failing the whole
-        // apply after the chain already converged.
-        tracing::warn!(
-            owner = %current,
-            signer = %sender,
-            wanted = %desired,
-            "factory owner is not the apply signer: cannot hand ownership to \
-             accounts.owner"
-        );
-        summary.configured.push(format!(
-            "factory ownership NOT converged: owned by {current:#x}, wanted \
-             {desired:#x}"
-        ));
-        return Ok(());
-    }
-
-    let pending = contract
-        .pendingOwner()
-        .call()
-        .await
-        .map_err(|e| anyhow!("LibidFactory.pendingOwner read failed: {e}"))?;
-    if pending != desired {
-        send_with_nonce_retry!(
-            contract.transferOwnership(desired),
-            "LibidFactory.transferOwnership",
+        let artifacts = Artifacts::embedded();
+        let factory = cfg.accounts.factory_genesis()?.address(&artifacts)?;
+        Ok(Self {
             provider,
-            sender
-        )?;
-        tracing::info!(from = %sender, to = %desired, "factory ownership handover initiated");
+            artifacts,
+            cfg,
+            factory,
+            sender,
+            stack: cfg.contracts.stack()?,
+            opts,
+            summary: Summary::default(),
+            circuits: BTreeMap::new(),
+        })
     }
 
-    let (is_dev, _) = detect_dev_client(provider).await?;
-    if is_dev {
-        // Complete the two-step locally: impersonate the operational owner
-        // (e.g. the anvil #0 wallet) and accept.
-        provider
-            .anvil_set_balance(desired, Unit::ETHER.wei())
-            .await
-            .map_err(|e| anyhow!("anvil_setBalance failed: {e}"))?;
-        provider
-            .anvil_impersonate_account(desired)
-            .await
-            .map_err(|e| anyhow!("anvil_impersonateAccount failed: {e}"))?;
-        let accept = TransactionRequest::default()
-            .with_from(desired)
-            .with_to(factory)
-            .with_input(LibidFactory::acceptOwnershipCall {}.abi_encode());
-        provider
-            .eth_send_unsigned_transaction(accept)
-            .await
-            .map_err(|e| anyhow!("impersonated acceptOwnership failed: {e}"))?;
-        provider
-            .anvil_stop_impersonating_account(desired)
-            .await
-            .map_err(|e| anyhow!("anvil_stopImpersonatingAccount failed: {e}"))?;
-        tracing::info!(from = %sender, to = %desired, "factory ownership converged (dev)");
-        summary.configured.push(format!(
-            "factory ownership transferred to accounts.owner {desired:#x} (dev)"
-        ));
-    } else {
-        summary.configured.push(format!(
-            "factory ownership handover to accounts.owner {desired:#x} initiated — \
-             pending acceptOwnership by that key"
-        ));
-    }
-    Ok(())
-}
-
-/// Whether the RPC's `web3_clientVersion` reports a dev chain (anvil or
-/// hardhat). Returns the raw version string for error messages.
-async fn detect_dev_client<P: Provider>(provider: &P) -> Result<(bool, String)> {
-    let version = provider
-        .get_client_version()
-        .await
-        .map_err(|e| anyhow!("web3_clientVersion failed: {e}"))?;
-    let lower = version.to_lowercase();
-    let is_dev = lower.contains("anvil") || lower.contains("hardhat");
-    Ok((is_dev, version))
-}
-
-/// Make sure the apply signer owns the factory (its `deploy` is
-/// owner-gated).
-///
-/// - Signer already the owner: nothing to do.
-/// - Signer is the pending owner (an interrupted Ownable2Step handover):
-///   `acceptOwnership`.
-/// - Otherwise a hard error: the signer is the deployer, the factory's
-///   genesis admin, so another owner means an earlier apply handed the
-///   factory to a different `accounts.owner`, and that key has to hand it
-///   back before anything new can deploy.
-async fn ensure_factory_ownership<P: Provider>(
-    provider: &P,
-    factory: Address,
-    sender: Address,
-) -> Result<()> {
-    let contract = LibidFactory::new(factory, provider);
-    let owner = contract
-        .owner()
-        .call()
-        .await
-        .map_err(|e| anyhow!("LibidFactory.owner read failed: {e}"))?;
-    if owner == sender {
-        return Ok(());
-    }
-    let pending = contract
-        .pendingOwner()
-        .call()
-        .await
-        .map_err(|e| anyhow!("LibidFactory.pendingOwner read failed: {e}"))?;
-    if pending == sender {
-        send_with_nonce_retry!(
-            contract.acceptOwnership(),
-            "LibidFactory.acceptOwnership",
-            provider,
-            sender
-        )?;
-        tracing::info!(from = %owner, to = %sender, "factory ownership accepted");
-        return Ok(());
-    }
-    bail!(
-        "the factory at {factory:#x} is owned by {owner:#x} but apply signs as \
-         {sender:#x}. factory.deploy is owner-gated and the deployer is its genesis \
-         admin, so that owner must transferOwnership back to the deployer first"
-    )
-}
-
-/// CREATE3-deploy `creation_code` under `name` through the factory, with an
-/// explicit chain-fetched nonce (the rest of the apply flow manages nonces
-/// explicitly, so the provider's cached filler cannot be trusted here).
-/// Idempotent: a name the factory already deployed returns its recorded
-/// address without sending anything — that is how a partially-failed apply
-/// converges instead of tripping on the single-use name.
-///
-/// The returned address is verified to equal `predict_address(factory,
-/// name)` — the whole point of the exercise.
-pub(crate) async fn factory_deploy_named<P: Provider>(
-    provider: &P,
-    factory: Address,
-    name: &str,
-    creation_code: Bytes,
-    sender: Address,
-) -> Result<Address> {
-    let contract = LibidFactory::new(factory, provider);
-    let predicted = predict_address(factory, name);
-
-    let existing = contract
-        .deployedAt(name.to_string())
-        .call()
-        .await
-        .map_err(|e| anyhow!("factory deployedAt({name}) read failed: {e}"))?;
-    if existing != Address::ZERO {
-        tracing::info!(name, %existing, "already deployed by the factory; reusing");
-        if existing != predicted {
+    /// Converge the chain onto the file at `path`, which errors name.
+    pub async fn run(mut self, path: &Path) -> Result<Summary> {
+        // The signer must be the declared deployer: it is the factory's
+        // genesis admin, the only key `factory.deploy` accepts, and what
+        // every canonical address in the file was predicted from.
+        let genesis = self.cfg.accounts.factory_genesis()?;
+        if self.sender != genesis.admin {
             bail!(
-                "factory record for {name} is {existing:#x} but predict says \
+                "apply signs as {:#x} but accounts.deployer of '{}' is {:#x} — the \
+                 signer must be the deployer key: its factory, and every address \
+                 declared in {}, follow from that key",
+                self.sender,
+                self.cfg.network.name,
+                genesis.admin,
+                path.display()
+            );
+        }
+
+        let notary_signer = self.cfg.accounts.notary_address()?;
+        let notary_fee = self.cfg.notary_service.fee()?;
+        // The operational owner the factory should END up with; defaults
+        // to the deployer.
+        let operational_owner = self.cfg.accounts.owner_address().unwrap_or(self.sender);
+
+        self.install_factory(genesis, path).await?;
+
+        // ── Presence: what does the CHAIN have, of what the file declares? ─
+        // Deployed-vs-not is read from chain state at the declared
+        // (canonical, validated) addresses — config emptiness no longer
+        // means anything.
+        let stack = self.stack;
+        let notary_service_present = self.code_present(stack.notary_service).await?;
+        let proof_verifier_present = self.code_present(stack.proof_verifier).await?;
+        let identity_registry_present =
+            self.code_present(stack.identity_registry).await?;
+        let handle_escrow_present = self.code_present(stack.handle_escrow).await?;
+        let jwt_roots_present = self.code_present(stack.jwt_roots).await?;
+
+        // Does anything need `factory.deploy` (owner-gated)? Only then must
+        // the apply signer own the factory: it does from genesis, unless an
+        // earlier apply handed the factory to a different operational owner.
+        let mut needs_factory_deploy = !(notary_service_present
+            && proof_verifier_present
+            && identity_registry_present
+            && handle_escrow_present
+            && jwt_roots_present);
+        for platform in platforms::LAUNCH {
+            let declared = self.cfg.contracts.address(platform.contracts_key)?;
+            needs_factory_deploy |= !self.code_present(declared).await?;
+        }
+        // The circuit verifiers deploy through the factory too, under a name
+        // carrying the pinned circuits release.
+        for circuit in Circuit::ALL {
+            let predicted =
+                predict_address(self.factory, &circuits::factory_name(circuit)?);
+            needs_factory_deploy |= !self.code_present(predicted).await?;
+        }
+        if needs_factory_deploy {
+            self.ensure_factory_ownership().await?;
+        }
+
+        self.notary_service(notary_service_present, notary_signer, notary_fee)
+            .await?;
+        self.proof_verifier(proof_verifier_present).await?;
+        self.identity_registry(identity_registry_present).await?;
+        self.handle_escrow(handle_escrow_present).await?;
+        self.jwt_roots(jwt_roots_present).await?;
+
+        // ── 6. A Platform Verifier per platform, on its circuit's verifier ─
+        for platform in platforms::LAUNCH {
+            self.platform_verifier(platform).await?;
+        }
+        self.check_accepts_bindings().await?;
+
+        // Every requested upgrade ran inside its component's section above;
+        // a component none of them owns would have been silently dropped.
+        if self.summary.upgraded.len() != self.opts.upgrades.len() {
+            bail!(
+                "{} upgrade(s) requested, {} applied — a requested component has \
+                 no section in apply",
+                self.opts.upgrades.len(),
+                self.summary.upgraded.len()
+            );
+        }
+
+        // ── Factory ownership converges to the declared operational owner ─
+        self.converge_factory_owner(operational_owner).await?;
+
+        // Nothing is recorded back: the file already declares every
+        // canonical address and the chain records the rest.
+        Ok(self.summary)
+    }
+
+    /// Step 0, the deterministic-deployment substrate. The keyless CREATE2
+    /// deployer and the LibidFactory are the hard onboarding gate: a chain
+    /// that cannot host them cannot host the stack.
+    async fn install_factory(
+        &mut self,
+        genesis: FactoryGenesis,
+        path: &Path,
+    ) -> Result<()> {
+        let predicted_factory = self.factory;
+        let factory_was_present = self.code_present(predicted_factory).await?;
+
+        // The fresh-deploy guard keys on CHAIN STATE, not config emptiness:
+        // a factory with no code means a virgin network, and this apply
+        // would publish the entire declared stack.
+        if !factory_was_present && !self.opts.confirm_fresh_deploy {
+            bail!(
+                "the LibidFactory has no code at its canonical address \
+                 {predicted_factory:#x} on '{}' — this chain is VIRGIN, so this apply \
+                 would be a FRESH DEPLOY of the whole stack declared in {}. Re-run \
+                 with --confirm-fresh-deploy if the network is genuinely new; once \
+                 the factory exists, apply converges incrementally without the flag.",
+                self.cfg.network.name,
+                path.display()
+            );
+        }
+
+        ensure_create2_deployer(&self.provider)
+            .await
+            .context("the canonical CREATE2 deployer is the onboarding gate")?;
+        let libid_factory = genesis.ensure(&self.provider, &self.artifacts).await?;
+
+        // CANARY: after any install the factory must sit at exactly the
+        // predicted address. A mismatch (or missing code) means the chain
+        // does not derive CREATE2 addresses the standard way — every
+        // "deterministic" address downstream would be wrong, so abort before
+        // sending anything.
+        if libid_factory != predicted_factory
+            || !self.code_present(predicted_factory).await?
+        {
+            bail!(
+                "FACTORY CANARY FAILED: the LibidFactory is not at its canonical \
+                 predicted address {predicted_factory:#x} (got {libid_factory:#x}). \
+                 This chain does not derive CREATE2 addresses the standard way \
+                 (zkSync-Era-style derivation?), so cross-network address parity is \
+                 impossible here — refusing to proceed."
+            );
+        }
+        if !factory_was_present {
+            tracing::info!(%libid_factory, "LibidFactory installed at its canonical address");
+            self.summary
+                .deployed
+                .push(("contracts.factory".into(), libid_factory));
+        }
+        Ok(())
+    }
+
+    /// Step 1, the Notary Service: everything else takes its proxy address.
+    async fn notary_service(
+        &mut self,
+        present: bool,
+        notary_signer: Address,
+        notary_fee: U256,
+    ) -> Result<()> {
+        let notary_service = self.stack.notary_service;
+        if !present {
+            let addr = self
+                .deploy_named_proxy(
+                    names::NOTARY_SERVICE,
+                    "NotaryService",
+                    NotaryService::initializeCall {
+                        owner_: self.sender,
+                        notary_: notary_signer,
+                        fee_: notary_fee,
+                    }
+                    .abi_encode()
+                    .into(),
+                )
+                .await?;
+            tracing::info!(
+                %addr,
+                name = names::NOTARY_SERVICE,
+                "NotaryService proxy deployed"
+            );
+            debug_assert_eq!(addr, notary_service);
+            self.summary
+                .deployed
+                .push(("contracts.notary_service".into(), addr));
+        }
+
+        self.upgrade_if_requested("notary_service", notary_service)
+            .await?;
+
+        // Declarative key trust: the file says which signer the stack
+        // accepts. Only the ADDITION is inferable — the service holds a SET
+        // so a rotation can overlap, and which outgoing key to stop trusting
+        // is a decision the file does not carry.
+        let service = NotaryService::new(notary_service, &self.provider);
+        let trusted = service
+            .isTrustedNotary(notary_signer)
+            .call()
+            .await
+            .map_err(|e| anyhow!("NotaryService.isTrustedNotary read failed: {e}"))?;
+        if !trusted {
+            send_with_nonce_retry!(
+                service.setNotary(notary_signer, true),
+                "NotaryService.setNotary",
+                &self.provider,
+                self.sender
+            )?;
+            tracing::info!(%notary_signer, "notary key trusted");
+            self.summary
+                .configured
+                .push(format!("notary key {notary_signer:#x} trusted"));
+        }
+
+        let on_chain_fee = service
+            .fee()
+            .call()
+            .await
+            .map_err(|e| anyhow!("NotaryService.fee read failed: {e}"))?;
+        if on_chain_fee != notary_fee {
+            send_with_nonce_retry!(
+                service.setFee(notary_fee),
+                "NotaryService.setFee",
+                &self.provider,
+                self.sender
+            )?;
+            tracing::info!(from_wei = %on_chain_fee, to_wei = %notary_fee, "notary fee set");
+            self.summary
+                .configured
+                .push(format!("notary fee {on_chain_fee} -> {notary_fee} wei"));
+        }
+        Ok(())
+    }
+
+    /// Step 2, the Proof Verifier the identity registry dispatches through.
+    async fn proof_verifier(&mut self, present: bool) -> Result<()> {
+        let proof_verifier = self.stack.proof_verifier;
+        if !present {
+            let addr = self
+                .deploy_named_proxy(
+                    names::CEREMONY_PROOF_VERIFIER,
+                    "CeremonyProofVerifier",
+                    CeremonyProofVerifier::initializeCall {
+                        owner_: self.sender,
+                    }
+                    .abi_encode()
+                    .into(),
+                )
+                .await?;
+            tracing::info!(
+                %addr,
+                name = names::CEREMONY_PROOF_VERIFIER,
+                "CeremonyProofVerifier proxy deployed"
+            );
+            debug_assert_eq!(addr, proof_verifier);
+            self.summary
+                .deployed
+                .push(("contracts.ceremony_proof_verifier".into(), addr));
+        }
+
+        self.upgrade_if_requested("ceremony_proof_verifier", proof_verifier)
+            .await
+    }
+
+    /// Step 3, the identity registry, dispatching through the Proof Verifier.
+    async fn identity_registry(&mut self, present: bool) -> Result<()> {
+        let Stack {
+            identity_registry,
+            proof_verifier,
+            ..
+        } = self.stack;
+        if !present {
+            let addr = self
+                .deploy_named_proxy(
+                    names::IDENTITY_REGISTRY,
+                    "IdentityRegistry",
+                    IdentityRegistry::initializeCall {
+                        owner_: self.sender,
+                    }
+                    .abi_encode()
+                    .into(),
+                )
+                .await?;
+            tracing::info!(
+                %addr,
+                name = names::IDENTITY_REGISTRY,
+                "IdentityRegistry proxy deployed"
+            );
+            debug_assert_eq!(addr, identity_registry);
+            self.summary
+                .deployed
+                .push(("contracts.identity_registry".into(), addr));
+        }
+
+        self.upgrade_if_requested("identity_registry", identity_registry)
+            .await?;
+
+        let registry = IdentityRegistry::new(identity_registry, &self.provider);
+        let wired =
+            registry.proofVerifier().call().await.map_err(|e| {
+                anyhow!("IdentityRegistry.proofVerifier read failed: {e}")
+            })?;
+        if wired != proof_verifier {
+            send_with_nonce_retry!(
+                registry.setProofVerifier(proof_verifier),
+                "IdentityRegistry.setProofVerifier",
+                &self.provider,
+                self.sender
+            )?;
+            tracing::info!(%proof_verifier, "IdentityRegistry dispatches through the proof verifier");
+            self.summary.configured.push(format!(
+                "identity registry -> proof verifier {proof_verifier:#x}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Step 4, the handle escrow, bound to the identity registry. `initialize`
+    /// refuses a registry whose `nodeKeyed()` is not true, so the registry
+    /// and any upgrade of it land first.
+    async fn handle_escrow(&mut self, present: bool) -> Result<()> {
+        let Stack {
+            handle_escrow,
+            identity_registry,
+            ..
+        } = self.stack;
+        if !present {
+            let addr = self
+                .deploy_named_proxy(
+                    names::HANDLE_ESCROW,
+                    "HandleEscrow",
+                    HandleEscrow::initializeCall {
+                        owner_: self.sender,
+                        registry_: identity_registry,
+                    }
+                    .abi_encode()
+                    .into(),
+                )
+                .await?;
+            tracing::info!(
+                %addr,
+                name = names::HANDLE_ESCROW,
+                %identity_registry,
+                "HandleEscrow proxy deployed"
+            );
+            debug_assert_eq!(addr, handle_escrow);
+            self.summary
+                .deployed
+                .push(("contracts.handle_escrow".into(), addr));
+        }
+
+        self.upgrade_if_requested("handle_escrow", handle_escrow)
+            .await?;
+
+        // The escrow has no setter for its registry, so apply can only check
+        // it. One bound elsewhere pays out to whoever THAT contract says
+        // holds a handle.
+        let resolves_through = HandleEscrow::new(handle_escrow, &self.provider)
+            .registry()
+            .call()
+            .await
+            .map_err(|e| anyhow!("HandleEscrow.registry read failed: {e}"))?;
+        if resolves_through != identity_registry {
+            bail!(
+                "the HandleEscrow at {handle_escrow:#x} resolves through \
+                 {resolves_through:#x}, not the declared IdentityRegistry \
+                 {identity_registry:#x}. apply cannot rebind it: that takes an escrow \
+                 implementation that moves it, or a new canonical escrow name"
+            );
+        }
+        Ok(())
+    }
+
+    /// Step 5, the Google JWT root list, beside the verifier it serves.
+    async fn jwt_roots(&mut self, present: bool) -> Result<()> {
+        let Stack {
+            jwt_roots,
+            notary_service,
+            ..
+        } = self.stack;
+        if !present {
+            let addr = self
+                .deploy_named_proxy(
+                    names::GOOGLE_JWT_ROOTS,
+                    "GoogleJwtRoots",
+                    GoogleJwtRoots::initializeCall {
+                        owner_: self.sender,
+                        notary_: notary_service,
+                    }
+                    .abi_encode()
+                    .into(),
+                )
+                .await?;
+            tracing::info!(
+                %addr,
+                name = names::GOOGLE_JWT_ROOTS,
+                "GoogleJwtRoots proxy deployed; the trust list starts EMPTY: point a \
+                 keeper at it, or every Google binding reverts"
+            );
+            debug_assert_eq!(addr, jwt_roots);
+            self.summary
+                .deployed
+                .push(("contracts.google_jwt_roots".into(), addr));
+        }
+
+        self.upgrade_if_requested("google_jwt_roots", jwt_roots)
+            .await?;
+
+        let roots = GoogleJwtRoots::new(jwt_roots, &self.provider);
+        let roots_notary = roots
+            .notaryService()
+            .call()
+            .await
+            .map_err(|e| anyhow!("GoogleJwtRoots.notaryService read failed: {e}"))?;
+        if roots_notary != notary_service {
+            send_with_nonce_retry!(
+                roots.setNotaryService(notary_service),
+                "GoogleJwtRoots.setNotaryService",
+                &self.provider,
+                self.sender
+            )?;
+            tracing::info!(%notary_service, "GoogleJwtRoots verifies through the notary service");
+            self.summary
+                .configured
+                .push(format!("jwt roots -> notary service {notary_service:#x}"));
+        }
+        Ok(())
+    }
+
+    /// The registry accepts a platform's bindings once its Proof Verifier
+    /// routes the platform to a registered verifier.
+    async fn check_accepts_bindings(&self) -> Result<()> {
+        let identity_registry = self.stack.identity_registry;
+        let registry = IdentityRegistry::new(identity_registry, &self.provider);
+        for platform in platforms::LAUNCH {
+            let accepts = registry
+                .acceptsBindings(platform.id())
+                .call()
+                .await
+                .map_err(|e| {
+                    anyhow!("IdentityRegistry.acceptsBindings read failed: {e}")
+                })?;
+            if !accepts {
+                bail!(
+                    "IdentityRegistry {identity_registry:#x} accepts no {} binding after \
+                     apply registered its verifier",
+                    platform.label
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `addr` has code on-chain — the declarative presence check.
+    async fn code_present(&self, addr: Address) -> Result<bool> {
+        Ok(!self
+            .provider
+            .get_code_at(addr)
+            .await
+            .map_err(|e| anyhow!("get_code({addr:#x}) failed: {e}"))?
+            .is_empty())
+    }
+
+    /// Hand the factory over to `desired`, the declared `[accounts].owner`
+    /// (default: the deployer). Ownable2Step: from the sender this
+    /// INITIATES the handover; on a dev chain (anvil/hardhat) the
+    /// acceptance is completed by impersonating the new owner, so local
+    /// stacks end fully converged.
+    async fn converge_factory_owner(&mut self, desired: Address) -> Result<()> {
+        let sender = self.sender;
+        let factory = self.factory;
+        let contract = LibidFactory::new(factory, &self.provider);
+        let current = contract
+            .owner()
+            .call()
+            .await
+            .map_err(|e| anyhow!("LibidFactory.owner read failed: {e}"))?;
+        if current == desired {
+            return Ok(());
+        }
+        if current != sender {
+            // Nothing this signer can do; say so instead of failing the whole
+            // apply after the chain already converged.
+            tracing::warn!(
+                owner = %current,
+                signer = %sender,
+                wanted = %desired,
+                "factory owner is not the apply signer: cannot hand ownership to \
+                 accounts.owner"
+            );
+            self.summary.configured.push(format!(
+                "factory ownership NOT converged: owned by {current:#x}, wanted \
+                 {desired:#x}"
+            ));
+            return Ok(());
+        }
+
+        let pending = contract
+            .pendingOwner()
+            .call()
+            .await
+            .map_err(|e| anyhow!("LibidFactory.pendingOwner read failed: {e}"))?;
+        if pending != desired {
+            send_with_nonce_retry!(
+                contract.transferOwnership(desired),
+                "LibidFactory.transferOwnership",
+                &self.provider,
+                sender
+            )?;
+            tracing::info!(from = %sender, to = %desired, "factory ownership handover initiated");
+        }
+
+        if self.is_dev_chain().await? {
+            // Complete the two-step locally: impersonate the operational
+            // owner (e.g. the anvil #0 wallet) and accept.
+            self.provider
+                .anvil_set_balance(desired, Unit::ETHER.wei())
+                .await
+                .map_err(|e| anyhow!("anvil_setBalance failed: {e}"))?;
+            self.provider
+                .anvil_impersonate_account(desired)
+                .await
+                .map_err(|e| anyhow!("anvil_impersonateAccount failed: {e}"))?;
+            let accept = TransactionRequest::default()
+                .with_from(desired)
+                .with_to(factory)
+                .with_input(LibidFactory::acceptOwnershipCall {}.abi_encode());
+            self.provider
+                .eth_send_unsigned_transaction(accept)
+                .await
+                .map_err(|e| anyhow!("impersonated acceptOwnership failed: {e}"))?;
+            self.provider
+                .anvil_stop_impersonating_account(desired)
+                .await
+                .map_err(|e| anyhow!("anvil_stopImpersonatingAccount failed: {e}"))?;
+            tracing::info!(from = %sender, to = %desired, "factory ownership converged (dev)");
+            self.summary.configured.push(format!(
+                "factory ownership transferred to accounts.owner {desired:#x} (dev)"
+            ));
+        } else {
+            self.summary.configured.push(format!(
+                "factory ownership handover to accounts.owner {desired:#x} initiated — \
+                 pending acceptOwnership by that key"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether the RPC's `web3_clientVersion` reports a dev chain (anvil or
+    /// hardhat).
+    async fn is_dev_chain(&self) -> Result<bool> {
+        let version = self
+            .provider
+            .get_client_version()
+            .await
+            .map_err(|e| anyhow!("web3_clientVersion failed: {e}"))?
+            .to_lowercase();
+        Ok(version.contains("anvil") || version.contains("hardhat"))
+    }
+
+    /// Make sure the apply signer owns the factory (its `deploy` is
+    /// owner-gated).
+    ///
+    /// - Signer already the owner: nothing to do.
+    /// - Signer is the pending owner (an interrupted Ownable2Step handover):
+    ///   `acceptOwnership`.
+    /// - Otherwise a hard error: the signer is the deployer, the factory's
+    ///   genesis admin, so another owner means an earlier apply handed the
+    ///   factory to a different `accounts.owner`, and that key has to hand it
+    ///   back before anything new can deploy.
+    async fn ensure_factory_ownership(&self) -> Result<()> {
+        let (factory, sender) = (self.factory, self.sender);
+        let contract = LibidFactory::new(factory, &self.provider);
+        let owner = contract
+            .owner()
+            .call()
+            .await
+            .map_err(|e| anyhow!("LibidFactory.owner read failed: {e}"))?;
+        if owner == sender {
+            return Ok(());
+        }
+        let pending = contract
+            .pendingOwner()
+            .call()
+            .await
+            .map_err(|e| anyhow!("LibidFactory.pendingOwner read failed: {e}"))?;
+        if pending == sender {
+            send_with_nonce_retry!(
+                contract.acceptOwnership(),
+                "LibidFactory.acceptOwnership",
+                &self.provider,
+                sender
+            )?;
+            tracing::info!(from = %owner, to = %sender, "factory ownership accepted");
+            return Ok(());
+        }
+        bail!(
+            "the factory at {factory:#x} is owned by {owner:#x} but apply signs as \
+             {sender:#x}. factory.deploy is owner-gated and the deployer is its genesis \
+             admin, so that owner must transferOwnership back to the deployer first"
+        )
+    }
+
+    /// CREATE3-deploy `creation_code` under `name` through the factory, with
+    /// an explicit chain-fetched nonce (the rest of the apply flow manages
+    /// nonces explicitly, so the provider's cached filler cannot be trusted
+    /// here). Idempotent: a name the factory already deployed returns its
+    /// recorded address without sending anything — that is how a
+    /// partially-failed apply converges instead of tripping on the
+    /// single-use name.
+    ///
+    /// The returned address is verified to equal `predict_address(factory,
+    /// name)` — the whole point of the exercise.
+    async fn factory_deploy_named(
+        &self,
+        name: &str,
+        creation_code: Bytes,
+    ) -> Result<Address> {
+        let (factory, sender) = (self.factory, self.sender);
+        let contract = LibidFactory::new(factory, &self.provider);
+        let predicted = predict_address(factory, name);
+
+        let existing = contract
+            .deployedAt(name.to_string())
+            .call()
+            .await
+            .map_err(|e| anyhow!("factory deployedAt({name}) read failed: {e}"))?;
+        if existing != Address::ZERO {
+            tracing::info!(name, %existing, "already deployed by the factory; reusing");
+            if existing != predicted {
+                bail!(
+                    "factory record for {name} is {existing:#x} but predict says \
+                     {predicted:#x} — the deterministic invariant is broken"
+                );
+            }
+            return Ok(existing);
+        }
+
+        // `deploy` is sent as raw calldata: alloy's `sol!` reserves the
+        // `deploy` method name on generated contract instances.
+        let call = LibidFactory::deployCall {
+            name: name.to_string(),
+            creationCode: creation_code,
+        };
+        let nonce = self
+            .provider
+            .get_transaction_count(sender)
+            .await
+            .map_err(|e| {
+                anyhow!("factory deploy of {name} failed to fetch nonce: {e}")
+            })?;
+        let tx = TransactionRequest::default()
+            .with_to(factory)
+            .with_input(Bytes::from(call.abi_encode()))
+            .with_nonce(nonce);
+        let pending = self
+            .provider
+            .send_transaction(tx)
+            .await
+            .map_err(|e| anyhow!("factory deploy of {name} send failed: {e}"))?;
+        pending
+            .get_receipt()
+            .await
+            .map_err(|e| anyhow!("factory deploy of {name} confirmation failed: {e}"))?;
+
+        let deployed = contract
+            .deployedAt(name.to_string())
+            .call()
+            .await
+            .map_err(|e| anyhow!("factory deployedAt({name}) re-read failed: {e}"))?;
+        if deployed != predicted {
+            bail!(
+                "factory deployed {name} at {deployed:#x} but predict says \
                  {predicted:#x} — the deterministic invariant is broken"
             );
         }
-        return Ok(existing);
+        Ok(deployed)
     }
 
-    // `deploy` is sent as raw calldata: alloy's `sol!` reserves the `deploy`
-    // method name on generated contract instances.
-    let call = LibidFactory::deployCall {
-        name: name.to_string(),
-        creationCode: creation_code,
-    };
-    let nonce = provider
-        .get_transaction_count(sender)
-        .await
-        .map_err(|e| anyhow!("factory deploy of {name} failed to fetch nonce: {e}"))?;
-    let tx = TransactionRequest::default()
-        .with_to(factory)
-        .with_input(Bytes::from(call.abi_encode()))
-        .with_nonce(nonce);
-    let pending = provider
-        .send_transaction(tx)
-        .await
-        .map_err(|e| anyhow!("factory deploy of {name} send failed: {e}"))?;
-    pending
-        .get_receipt()
-        .await
-        .map_err(|e| anyhow!("factory deploy of {name} confirmation failed: {e}"))?;
+    /// Deploy `contract`'s implementation via plain CREATE (its address is
+    /// referenced, not canonical), then CREATE3-deploy an ERC1967 proxy for
+    /// it under `name` through the factory, initialized with the ABI-encoded
+    /// `init_data`. The named-proxy shape of every UUPS entry contract.
+    async fn deploy_named_proxy(
+        &self,
+        name: &str,
+        contract: &str,
+        init_data: Bytes,
+    ) -> Result<Address> {
+        let implementation_code = self.artifacts.bytecode(contract)?;
+        // Reuse before paying for an implementation nobody will point at.
+        let record = LibidFactory::new(self.factory, &self.provider)
+            .deployedAt(name.to_string())
+            .call()
+            .await
+            .map_err(|e| anyhow!("factory deployedAt({name}) read failed: {e}"))?;
+        if record != Address::ZERO {
+            return self.factory_deploy_named(name, Bytes::new()).await;
+        }
 
-    let deployed = contract
-        .deployedAt(name.to_string())
-        .call()
-        .await
-        .map_err(|e| anyhow!("factory deployedAt({name}) re-read failed: {e}"))?;
-    if deployed != predicted {
-        bail!(
-            "factory deployed {name} at {deployed:#x} but predict says \
-             {predicted:#x} — the deterministic invariant is broken"
-        );
-    }
-    Ok(deployed)
-}
-
-/// Deploy `contract`'s implementation via plain CREATE (its address is
-/// referenced, not canonical), then CREATE3-deploy an ERC1967 proxy for it
-/// under `name` through the factory, initialized with the ABI-encoded
-/// `init_data`. The named-proxy shape of every UUPS entry contract.
-#[allow(clippy::too_many_arguments)]
-async fn deploy_named_proxy<P: Provider>(
-    provider: &P,
-    artifacts: &Artifacts,
-    factory: Address,
-    name: &str,
-    contract: &str,
-    implementation_code: Bytes,
-    init_data: Bytes,
-    sender: Address,
-) -> Result<Address> {
-    // Reuse before paying for an implementation nobody will point at.
-    let record = LibidFactory::new(factory, provider)
-        .deployedAt(name.to_string())
-        .call()
-        .await
-        .map_err(|e| anyhow!("factory deployedAt({name}) read failed: {e}"))?;
-    if record != Address::ZERO {
-        return factory_deploy_named(provider, factory, name, Bytes::new(), sender).await;
+        let implementation = deploy_contract_from(
+            &self.provider,
+            implementation_code,
+            &format!("{contract} (impl)"),
+            Some(self.sender),
+        )
+        .await?;
+        let creation_code = self.proxy_creation_code(implementation, init_data)?;
+        self.factory_deploy_named(name, creation_code).await
     }
 
-    let implementation = deploy_contract_from(
-        provider,
-        implementation_code,
-        &format!("{contract} (impl)"),
-        Some(sender),
-    )
-    .await?;
-    let creation_code = proxy_creation_code(artifacts, implementation, init_data)?;
-    factory_deploy_named(provider, factory, name, creation_code, sender).await
-}
-
-/// The Platform Verifier proxy address a platform declares.
-fn declared_verifier(cfg: &NetworkConfig, platform: &Platform) -> Result<Address> {
-    let key = platform.contracts_key;
-    let raw = cfg
-        .contracts
-        .raw(key)
-        .ok_or_else(|| anyhow!("{key} is not a canonical contract"))?;
-    required_address(raw, &format!("contracts.{key}"))
-}
-
-/// What this run has already put on the chain for the ceremony circuits.
-///
-/// Two platforms share `bearer-link`, so without this a single apply would
-/// resolve the same verifier twice.
-#[derive(Debug, Default)]
-struct CircuitCache {
-    /// Circuit -> its verifier's address.
-    verifiers: BTreeMap<Circuit, Address>,
-}
-
-/// The circuit verifier for `circuit`, deployed if the chain lacks it.
-///
-/// The verifier goes through the factory under
-/// [`circuits::factory_name`], so its address is a pure function of which
-/// artifact it is. That is what makes this idempotent: a second apply
-/// finds code at the same address and sends nothing, and a circuits
-/// release is a different name and a different address.
-async fn ensure_circuit_verifier<P: Provider>(
-    provider: &P,
-    artifacts: &Artifacts,
-    factory: Address,
-    sender: Address,
-    circuit: Circuit,
-    cache: &mut CircuitCache,
-    summary: &mut Summary,
-) -> Result<Address> {
-    if let Some(&known) = cache.verifiers.get(&circuit) {
-        return Ok(known);
+    /// The circuit verifier for `circuit`, deployed if the chain lacks it.
+    ///
+    /// The verifier goes through the factory under
+    /// [`circuits::factory_name`], so its address is a pure function of
+    /// which artifact it is. That is what makes this idempotent: a second
+    /// apply finds code at the same address and sends nothing, and a
+    /// circuits release is a different name and a different address.
+    async fn circuit_verifier(&mut self, circuit: Circuit) -> Result<Address> {
+        if let Some(&known) = self.circuits.get(&circuit) {
+            return Ok(known);
+        }
+        let name = circuits::factory_name(circuit)?;
+        let address = predict_address(self.factory, &name);
+        if !self.code_present(address).await? {
+            let creation_code = self.artifacts.bytecode(circuit.contract())?;
+            let deployed = self.factory_deploy_named(&name, creation_code).await?;
+            tracing::info!(
+                circuit = circuit.name(),
+                %deployed,
+                %name,
+                "circuit verifier deployed"
+            );
+            debug_assert_eq!(deployed, address);
+            self.summary
+                .deployed
+                .push((format!("circuits.{}", circuit.name()), deployed));
+        }
+        self.circuits.insert(circuit, address);
+        Ok(address)
     }
-    let name = circuits::factory_name(circuit)?;
-    let address = predict_address(factory, &name);
-    if !code_present(provider, address).await? {
-        let creation_code = artifacts.bytecode(circuit.contract())?;
-        let deployed =
-            factory_deploy_named(provider, factory, &name, creation_code, sender).await?;
-        tracing::info!(
-            circuit = circuit.name(),
-            %deployed,
-            %name,
-            "circuit verifier deployed"
-        );
-        debug_assert_eq!(deployed, address);
-        summary
-            .deployed
-            .push((format!("circuits.{}", circuit.name()), deployed));
+
+    /// Deploy, wire and register one platform's Platform Verifier, on the
+    /// verifier for the ceremony circuit its proofs are made under.
+    async fn platform_verifier(&mut self, platform: &Platform) -> Result<()> {
+        let proxy = self.cfg.contracts.address(platform.contracts_key)?;
+        let circuit = self.circuit_verifier(platform.circuit()).await?;
+
+        if !self.code_present(proxy).await? {
+            // The initializer knows the contract's rules — a Notary Service
+            // exactly where the profile notarizes — and the code at `circuit`
+            // must be the verifier the implementation compiles in, so a
+            // mis-wiring fails here rather than at the proxy's constructor.
+            platform
+                .verifier
+                .circuit_codehash_at(&self.provider, &self.artifacts, circuit)
+                .await?;
+            let init = platform
+                .initializer(
+                    self.sender,
+                    self.stack.notary_service,
+                    circuit,
+                    self.stack.jwt_roots,
+                )
+                .call()?;
+            let deployed = self
+                .deploy_named_proxy(
+                    platform.canonical_name,
+                    platform.contract(),
+                    init.abi_encode().into(),
+                )
+                .await?;
+            tracing::info!(
+                platform = platform.label,
+                %deployed,
+                name = platform.canonical_name,
+                "Platform Verifier deployed"
+            );
+            debug_assert_eq!(deployed, proxy);
+            self.summary.deployed.push((platform.component(), deployed));
+        }
+
+        self.upgrade_if_requested(platform.contracts_key, proxy)
+            .await?;
+        self.converge_trust_roots(platform, proxy, circuit).await?;
+        if platform.reads_jwt_roots() {
+            self.converge_jwt_roots(proxy).await?;
+        }
+        self.register_verifier(platform, proxy).await
     }
-    cache.verifiers.insert(circuit, address);
-    Ok(address)
-}
 
-/// Deploy, wire and register one platform's Platform Verifier, on the
-/// verifier for the ceremony circuit its proofs are made under.
-#[allow(clippy::too_many_arguments)]
-async fn apply_platform_verifier<P: Provider>(
-    provider: &P,
-    artifacts: &Artifacts,
-    cfg: &NetworkConfig,
-    opts: &Options,
-    factory: Address,
-    sender: Address,
-    platform: &Platform,
-    notary_service: Address,
-    proof_verifier: Address,
-    jwt_roots: Address,
-    circuits: &mut CircuitCache,
-    summary: &mut Summary,
-) -> Result<()> {
-    let proxy = declared_verifier(cfg, platform)?;
-    let circuit = ensure_circuit_verifier(
-        provider,
-        artifacts,
-        factory,
-        sender,
-        platform.circuit(),
-        circuits,
-        summary,
-    )
-    .await?;
-
-    if !code_present(provider, proxy).await? {
-        // The initializer knows the contract's rules — a Notary Service
-        // exactly where the profile notarizes — and the code at `circuit`
-        // must be the verifier the implementation compiles in, so a
-        // mis-wiring fails here rather than at the proxy's constructor.
+    /// Point a Platform Verifier at its circuit's verifier when the two have
+    /// drifted. A new circuits release lands under a new factory name, and
+    /// the proxy's implementation compiles in the code hash it accepts, so
+    /// the rotation needs `--upgrade` of that Platform Verifier in the same
+    /// run; without it apply stops before sending `setTrustRoots`.
+    ///
+    /// The surface is `PlatformVerifierBase`'s, identical in every Platform
+    /// Verifier. The Notary Service the proxy holds is kept: zero for
+    /// Google, whose profile notarizes nothing.
+    async fn converge_trust_roots(
+        &mut self,
+        platform: &Platform,
+        proxy: Address,
+        circuit: Address,
+    ) -> Result<()> {
+        let verifier = PlatformVerifierBase::new(proxy, &self.provider);
+        let wired =
+            verifier.honkVerifier().call().await.map_err(|e| {
+                anyhow!("{}.honkVerifier read failed: {e}", platform.label)
+            })?;
+        if wired == circuit {
+            return Ok(());
+        }
         platform
             .verifier
-            .circuit_codehash_at(provider, artifacts, circuit)
-            .await?;
-        let init = platform
-            .initializer(sender, notary_service, circuit, jwt_roots)
-            .call()?;
-        let deployed = deploy_named_proxy(
-            provider,
-            artifacts,
-            factory,
-            platform.canonical_name,
-            platform.contract(),
-            artifacts.bytecode(platform.contract())?,
-            init.abi_encode().into(),
-            sender,
-        )
-        .await?;
+            .rotation_codehash_at(&self.provider, &self.artifacts, proxy, circuit)
+            .await
+            .with_context(|| {
+                format!(
+                    "{} pins {wired:#x}; rotating it onto {circuit:#x} takes \
+                     --upgrade {} in the same apply",
+                    platform.label,
+                    Upgrade::from(platform.verifier)
+                )
+            })?;
+        let notary =
+            verifier.notaryService().call().await.map_err(|e| {
+                anyhow!("{}.notaryService read failed: {e}", platform.label)
+            })?;
+        send_with_nonce_retry!(
+            verifier.setTrustRoots(notary, circuit),
+            format!("{}.setTrustRoots", platform.label),
+            &self.provider,
+            self.sender
+        )?;
         tracing::info!(
             platform = platform.label,
-            %deployed,
-            name = platform.canonical_name,
-            "Platform Verifier deployed"
+            from = %wired,
+            to = %circuit,
+            "circuit verifier rotated"
         );
-        debug_assert_eq!(deployed, proxy);
-        summary
-            .deployed
-            .push((format!("contracts.{}", platform.contracts_key), deployed));
+        self.summary.configured.push(format!(
+            "{} circuit verifier {wired:#x} -> {circuit:#x}",
+            platform.label
+        ));
+        Ok(())
     }
 
-    upgrade_if_requested(
-        provider,
-        artifacts,
-        opts,
-        platform.contracts_key,
-        proxy,
-        sender,
-        summary,
-    )
-    .await?;
-
-    converge_trust_roots(
-        provider, artifacts, platform, proxy, circuit, sender, summary,
-    )
-    .await?;
-    if platform.verifier == PlatformVerifier::Google {
-        converge_jwt_roots(provider, proxy, jwt_roots, sender, summary).await?;
+    /// The Google verifier reads its trusted moduli through the root list; a
+    /// drifted pointer is a verifier trusting a list nobody rotates.
+    async fn converge_jwt_roots(&mut self, proxy: Address) -> Result<()> {
+        let jwt_roots = self.stack.jwt_roots;
+        let verifier = GooglePlatformVerifier::new(proxy, &self.provider);
+        let wired =
+            verifier.jwtRoots().call().await.map_err(|e| {
+                anyhow!("GooglePlatformVerifier.jwtRoots read failed: {e}")
+            })?;
+        if wired == jwt_roots {
+            return Ok(());
+        }
+        send_with_nonce_retry!(
+            verifier.setJwtRoots(jwt_roots),
+            "GooglePlatformVerifier.setJwtRoots",
+            &self.provider,
+            self.sender
+        )?;
+        tracing::info!(%jwt_roots, "Google verifier reads roots from GoogleJwtRoots");
+        self.summary
+            .configured
+            .push(format!("google verifier -> jwt roots {jwt_roots:#x}"));
+        Ok(())
     }
-    register_verifier(provider, platform, proof_verifier, proxy, sender, summary).await
-}
 
-/// Point a Platform Verifier at its circuit's verifier when the two have
-/// drifted. A new circuits release lands under a new factory name, and the
-/// proxy's implementation compiles in the code hash it accepts, so the
-/// rotation needs `--upgrade` of that Platform Verifier in the same run;
-/// without it apply stops before sending `setTrustRoots`.
-///
-/// The surface is `PlatformVerifierBase`'s, identical in every Platform
-/// Verifier. The Notary Service the proxy holds is kept: zero for Google,
-/// whose profile notarizes nothing.
-async fn converge_trust_roots<P: Provider>(
-    provider: &P,
-    artifacts: &Artifacts,
-    platform: &Platform,
-    proxy: Address,
-    circuit: Address,
-    sender: Address,
-    summary: &mut Summary,
-) -> Result<()> {
-    let verifier = PlatformVerifierBase::new(proxy, provider);
-    let wired = verifier
-        .honkVerifier()
-        .call()
-        .await
-        .map_err(|e| anyhow!("{}.honkVerifier read failed: {e}", platform.label))?;
-    if wired == circuit {
-        return Ok(());
+    /// Register the verifier in the Supported Version Set. Until this lands,
+    /// `IdentityRegistry.bind` reverts `UnknownVersion` and every resolver
+    /// for the platform reverts `UnknownPlatform`.
+    async fn register_verifier(
+        &mut self,
+        platform: &Platform,
+        proxy: Address,
+    ) -> Result<()> {
+        let platform_id = platform.id();
+        let version_set =
+            CeremonyProofVerifier::new(self.stack.proof_verifier, &self.provider);
+        let registered = version_set
+            .verifierOf(platform_id, LAUNCH_VERIFIER_VERSION)
+            .call()
+            .await
+            .map_err(|e| anyhow!("CeremonyProofVerifier.verifierOf read failed: {e}"))?;
+        if registered == proxy {
+            return Ok(());
+        }
+        send_with_nonce_retry!(
+            version_set.setVerifier(platform_id, LAUNCH_VERIFIER_VERSION, proxy),
+            format!("CeremonyProofVerifier.setVerifier({})", platform.label),
+            &self.provider,
+            self.sender
+        )?;
+        tracing::info!(
+            platform = platform.label,
+            version = LAUNCH_VERIFIER_VERSION,
+            %proxy,
+            "Platform Verifier registered"
+        );
+        self.summary.configured.push(format!(
+            "{} verifier v{LAUNCH_VERIFIER_VERSION} -> {proxy:#x}",
+            platform.label
+        ));
+        Ok(())
     }
-    platform
-        .verifier
-        .rotation_codehash_at(provider, artifacts, proxy, circuit)
-        .await
-        .with_context(|| {
-            format!(
-                "{} pins {wired:#x}; rotating it onto {circuit:#x} takes \
-                 --upgrade {} in the same apply",
-                platform.label,
-                Upgrade::from(platform.verifier)
-            )
-        })?;
-    let notary = verifier
-        .notaryService()
-        .call()
-        .await
-        .map_err(|e| anyhow!("{}.notaryService read failed: {e}", platform.label))?;
-    send_with_nonce_retry!(
-        verifier.setTrustRoots(notary, circuit),
-        format!("{}.setTrustRoots", platform.label),
-        provider,
-        sender
-    )?;
-    tracing::info!(
-        platform = platform.label,
-        from = %wired,
-        to = %circuit,
-        "circuit verifier rotated"
-    );
-    summary.configured.push(format!(
-        "{} circuit verifier {wired:#x} -> {circuit:#x}",
-        platform.label
-    ));
-    Ok(())
-}
 
-/// The Google verifier reads its trusted moduli through the root list; a
-/// drifted pointer is a verifier trusting a list nobody rotates.
-async fn converge_jwt_roots<P: Provider>(
-    provider: &P,
-    proxy: Address,
-    jwt_roots: Address,
-    sender: Address,
-    summary: &mut Summary,
-) -> Result<()> {
-    let verifier = GooglePlatformVerifier::new(proxy, provider);
-    let wired = verifier
-        .jwtRoots()
-        .call()
-        .await
-        .map_err(|e| anyhow!("GooglePlatformVerifier.jwtRoots read failed: {e}"))?;
-    if wired == jwt_roots {
-        return Ok(());
-    }
-    send_with_nonce_retry!(
-        verifier.setJwtRoots(jwt_roots),
-        "GooglePlatformVerifier.setJwtRoots",
-        provider,
-        sender
-    )?;
-    tracing::info!(%jwt_roots, "Google verifier reads roots from GoogleJwtRoots");
-    summary
-        .configured
-        .push(format!("google verifier -> jwt roots {jwt_roots:#x}"));
-    Ok(())
-}
-
-/// Register the verifier in the Supported Version Set. Until this lands,
-/// `IdentityRegistry.bind` reverts `UnknownVersion` and every resolver for
-/// the platform reverts `UnknownPlatform`.
-async fn register_verifier<P: Provider>(
-    provider: &P,
-    platform: &Platform,
-    proof_verifier: Address,
-    proxy: Address,
-    sender: Address,
-    summary: &mut Summary,
-) -> Result<()> {
-    let platform_id = platforms::platform_id(platform.key);
-    let version_set = CeremonyProofVerifier::new(proof_verifier, provider);
-    let registered = version_set
-        .verifierOf(platform_id, LAUNCH_VERIFIER_VERSION)
-        .call()
-        .await
-        .map_err(|e| anyhow!("CeremonyProofVerifier.verifierOf read failed: {e}"))?;
-    if registered == proxy {
-        return Ok(());
-    }
-    send_with_nonce_retry!(
-        version_set.setVerifier(platform_id, LAUNCH_VERIFIER_VERSION, proxy),
-        format!("CeremonyProofVerifier.setVerifier({})", platform.label),
-        provider,
-        sender
-    )?;
-    tracing::info!(
-        platform = platform.label,
-        version = LAUNCH_VERIFIER_VERSION,
-        %proxy,
-        "Platform Verifier registered"
-    );
-    summary.configured.push(format!(
-        "{} verifier v{LAUNCH_VERIFIER_VERSION} -> {proxy:#x}",
-        platform.label
-    ));
-    Ok(())
-}
-
-/// Replace a UUPS proxy's implementation with a freshly deployed one. The
-/// entry address, its storage and its owner all survive.
-async fn upgrade_proxy<P: Provider>(
-    provider: &P,
-    proxy: Address,
-    implementation_code: Bytes,
-    label: &str,
-    sender: Address,
-) -> Result<Address> {
-    let new_impl = deploy_contract_from(
-        provider,
-        implementation_code,
-        &format!("{label} (new impl)"),
-        Some(sender),
-    )
-    .await?;
-    let proxied = IUUPSUpgradeable::new(proxy, provider);
-    send_with_nonce_retry!(
-        proxied.upgradeToAndCall(new_impl, Bytes::new()),
-        format!("{label}.upgradeToAndCall"),
-        provider,
-        sender
-    )?;
-    Ok(new_impl)
-}
-
-/// Run the `--upgrade`s that name the proxy under `[contracts].<key>`.
-/// Called from the component's own section, once its proxy has code and
-/// BEFORE anything reads or writes through it: the implementation running
-/// today may predate a getter the wiring reads (a HandleEscrow from before
-/// libid-contracts 0.15 has no `registry()`), and the upgrade is what makes
-/// that read answer. Nothing to do when no upgrade names the component.
-async fn upgrade_if_requested<P: Provider>(
-    provider: &P,
-    artifacts: &Artifacts,
-    opts: &Options,
-    key: &str,
-    proxy: Address,
-    sender: Address,
-    summary: &mut Summary,
-) -> Result<()> {
-    for upgrade in opts.upgrades.iter().filter(|u| u.contracts_key() == key) {
-        let new_impl = upgrade_proxy(
-            provider,
-            proxy,
-            upgrade.implementation_code(artifacts)?,
-            upgrade.contract(),
-            sender,
+    /// Replace a UUPS proxy's implementation with a freshly deployed one of
+    /// `upgrade`'s contract. The entry address, its storage and its owner
+    /// all survive.
+    async fn upgrade_proxy(&self, upgrade: Upgrade, proxy: Address) -> Result<Address> {
+        let label = upgrade.contract();
+        let new_impl = deploy_contract_from(
+            &self.provider,
+            upgrade.implementation_code(&self.artifacts)?,
+            &format!("{label} (new impl)"),
+            Some(self.sender),
         )
         .await?;
-        tracing::info!(
-            contract = upgrade.contract(),
-            %proxy,
-            %new_impl,
-            "proxy upgraded"
-        );
-        summary
-            .upgraded
-            .push(format!("{} -> {new_impl:#x}", upgrade.contract()));
+        let proxied = IUUPSUpgradeable::new(proxy, &self.provider);
+        send_with_nonce_retry!(
+            proxied.upgradeToAndCall(new_impl, Bytes::new()),
+            format!("{label}.upgradeToAndCall"),
+            &self.provider,
+            self.sender
+        )?;
+        Ok(new_impl)
     }
-    Ok(())
-}
 
-/// ERC1967Proxy creation code ++ `abi.encode(implementation, initData)` —
-/// the bytes a CREATE3 name is deployed from.
-pub(crate) fn proxy_creation_code(
-    artifacts: &Artifacts,
-    implementation: Address,
-    init_data: Bytes,
-) -> Result<Bytes> {
-    let mut code = artifacts.bytecode("ERC1967Proxy")?.to_vec();
-    code.extend_from_slice(&(implementation, init_data).abi_encode_params());
-    Ok(code.into())
+    /// Run the `--upgrade`s that name the proxy under `[contracts].<key>`.
+    /// Called from the component's own section, once its proxy has code
+    /// and BEFORE anything reads or writes through it: the implementation
+    /// running today may predate a getter the wiring reads (a HandleEscrow
+    /// from before libid-contracts 0.15 has no `registry()`), and the
+    /// upgrade is what makes that read answer. Nothing to do when no
+    /// upgrade names the component.
+    async fn upgrade_if_requested(&mut self, key: &str, proxy: Address) -> Result<()> {
+        let requested: Vec<Upgrade> = self
+            .opts
+            .upgrades
+            .iter()
+            .copied()
+            .filter(|u| u.contracts_key() == key)
+            .collect();
+        for upgrade in requested {
+            let new_impl = self.upgrade_proxy(upgrade, proxy).await?;
+            tracing::info!(
+                contract = upgrade.contract(),
+                %proxy,
+                %new_impl,
+                "proxy upgraded"
+            );
+            self.summary
+                .upgraded
+                .push(format!("{} -> {new_impl:#x}", upgrade.contract()));
+        }
+        Ok(())
+    }
+
+    /// ERC1967Proxy creation code ++ `abi.encode(implementation, initData)`
+    /// — the bytes a CREATE3 name is deployed from.
+    fn proxy_creation_code(
+        &self,
+        implementation: Address,
+        init_data: Bytes,
+    ) -> Result<Bytes> {
+        let mut code = self.artifacts.bytecode("ERC1967Proxy")?.to_vec();
+        code.extend_from_slice(&(implementation, init_data).abi_encode_params());
+        Ok(code.into())
+    }
 }
 
 #[cfg(test)]
