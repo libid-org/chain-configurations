@@ -70,3 +70,33 @@ fn check_rpc_needs_an_endpoint() {
     assert!(!output.status.success(), "{stderr}");
     assert!(stderr.contains("no endpoint for 'sepolia'"), "{stderr}");
 }
+
+/// A Safe declared anywhere but the address its name and the deployer
+/// predict fails `validate`, naming the predicted address.
+#[test]
+fn a_safe_off_its_predicted_address_fails_validation() {
+    let sepolia =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../networks/sepolia.toml");
+    let notary_fees = "0x50c5fb6d2861c8b29df8880a13ce8d9e949f3c34";
+    let registry_fees = "0x19bcbc5cf49025a8330e4fc32b4192bd08783096";
+    let text = std::fs::read_to_string(&sepolia).expect("sepolia.toml is readable");
+    let declared = format!("address = \"{notary_fees}\"");
+    assert!(
+        text.contains(&declared),
+        "sepolia declares notary_fees at {notary_fees}"
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let swapped = dir.path().join("sepolia.toml");
+    std::fs::write(
+        &swapped,
+        text.replace(&declared, &format!("address = \"{registry_fees}\"")),
+    )
+    .expect("write the swapped file");
+
+    let output = validate(&swapped, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("safes.notary_fees.address"), "{stderr}");
+    assert!(stderr.contains(notary_fees), "{stderr}");
+}
