@@ -577,6 +577,29 @@ impl<'a> Applier<'a> {
                 .configured
                 .push(format!("notary fee {on_chain_fee} -> {notary_fee} wei"));
         }
+
+        if let Some(recipient) = self.cfg.notary_service.fee_recipient.get() {
+            let on_chain_recipient =
+                service.feeRecipient().call().await.map_err(|e| {
+                    anyhow!("NotaryService.feeRecipient read failed: {e}")
+                })?;
+            if on_chain_recipient != recipient {
+                send_with_nonce_retry!(
+                    service.setFeeRecipient(recipient),
+                    "NotaryService.setFeeRecipient",
+                    &self.provider,
+                    self.sender
+                )?;
+                tracing::info!(
+                    from = %on_chain_recipient,
+                    to = %recipient,
+                    "notary fee recipient set"
+                );
+                self.summary.configured.push(format!(
+                    "notary fee recipient {on_chain_recipient:#x} -> {recipient:#x}"
+                ));
+            }
+        }
         Ok(())
     }
 

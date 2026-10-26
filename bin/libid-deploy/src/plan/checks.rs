@@ -149,6 +149,43 @@ impl From<NotaryFee> for Item {
     }
 }
 
+/// Whether the Notary Service sweeps to the declared fee recipient.
+pub(crate) struct NotaryFeeRecipient {
+    /// The declared `notary_service.fee_recipient`.
+    pub(crate) declared: Address,
+    /// `feeRecipient()`.
+    pub(crate) on_chain: Answer<Address>,
+}
+
+impl From<NotaryFeeRecipient> for Item {
+    fn from(check: NotaryFeeRecipient) -> Self {
+        let declared = check.declared;
+        match check.on_chain {
+            Ok(addr) if addr == declared => Item::new(
+                "notary_service.fee_recipient",
+                Status::Ok,
+                format!("{addr:#x}"),
+            ),
+            Ok(addr) => Item::new(
+                "notary_service.fee_recipient",
+                Status::Configure,
+                format!(
+                    "{addr:#x} on-chain, file says {declared:#x} — apply sends \
+                     setFeeRecipient"
+                ),
+            ),
+            Err(e) => Item::new(
+                "notary_service.fee_recipient",
+                Status::Warn,
+                format!(
+                    "feeRecipient read failed: {e} — apply STOPS at this read unless \
+                     it upgrades the implementation first (--upgrade notary-service)"
+                ),
+            ),
+        }
+    }
+}
+
 /// Whether the identity registry dispatches through the declared Proof
 /// Verifier; without that pointer `quoteBind` calls the zero address.
 pub(crate) struct RegistryProofVerifier {
@@ -570,6 +607,40 @@ mod tests {
         assert_eq!(
             item.detail,
             "7 wei on-chain, file says 1000 — apply sends setFee"
+        );
+    }
+
+    /// A fee recipient that differs from the file is configured, naming
+    /// both addresses.
+    #[test]
+    fn a_drifted_fee_recipient_is_configured() {
+        let item = Item::from(NotaryFeeRecipient {
+            declared: DECLARED,
+            on_chain: Ok(Address::ZERO),
+        });
+        assert_eq!(item.status, Status::Configure);
+        assert_eq!(
+            item.detail,
+            format!(
+                "{:#x} on-chain, file says {DECLARED:#x} — apply sends setFeeRecipient",
+                Address::ZERO
+            )
+        );
+    }
+
+    /// An implementation without `feeRecipient` names the upgrade that
+    /// lifts the stop.
+    #[test]
+    fn an_unreadable_fee_recipient_asks_for_the_upgrade() {
+        let item = Item::from(NotaryFeeRecipient {
+            declared: DECLARED,
+            on_chain: Err("execution reverted".into()),
+        });
+        assert_eq!(item.status, Status::Warn);
+        assert!(
+            item.detail.ends_with("(--upgrade notary-service)"),
+            "{}",
+            item.detail
         );
     }
 

@@ -60,6 +60,9 @@ owner = ""
 # attach exactly `quoteBind`, zero included — so the path is the same one
 # mainnet will run with a real number.
 fee_wei = "0"
+# The notary_fees Safe below: `sweep` sends the accrued fees there, and
+# anyone may call it. Editing it makes apply send `setFeeRecipient`.
+fee_recipient = "0x50c5fb6d2861c8b29df8880a13ce8d9e949f3c34"
 
 # OUTPUT: the canonical contract addresses. Do not hand-edit.
 [contracts]
@@ -100,7 +103,7 @@ google_platform_verifier = "0x355143c93a645ae914b1315eb1b580072207e0f2"
 #
 # PLACEHOLDER owners: the deployer alone, until the owner lists are set.
 
-# The receiver of Notary Service fee withdrawals.
+# Where the Notary Service sweeps its fees: notary_service.fee_recipient.
 [safes.notary_fees]
 address = "0x50c5fb6d2861c8b29df8880a13ce8d9e949f3c34"
 owners = ["0xdaeb247f5a90c53f2d7a80a81f6cb6acb0d8b907"]
