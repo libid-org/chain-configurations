@@ -155,7 +155,7 @@ forever, on every network — names are frozen. The testnet table, deployer
 | `contracts.notary_service` | `libid.NotaryService` | `0xfcf39134654e3542b956ee6e315ca650e6ba3b8c` |
 | `contracts.ceremony_proof_verifier` | `libid.CeremonyProofVerifier.2` | `0x6e4585c4f1ac48a20f49bb61163c466dc4f35004` |
 | `contracts.identity_registry` | `libid.IdentityRegistry.2` | `0x58ac0cd5ec19c850a75d6183b3c3b2de692fb20d` |
-| `contracts.handle_escrow` | `libid.HandleEscrow.3` | `0xf3f81c31c889ddf1ec83b91b3dfed601c04f5e50` |
+| `contracts.handle_escrow` | `libid.HandleEscrow.4` | `0xe7eb0c675b757c12b1312df652242b863624bfab` |
 | `contracts.google_jwt_roots` | `libid.GoogleJwtRoots` | `0x4d9c43d4cf161452b7f66415fa492f4fc42ea583` |
 | `contracts.x_platform_verifier` | `libid.XPlatformVerifier.2` | `0x655be95a91a26b4ade476a8992ee25c98bb774a6` |
 | `contracts.github_platform_verifier` | `libid.GitHubPlatformVerifier.2` | `0x13cdf6d5666a42e0eb586809f46ce10e469d11f7` |
@@ -170,7 +170,7 @@ The mainnet table, deployer `0x7e00d33b5c571ca2b2879309c4846ddd80f4128e`
 | `contracts.notary_service` | `0x4f624a90ae152e524b12258ce6aa9df6ed70ddfb` |
 | `contracts.ceremony_proof_verifier` | `0xcfee504d5a290d72c52b9ffd61d54444d727233b` |
 | `contracts.identity_registry` | `0xf39343febda25caa8c3861954e33f8a0189d4fda` |
-| `contracts.handle_escrow` | `0xd38474f12d887a1d97ac7a62cf0b3c17e4d2c100` |
+| `contracts.handle_escrow` | `0xf2731ab2c9451a9191e0ef64d7fd5352068eb1b5` |
 | `contracts.google_jwt_roots` | `0xa2c959b2940bdb8f97af52401c1603000a3aa46b` |
 | `contracts.x_platform_verifier` | `0xe9b6d548a070fcaa5b43344c0b495d982aaa9fc4` |
 | `contracts.github_platform_verifier` | `0x4f6d4a3486a00b260a1dd91f9dde6f333de6861f` |
