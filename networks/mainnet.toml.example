@@ -60,6 +60,9 @@ owner = ""
 # TLSNotary profile carries two, Google's carries none. Editing it makes
 # apply send `setFee`.
 fee_wei = "0"
+# Where the service's `sweep` sends accrued fees, usually a [safes.<name>]
+# address. Empty = undeclared: apply leaves the on-chain recipient as it is.
+fee_recipient = ""
 
 # DECLARED canonical addresses — the deployer's table, identical on every
 # EVM network that deployer deploys to; validated to equal

@@ -231,7 +231,7 @@ in the flow is the KMS key, which never leaves AWS.
 | `[network]` | input | `name`, `chain_id` (apply refuses a mismatch, whichever endpoint answers); `rpc_url` only where the environment's endpoint is no secret (`local-dev`'s compose service) — a real network's file names none, and `--rpc-url` supplies it |
 | `[aws]` | input | `region`, `kms_deployer` (key id / `alias/...` / ARN; the default signer) |
 | `[accounts]` | input | `notary` (the notary **signer** — see below), `owner` (the operational owner the factory ends up with; empty = the deployer) — addresses of **keys**, not contracts |
-| `[notary_service]` | input | `fee_wei` — what one attestation verification costs, as a decimal string |
+| `[notary_service]` | input | `fee_wei` — what one attestation verification costs, as a decimal string; `fee_recipient` — where `sweep` sends the accrued fees (optional) |
 | `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_registry`, `handle_escrow`, `google_jwt_roots`, `x_platform_verifier`, `github_platform_verifier`, `google_platform_verifier` — always present, pre-filled with the canonical table, validated against the prediction |
 | `[safes.<name>]` | input + declared | `owners`, `threshold` — what the Safe ends up with; `address` — pre-filled with the address the name predicts, validated against it |
 

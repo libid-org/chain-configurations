@@ -120,6 +120,8 @@ const ANVIL_NOTARY: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 // A Notary Fee that is not zero, so the fee path is exercised rather than
 // passing by default.
 const NOTARY_FEE_WEI: u64 = 1_000_000_000_000_000;
+// Anvil account #2, where the Notary Service sweeps its fees.
+const NOTARY_FEE_RECIPIENT: &str = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
 
 /// Anvil WITHOUT its predeployed CREATE2 deployer, so apply's install path
 /// is what puts it there. Default code-size limit on purpose: everything
@@ -183,6 +185,7 @@ owner = "{ANVIL_OWNER}"
 
 [notary_service]
 fee_wei = "{NOTARY_FEE_WEI}"
+fee_recipient = "{NOTARY_FEE_RECIPIENT}"
 
 [contracts]
 factory = "{factory:#x}"
@@ -367,6 +370,10 @@ async fn declarative_apply_cycle_never_touches_the_config() {
         service.fee().call().await.unwrap(),
         U256::from(NOTARY_FEE_WEI)
     );
+    assert_eq!(
+        service.feeRecipient().call().await.unwrap(),
+        NOTARY_FEE_RECIPIENT.parse::<Address>().unwrap()
+    );
 
     let registry = IdentityRegistry::new(identity_registry, &provider);
     assert_eq!(
@@ -505,7 +512,8 @@ async fn apply_converges_drifted_wiring_without_redeploying() {
     let identity_registry: Address = cfg.contracts.identity_registry.get().unwrap();
 
     // Drift: the owner (the anvil #0 key, which is also the apply signer)
-    // points the identity registry somewhere else and changes the fee.
+    // points the identity registry somewhere else and changes the fee and
+    // the fee recipient.
     let key: PrivateKeySigner = ANVIL_KEY.parse().unwrap();
     let owned = ProviderBuilder::new()
         .wallet(EthereumWallet::from(key))
@@ -526,6 +534,14 @@ async fn apply_converges_drifted_wiring_without_redeploying() {
         .get_receipt()
         .await
         .unwrap();
+    NotaryService::new(notary_service, &owned)
+        .setFeeRecipient(Address::repeat_byte(0x99))
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
 
     let drifted = Plan::build(&cfg, &file_rpc(&cfg))
         .await
@@ -536,6 +552,10 @@ async fn apply_converges_drifted_wiring_without_redeploying() {
     );
     assert_eq!(
         drifted.status_of("notary_service.fee"),
+        Some(Status::Configure)
+    );
+    assert_eq!(
+        drifted.status_of("notary_service.fee_recipient"),
         Some(Status::Configure)
     );
     assert!(!drifted.has_deploys(), "drift is not a redeploy");
@@ -551,13 +571,14 @@ async fn apply_converges_drifted_wiring_without_redeploying() {
             .unwrap(),
         proof_verifier
     );
+    let service = NotaryService::new(notary_service, &provider);
     assert_eq!(
-        NotaryService::new(notary_service, &provider)
-            .fee()
-            .call()
-            .await
-            .unwrap(),
+        service.fee().call().await.unwrap(),
         U256::from(NOTARY_FEE_WEI)
+    );
+    assert_eq!(
+        service.feeRecipient().call().await.unwrap(),
+        NOTARY_FEE_RECIPIENT.parse::<Address>().unwrap()
     );
 }
 

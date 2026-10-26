@@ -154,7 +154,7 @@ impl Accounts {
     }
 }
 
-/// `[notary_service]` — the one governance parameter of the service.
+/// `[notary_service]` — the governance parameters of the service.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotaryService {
@@ -163,6 +163,11 @@ pub struct NotaryService {
     /// deployment may meter at no charge, and the exact-value rule still
     /// applies. Editing it makes apply send `setFee`.
     pub fee_wei: String,
+    /// Where the service's `sweep` sends accrued fees. Empty = undeclared:
+    /// apply leaves the on-chain recipient as it is. Editing it makes apply
+    /// send `setFeeRecipient`.
+    #[serde(default)]
+    pub fee_recipient: DeclaredAddress,
 }
 
 impl NotaryService {

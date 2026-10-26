@@ -39,6 +39,7 @@ use checks::{
     FactoryOwner,
     FactoryRecord,
     NotaryFee,
+    NotaryFeeRecipient,
     NotarySigner,
     Registration,
     RegistryProofVerifier,
@@ -341,8 +342,9 @@ impl Planner<'_> {
         Ok(())
     }
 
-    /// The declared notary signer must be trusted, and the declared fee
-    /// must be the one the service charges.
+    /// The declared notary signer must be trusted, the declared fee must be
+    /// the one the service charges, and a declared fee recipient the one it
+    /// sweeps to.
     async fn notary_service(&mut self, address: Address) {
         let service = NotaryService::new(address, &self.provider);
         let signer = match self.cfg.accounts.notary_address() {
@@ -376,6 +378,16 @@ impl Planner<'_> {
         };
         let on_chain = service.fee().call().await.map_err(|e| e.to_string());
         self.items.push(NotaryFee { declared, on_chain }.into());
+
+        if let Some(declared) = self.cfg.notary_service.fee_recipient.get() {
+            let on_chain = service
+                .feeRecipient()
+                .call()
+                .await
+                .map_err(|e| e.to_string());
+            self.items
+                .push(NotaryFeeRecipient { declared, on_chain }.into());
+        }
     }
 
     /// The identity registry dispatches every binding through the Proof
