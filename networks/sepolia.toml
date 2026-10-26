@@ -81,7 +81,7 @@ ceremony_proof_verifier = "0x6e4585c4f1ac48a20f49bb61163c466dc4f35004"
 identity_registry = "0x58ac0cd5ec19c850a75d6183b3c3b2de692fb20d"
 # Initialized with identity_registry above, which it resolves every handle
 # through for life: no setter moves it.
-handle_escrow = "0xf3f81c31c889ddf1ec83b91b3dfed601c04f5e50"
+handle_escrow = "0xe7eb0c675b757c12b1312df652242b863624bfab"
 # Deploys EMPTY. Until a keeper lands a notarized reading of Google's live JWKS,
 # every Google binding reverts with UntrustedModulus(). The deployment repo runs
 # the keeper hourly against this network too; the first tick has to be run

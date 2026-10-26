@@ -77,7 +77,7 @@ ceremony_proof_verifier = "0x145307aaf8dc22fb850aae44aea19628df20e9f6"
 identity_registry = "0x155090a3a2dded2fbdf385bac8cffeb3a51a18ae"
 # Initialized with identity_registry above, which it resolves every handle
 # through for life: no setter moves it.
-handle_escrow = "0x1297ddf98efc4d72ce4c5799e057dd61052cfe29"
+handle_escrow = "0xed2e993a615d8d6b28000034ac58fb6389fe038e"
 google_jwt_roots = "0x6d5bc82c9a8a6a05a9319c9e9d5fc43ff80552ac"
 x_platform_verifier = "0x37be0160c6e2e2e089010d178c7be3ee27602628"
 github_platform_verifier = "0x1aafd47fb1e7c68a1c9afc19d06ccccd958cc4d6"

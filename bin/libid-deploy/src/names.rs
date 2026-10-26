@@ -13,11 +13,13 @@
 //! A name is unique per factory: a new factory gives every name a new
 //! address, so a stack under a new factory keeps the plain names.
 //!
-//! The `.2` names (`.3` for the escrow) are the stack of libid-contracts
-//! 0.19: an Authorization Digest without a chain id and one primary handle
-//! per wallet. The Notary Service and the Google JWT root list serve both
-//! stacks under their plain names. `libid.HandleEscrow.2` belongs to the
-//! factory before this one.
+//! The `.2` names are the stack of libid-contracts 0.19: an Authorization
+//! Digest without a chain id and one primary handle per wallet. The Notary
+//! Service and the Google JWT root list serve both stacks under their plain
+//! names. `libid.HandleEscrow.4` is the escrow of libid-contracts 0.21, whose
+//! refunds open `REFUND_GRACE` after the sender's last deposit;
+//! `libid.HandleEscrow.3` is the 0.19 escrow, and `libid.HandleEscrow.2`
+//! belongs to the factory before this one.
 //!
 //! Two kinds of contract are NOT in this table. Proxy implementations
 //! deploy via plain CREATE: their addresses are referenced by a proxy
@@ -59,8 +61,9 @@ pub const CEREMONY_PROOF_VERIFIER: &str = "libid.CeremonyProofVerifier.2";
 pub const IDENTITY_REGISTRY: &str = "libid.IdentityRegistry.2";
 /// The HandleEscrow proxy: value sent to a handle node before anyone holds
 /// it, claimed through the IdentityRegistry it was initialized with. No
-/// setter moves it off that registry.
-pub const HANDLE_ESCROW: &str = "libid.HandleEscrow.3";
+/// setter moves it off that registry. A sender refunds its own deposits,
+/// from `REFUND_GRACE` after its last one.
+pub const HANDLE_ESCROW: &str = "libid.HandleEscrow.4";
 /// The Google JWT root list proxy, read by the Google Platform Verifier.
 pub const GOOGLE_JWT_ROOTS: &str = "libid.GoogleJwtRoots";
 /// The `x/v1` Platform Verifier proxy.
