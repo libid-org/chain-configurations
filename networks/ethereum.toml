@@ -91,3 +91,27 @@ google_platform_verifier = "0x731f3943879ccf40a21a7b84e9b7ec01776cb9cc"
 # deploys it through the factory under a CREATE3 name carrying that
 # release. Each Platform Verifier implementation compiles in the code
 # hash of its circuit's verifier.
+
+# Safe multisigs, one per [safes.<name>] table. A Safe's address follows from
+# its name and accounts.deployer alone: apply creates it through the Safe v1.4.1
+# SafeProxyFactory on the SafeL2 singleton with the deployer as its only owner,
+# so it lands at the same address on every chain this deployer deploys to.
+# `validate` checks `address` against that prediction, and renaming a table is
+# a new address. apply then sets `owners` and `threshold` in one Safe
+# transaction the deployer signs. Once the deployer can no longer sign alone,
+# apply sends nothing to the Safe: `plan` prints the calls its owners sign in
+# the Safe app.
+#
+# PLACEHOLDER owners: the deployer alone, until the owner lists are set.
+
+# The receiver of Notary Service fee withdrawals.
+[safes.notary_fees]
+address = "0x757b1a49b38b31c1be0456bbd77ae7c9c9eff65d"
+owners = ["0x7e00d33b5c571ca2b2879309c4846ddd80f4128e"]
+threshold = 1
+
+# The receiver of the handles.link service fee.
+[safes.registry_fees]
+address = "0xca5b1b4b68b89ecd2aa25b8822b317741bb702ba"
+owners = ["0x7e00d33b5c571ca2b2879309c4846ddd80f4128e"]
+threshold = 1

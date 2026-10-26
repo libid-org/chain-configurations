@@ -7,9 +7,11 @@
 //! at a WRONG address never reaches the plan: `NetworkConfig::load` rejects
 //! a canonical key that does not equal `predict_address(factory, name)`.
 //! Once the factory exists the plan also diffs its on-chain `deployedAt`
-//! records against the config to surface drift.
+//! records against the config to surface drift. The declared Safes close
+//! the plan: see [`crate::safes`].
 
 mod checks;
+mod safes;
 
 use std::collections::BTreeMap;
 
@@ -206,6 +208,7 @@ impl Plan {
             ));
         }
         planner.stack().await?;
+        planner.safes().await?;
 
         Ok(Plan {
             network: cfg.network.name.clone(),

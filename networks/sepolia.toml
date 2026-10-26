@@ -96,3 +96,27 @@ google_platform_verifier = "0x355143c93a645ae914b1315eb1b580072207e0f2"
 # hash of its circuit's verifier, so a new circuits release is a new name,
 # a new address, an `--upgrade` of the Platform Verifiers and a
 # `setTrustRoots`, with the proxies and their registrations untouched.
+
+# Safe multisigs, one per [safes.<name>] table. A Safe's address follows from
+# its name and accounts.deployer alone: apply creates it through the Safe v1.4.1
+# SafeProxyFactory on the SafeL2 singleton with the deployer as its only owner,
+# so it lands at the same address on every chain this deployer deploys to.
+# `validate` checks `address` against that prediction, and renaming a table is
+# a new address. apply then sets `owners` and `threshold` in one Safe
+# transaction the deployer signs. Once the deployer can no longer sign alone,
+# apply sends nothing to the Safe: `plan` prints the calls its owners sign in
+# the Safe app.
+#
+# PLACEHOLDER owners: the deployer alone, until the owner lists are set.
+
+# The receiver of Notary Service fee withdrawals.
+[safes.notary_fees]
+address = "0x50c5fb6d2861c8b29df8880a13ce8d9e949f3c34"
+owners = ["0xdaeb247f5a90c53f2d7a80a81f6cb6acb0d8b907"]
+threshold = 1
+
+# The receiver of the handles.link service fee.
+[safes.registry_fees]
+address = "0x19bcbc5cf49025a8330e4fc32b4192bd08783096"
+owners = ["0xdaeb247f5a90c53f2d7a80a81f6cb6acb0d8b907"]
+threshold = 1

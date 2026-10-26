@@ -28,6 +28,9 @@
 //! the ceremony circuits' Honk verifiers and a Platform Verifier per
 //! platform pinned to one of them and registered into the Supported Version
 //! Set, without which the registry accepts no binding for the platform.
+//! The declared Safes come last ([`crate::safes`]).
+
+mod safes;
 
 use std::{
     collections::BTreeMap,
@@ -434,6 +437,8 @@ impl<'a> Applier<'a> {
 
         // ── Factory ownership converges to the declared operational owner ─
         self.converge_factory_owner(operational_owner).await?;
+
+        self.safes().await?;
 
         // Nothing is recorded back: the file already declares every
         // canonical address and the chain records the rest.

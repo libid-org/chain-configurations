@@ -233,6 +233,7 @@ in the flow is the KMS key, which never leaves AWS.
 | `[accounts]` | input | `notary` (the notary **signer** — see below), `owner` (the operational owner the factory ends up with; empty = the deployer) — addresses of **keys**, not contracts |
 | `[notary_service]` | input | `fee_wei` — what one attestation verification costs, as a decimal string |
 | `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_registry`, `handle_escrow`, `google_jwt_roots`, `x_platform_verifier`, `github_platform_verifier`, `google_platform_verifier` — always present, pre-filled with the canonical table, validated against the prediction |
+| `[safes.<name>]` | input + declared | `owners`, `threshold` — what the Safe ends up with; `address` — pre-filled with the address the name predicts, validated against it |
 
 The circuit verifiers are not in the file. They are a property of the
 binary's contracts pin — which carries the circuits release — not of a
@@ -278,6 +279,36 @@ Declared-address semantics:
   the factory present, apply converges incrementally without the flag.
 - After registration apply reads `acceptsBindings` for every platform and
   fails if the registry still refuses one.
+
+## Safe multisigs
+
+Each `[safes.<name>]` table is a Safe multisig at an address that depends
+only on `accounts.deployer` and the name, the same on every EVM chain that
+deployer deploys to. Apply creates it through the canonical Safe v1.4.1
+contracts, which `plan` checks by code hash and apply requires:
+
+| Contract | Address |
+|---|---|
+| `SafeProxyFactory` | `0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67` |
+| `SafeL2` (the singleton) | `0x29fcB43b46531BcA003ddC8FCB67FFE91900C762` |
+| `CompatibilityFallbackHandler` | `0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99` |
+| `MultiSendCallOnly` | `0x9641d764fc13c8B624c04430C7356C1C7C8102e2` |
+
+1. **Create.** `createProxyWithNonce` on the `SafeL2` singleton, with
+   `setup(owners = [deployer], threshold = 1, fallback handler)` and salt
+   nonce `keccak256("libid.safes.<name>")`. Renaming a table is a new
+   address.
+2. **Hand over.** While the deployer is an owner and the threshold is 1,
+   apply sends one Safe transaction, signed by the deployer: a
+   `MultiSendCallOnly` batch of `addOwnerWithThreshold`, `removeOwner` and
+   `changeThreshold` that sets exactly `owners` and `threshold`. The
+   deployer stays only if `owners` lists it.
+3. **Owners hold it.** Once the deployer cannot sign alone, apply sends
+   nothing to the Safe. `plan` reports a differing owner set and prints
+   the calls, each from the Safe to itself, for its owners to sign in the
+   Safe app.
+
+`plan --print-addresses` prints each declared Safe's address.
 
 ## Running locally
 

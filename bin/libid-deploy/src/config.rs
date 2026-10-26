@@ -9,6 +9,7 @@
 //! time, never from config emptiness, and `apply` NEVER rewrites the file.
 
 use std::{
+    collections::BTreeMap,
     fmt,
     path::Path,
     str::FromStr,
@@ -33,7 +34,14 @@ use libid_contracts::factory::{
 };
 use serde::Deserialize;
 
-use crate::names;
+use crate::{
+    names,
+    safes::{
+        OwnerSet,
+        Safe,
+        SENTINEL_OWNERS,
+    },
+};
 
 /// One parsed network file.
 #[derive(Debug, Clone, Deserialize)]
@@ -50,6 +58,9 @@ pub struct NetworkConfig {
     /// The canonical contract addresses — DECLARED, pre-filled with the
     /// canonical table.
     pub contracts: Contracts,
+    /// The Safe multisigs, by name: `[safes.<name>]`.
+    #[serde(default)]
+    pub safes: BTreeMap<String, SafeConfig>,
 }
 
 /// `[network]`.
@@ -229,6 +240,30 @@ impl Contracts {
     }
 }
 
+/// `[safes.<name>]` — one Safe multisig. Its address follows from the name
+/// and `accounts.deployer` alone (see [`crate::safes`]); the owners and
+/// threshold are what apply hands it to.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafeConfig {
+    /// The Safe's address — DECLARED, validated to equal its prediction.
+    pub address: DeclaredAddress,
+    /// The owners it ends up with.
+    pub owners: Vec<Address>,
+    /// How many of them must sign.
+    pub threshold: u64,
+}
+
+impl SafeConfig {
+    /// The declared owners and threshold.
+    pub fn owner_set(&self) -> OwnerSet {
+        OwnerSet {
+            owners: self.owners.clone(),
+            threshold: self.threshold,
+        }
+    }
+}
+
 /// The declared addresses of the entry contracts every Platform Verifier
 /// and every wiring check refers to.
 #[derive(Debug, Clone, Copy)]
@@ -333,7 +368,59 @@ impl NetworkConfig {
         if self.aws.kms_deployer.trim().is_empty() {
             bail!("aws.kms_deployer must not be empty");
         }
-        self.validate_canonical_addresses()
+        self.validate_canonical_addresses()?;
+        self.validate_safes()
+    }
+
+    /// Every declared Safe: a name of `[a-z0-9_]`, distinct nonzero owners,
+    /// a threshold they can meet, and the address its name predicts.
+    fn validate_safes(&self) -> Result<()> {
+        let deployer = self.accounts.deployer_address()?;
+        for (name, declared) in &self.safes {
+            let label = format!("safes.{name}");
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            {
+                bail!("{label}: a Safe name is lowercase letters, digits and '_'");
+            }
+            let expected = Safe { name, deployer }.address();
+            let address = declared
+                .address
+                .required(&format!("{label}.address"))
+                .map_err(|e| {
+                    anyhow!(
+                        "{e} — set it to {expected:#x}, the address its name predicts"
+                    )
+                })?;
+            if address != expected {
+                bail!(
+                    "{label}.address declares {address:#x} but the Safe '{name}' of \
+                     deployer {deployer:#x} is at {expected:#x}"
+                );
+            }
+            let owners = &declared.owners;
+            if owners.is_empty() {
+                bail!("{label}.owners must name at least one owner");
+            }
+            for (i, owner) in owners.iter().enumerate() {
+                if [Address::ZERO, SENTINEL_OWNERS, address].contains(owner) {
+                    bail!("{label}.owners: {owner:#x} cannot own a Safe");
+                }
+                if owners[..i].contains(owner) {
+                    bail!("{label}.owners lists {owner:#x} twice");
+                }
+            }
+            if declared.threshold == 0 || declared.threshold > owners.len() as u64 {
+                bail!(
+                    "{label}.threshold is {} but must be 1 to {} (its owner count)",
+                    declared.threshold,
+                    owners.len()
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Every declared canonical key must EQUAL the predicted CREATE3
@@ -547,6 +634,86 @@ google_platform_verifier = "{google}"
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("contracts.identity_registry"), "got: {err}");
         assert!(err.contains(&format!("{expected:#x}")), "got: {err}");
+    }
+
+    /// A `[safes.<name>]` table for the test deployer.
+    fn with_safe(
+        name: &str,
+        address: Address,
+        owners: &[&str],
+        threshold: u64,
+    ) -> String {
+        let owners = owners
+            .iter()
+            .map(|o| format!("\"{o}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{}\n[safes.{name}]\naddress = \"{address:#x}\"\nowners = [{owners}]\n\
+             threshold = {threshold}\n",
+            canonical_toml()
+        )
+    }
+
+    fn test_safe(name: &str) -> Address {
+        Safe {
+            name,
+            deployer: TEST_DEPLOYER.parse().unwrap(),
+        }
+        .address()
+    }
+
+    /// A Safe at the address its name predicts validates.
+    #[test]
+    fn a_declared_safe_validates_at_its_predicted_address() {
+        let text = with_safe(
+            "notary_fees",
+            test_safe("notary_fees"),
+            &[TEST_DEPLOYER, "0x1111111111111111111111111111111111111111"],
+            2,
+        );
+        let cfg: NetworkConfig = toml::from_str(&text).unwrap();
+        cfg.validate().expect("the predicted address validates");
+        assert_eq!(cfg.safes.get("notary_fees").map(|s| s.threshold), Some(2));
+    }
+
+    /// A Safe declared at another name's address is an error naming the
+    /// predicted one.
+    #[test]
+    fn a_safe_at_another_address_is_an_error_naming_the_prediction() {
+        let expected = test_safe("notary_fees");
+        let text = with_safe(
+            "notary_fees",
+            test_safe("registry_fees"),
+            &[TEST_DEPLOYER],
+            1,
+        );
+        let cfg: NetworkConfig = toml::from_str(&text).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("safes.notary_fees.address"), "got: {err}");
+        assert!(err.contains(&format!("{expected:#x}")), "got: {err}");
+    }
+
+    /// Owners and threshold a Safe would refuse are refused at load.
+    #[test]
+    fn a_safe_with_unusable_owners_is_an_error() {
+        let address = test_safe("notary_fees");
+        for (owners, threshold, needle) in [
+            (vec![], 1, "at least one owner"),
+            (vec![TEST_DEPLOYER, TEST_DEPLOYER], 1, "twice"),
+            (vec![TEST_DEPLOYER], 2, "threshold"),
+            (vec![TEST_DEPLOYER], 0, "threshold"),
+            (
+                vec!["0x0000000000000000000000000000000000000001"],
+                1,
+                "cannot own",
+            ),
+        ] {
+            let text = with_safe("notary_fees", address, &owners, threshold);
+            let cfg: NetworkConfig = toml::from_str(&text).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "{owners:?}/{threshold}: {err}");
+        }
     }
 
     /// An empty canonical key is an error naming the fill-in value.
