@@ -13,9 +13,12 @@ use clap::{
     Subcommand,
 };
 use libid_deploy::{
-    apply,
+    apply::{
+        self,
+        Applier,
+    },
     config::NetworkConfig,
-    plan,
+    plan::Plan,
     rpc::RpcEndpoint,
     signer::SignerSource,
 };
@@ -139,7 +142,7 @@ async fn main() -> Result<()> {
             );
             if check_rpc {
                 let rpc = RpcEndpoint::resolve(&cfg, flag)?;
-                let built = plan::build(&cfg, &rpc).await?;
+                let built = Plan::build(&cfg, &rpc).await?;
                 if built.chain_id_actual != built.chain_id_expected {
                     bail!(
                         "{} reports chain {} but the file says {}",
@@ -169,7 +172,7 @@ async fn main() -> Result<()> {
             }
             let cfg = NetworkConfig::load(&network)?;
             let rpc = RpcEndpoint::resolve(&cfg, rpc.rpc_url.as_deref())?;
-            let built = plan::build(&cfg, &rpc).await?;
+            let built = Plan::build(&cfg, &rpc).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&built)?);
             } else {
@@ -209,7 +212,10 @@ async fn main() -> Result<()> {
                 upgrades: upgrade,
                 confirm_fresh_deploy,
             };
-            let summary = apply::run(&network, &cfg, &rpc, &signer, &opts).await?;
+            let summary = Applier::connect(&cfg, &rpc, &signer, opts)
+                .await?
+                .run(&network)
+                .await?;
             print!("{}", summary.render());
         }
     }
