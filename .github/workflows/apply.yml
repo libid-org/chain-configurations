@@ -54,6 +54,10 @@ on:
         type: choice
         options: [release, branch]
         default: release
+      contracts_ref:
+        description: "With source: branch, a libid-contracts commit (40-hex SHA) to build against instead of the crates.io release"
+        type: string
+        default: ""
 
 # Never let two applies touch the same chain at once. Cancelling mid-flight
 # is NOT safe — a half-applied upgrade is worse than a queued one — so
@@ -127,11 +131,62 @@ jobs:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: inputs.source == 'branch'
-      - name: Build libid-deploy from this branch
-        if: inputs.source == 'branch'
+      # ── Optionally, an unreleased libid-contracts commit ───────────────
+      # The crate embeds forge artifacts that are generated, not committed,
+      # so a git dependency cannot build: the commit is checked out, built
+      # and vendored here, and cargo patches the registry crate to it.
+      - name: Check the contracts ref
+        if: inputs.contracts_ref != ''
+        env:
+          SOURCE: ${{ inputs.source }}
+          CONTRACTS_REF: ${{ inputs.contracts_ref }}
         run: |
           set -euo pipefail
-          cargo build --release
+          [ "$SOURCE" = "branch" ] || { echo "::error::contracts_ref needs source: branch"; exit 1; }
+          [[ "$CONTRACTS_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::contracts_ref must be a full 40-hex commit SHA"; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: inputs.contracts_ref != ''
+        with:
+          repository: libid-org/libid-contracts
+          ref: ${{ inputs.contracts_ref }}
+          path: libid-contracts
+          submodules: recursive
+          persist-credentials: false
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        if: inputs.contracts_ref != ''
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+      - name: Vendor the libid-contracts artifacts
+        if: inputs.contracts_ref != ''
+        working-directory: libid-contracts
+        env:
+          CONTRACTS_REF: ${{ inputs.contracts_ref }}
+        run: |
+          set -euo pipefail
+          ./scripts/vendor-circuit-verifiers.sh
+          ./scripts/vendor-artifacts.sh
+          echo "libid-contracts: $CONTRACTS_REF" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build libid-deploy from this branch
+        if: inputs.source == 'branch'
+        env:
+          CONTRACTS_REF: ${{ inputs.contracts_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CONTRACTS_REF" ]; then
+            patch=(--config 'patch.crates-io.libid-contracts.path="libid-contracts/rust/contracts"')
+            # The lock names the registry release; moving it to the patched
+            # crate is what makes cargo use the checkout.
+            cargo update "${patch[@]}" -p libid-contracts
+            cargo build --release "${patch[@]}"
+            used=$(cargo tree "${patch[@]}" -i libid-contracts --depth 0)
+            [[ "$used" == *"/libid-contracts/rust/contracts)"* ]] ||
+              { echo "::error::the build did not use the libid-contracts checkout"; exit 1; }
+            # The committed lock stays the one the release builds from.
+            git checkout -- Cargo.lock
+          else
+            cargo build --release
+          fi
           cp target/release/libid-deploy .
           ./libid-deploy --version
 
