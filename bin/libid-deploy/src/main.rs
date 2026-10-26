@@ -70,7 +70,8 @@ enum Command {
         json: bool,
         /// Print the file's deployer's canonical address table (computed
         /// offline from `accounts.deployer` — works before the chain even
-        /// exists, and before `[contracts]` is filled in) and exit without
+        /// exists, and before `[contracts]` is filled in), with the address
+        /// of every `[safes.<name>]` the file names, and exit without
         /// contacting the RPC. For config pre-fill.
         #[arg(long, conflicts_with = "rpc_url")]
         print_addresses: bool,
@@ -165,9 +166,16 @@ async fn main() -> Result<()> {
             rpc,
         } => {
             if print_addresses {
-                let genesis =
-                    NetworkConfig::read(&network)?.accounts.factory_genesis()?;
+                let cfg = NetworkConfig::read(&network)?;
+                let genesis = cfg.accounts.factory_genesis()?;
                 print!("{}", libid_deploy::names::render_address_table(genesis)?);
+                print!(
+                    "{}",
+                    libid_deploy::safes::render_address_table(
+                        genesis.admin,
+                        cfg.safes.keys()
+                    )
+                );
                 return Ok(());
             }
             let cfg = NetworkConfig::load(&network)?;

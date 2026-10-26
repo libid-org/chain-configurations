@@ -92,6 +92,7 @@ use libid_deploy::{
         LAUNCH_VERIFIER_VERSION,
     },
     rpc::RpcEndpoint,
+    safes,
     signer::SignerSource,
 };
 
@@ -1594,4 +1595,221 @@ fn the_cli_applies_the_committed_file_through_rpc_url() {
         "{stdout}"
     );
     assert!(!stdout.contains("DEPLOY"), "{stdout}");
+}
+
+// Anvil accounts #2-#4: the owners a Safe is handed to.
+const SAFE_OWNERS: [&str; 3] = [
+    "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+    "0x90F79bf6EB2c4f870365E785982E1f101E93b906",
+    "0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65",
+];
+
+/// Where `name`'s Safe of the anvil #0 deployer lands.
+fn safe_address(name: &str) -> Address {
+    safes::Safe {
+        name,
+        deployer: ANVIL_OWNER.parse().unwrap(),
+    }
+    .address()
+}
+
+/// Add to the network file at `path` `notary_fees` handed to `owners` under
+/// `threshold`, and `registry_fees` left with the deployer alone.
+fn declare_safes(path: &Path, owners: &[&str], threshold: u64) {
+    let mut body = std::fs::read_to_string(path).expect("read network file");
+    let owners = owners
+        .iter()
+        .map(|o| format!("\"{o}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    body.push_str(&format!(
+        r#"
+[safes.notary_fees]
+address = "{notary:#x}"
+owners = [{owners}]
+threshold = {threshold}
+
+[safes.registry_fees]
+address = "{registry:#x}"
+owners = ["{ANVIL_OWNER}"]
+threshold = 1
+"#,
+        notary = safe_address("notary_fees"),
+        registry = safe_address("registry_fees"),
+    ));
+    std::fs::write(path, body).expect("write network file");
+}
+
+/// Put the Safe v1.4.1 contracts at their canonical addresses, with the
+/// runtime code they hold on Ethereum.
+async fn install_safe_contracts<P: Provider>(provider: &P) {
+    for contract in safes::SAFE_CONTRACTS {
+        let hex = match contract.name {
+            "SafeProxyFactory" => {
+                include_str!("fixtures/safe-1.4.1/SafeProxyFactory.hex")
+            }
+            "SafeL2" => include_str!("fixtures/safe-1.4.1/SafeL2.hex"),
+            "CompatibilityFallbackHandler" => {
+                include_str!("fixtures/safe-1.4.1/CompatibilityFallbackHandler.hex")
+            }
+            "MultiSendCallOnly" => {
+                include_str!("fixtures/safe-1.4.1/MultiSendCallOnly.hex")
+            }
+            other => panic!("no fixture for {other}"),
+        };
+        let code: Bytes = hex.trim().parse().expect("fixture is hex");
+        assert_eq!(keccak256(&code), contract.codehash, "{}", contract.name);
+        provider
+            .anvil_set_code(contract.address, code)
+            .await
+            .expect("anvil_setCode");
+    }
+}
+
+/// The owners and threshold a Safe holds, the owners as a sorted list.
+async fn safe_owners<P: Provider>(provider: &P, safe: Address) -> (Vec<Address>, U256) {
+    let safe = safes::ISafe::new(safe, provider);
+    let mut owners = safe.getOwners().call().await.expect("getOwners");
+    owners.sort();
+    (
+        owners,
+        safe.getThreshold().call().await.expect("getThreshold"),
+    )
+}
+
+/// A Safe's life under apply: refused on a chain without the Safe
+/// contracts, created at its predicted address as the deployer's 1-of-1,
+/// handed to the declared owners in the same run, left alone by the next
+/// run, and — once the owners hold it — reported with the calls they sign,
+/// never sent to.
+#[tokio::test]
+async fn safes_are_created_handed_over_and_then_left_to_their_owners() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_network_file(dir.path(), &anvil.endpoint());
+    declare_safes(&path, &SAFE_OWNERS, 2);
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let notary_fees = safe_address("notary_fees");
+    let registry_fees = safe_address("registry_fees");
+
+    // No Safe contracts: the plan says so and apply refuses the Safes.
+    let bare = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
+    assert_eq!(
+        bare.status_of("safe_contracts.proxy_factory"),
+        Some(Status::Warn)
+    );
+    assert_eq!(bare.status_of("safes.notary_fees"), None);
+    let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
+    let refused = Applier::connect(
+        &cfg,
+        &file_rpc(&cfg),
+        &signer,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("apply connects")
+    .run(&path)
+    .await
+    .expect_err("no Safe contracts, no Safes");
+    assert!(
+        refused
+            .to_string()
+            .contains("no Safe v1.4.1 SafeProxyFactory"),
+        "{refused}"
+    );
+
+    install_safe_contracts(&provider).await;
+    let fresh = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
+    assert_eq!(fresh.status_of("safes.notary_fees"), Some(Status::Deploy));
+    assert_eq!(
+        fresh.status_of("safes.notary_fees.owners"),
+        Some(Status::Deploy)
+    );
+
+    // Created at the predicted address and handed over in the same run.
+    let summary = apply_with(&path, apply::Options::default()).await;
+    for (component, address) in [
+        ("safes.notary_fees", notary_fees),
+        ("safes.registry_fees", registry_fees),
+    ] {
+        assert!(
+            summary.deployed.contains(&(component.to_string(), address)),
+            "{component}: {:?}",
+            summary.deployed
+        );
+    }
+    let mut declared: Vec<Address> =
+        SAFE_OWNERS.iter().map(|o| o.parse().unwrap()).collect();
+    declared.sort();
+    assert_eq!(
+        safe_owners(&provider, notary_fees).await,
+        (declared.clone(), U256::from(2))
+    );
+    assert_eq!(
+        safe_owners(&provider, registry_fees).await,
+        (vec![ANVIL_OWNER.parse().unwrap()], U256::from(1))
+    );
+
+    // The next run sends nothing to either Safe.
+    let deployer: Address = ANVIL_OWNER.parse().unwrap();
+    let nonce = provider.get_transaction_count(deployer).await.unwrap();
+    let again = apply_with(&path, apply::Options::default()).await;
+    assert!(again.deployed.is_empty(), "{:?}", again.deployed);
+    assert!(
+        !again.configured.iter().any(|c| c.starts_with("safes.")),
+        "{:?}",
+        again.configured
+    );
+    assert_eq!(
+        provider.get_transaction_count(deployer).await.unwrap(),
+        nonce
+    );
+    let settled = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
+    assert_eq!(
+        settled.status_of("safes.notary_fees.owners"),
+        Some(Status::Ok)
+    );
+
+    // The owners hold it now: a changed owner list is reported with the
+    // calls they sign, and apply sends nothing.
+    write_network_file(dir.path(), &anvil.endpoint());
+    declare_safes(&path, &SAFE_OWNERS[..2], 1);
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let plan = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
+    let owners = plan
+        .items
+        .iter()
+        .find(|i| i.component == "safes.notary_fees.owners")
+        .expect("the owners line");
+    assert_eq!(owners.status, Status::Warn);
+    assert!(
+        owners
+            .detail
+            .contains(&format!("1. to {notary_fees:#x} value 0 data 0x")),
+        "{}",
+        owners.detail
+    );
+    assert!(owners.detail.contains("2. to "), "{}", owners.detail);
+    let nonce = provider.get_transaction_count(deployer).await.unwrap();
+    let report = apply_with(&path, apply::Options::default()).await;
+    assert!(
+        report
+            .configured
+            .iter()
+            .any(|c| c.starts_with("safes.notary_fees NOT converged")),
+        "{:?}",
+        report.configured
+    );
+    assert_eq!(
+        provider.get_transaction_count(deployer).await.unwrap(),
+        nonce
+    );
+    assert_eq!(
+        safe_owners(&provider, notary_fees).await,
+        (declared, U256::from(2))
+    );
 }
