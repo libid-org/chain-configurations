@@ -1218,13 +1218,13 @@ async fn the_handle_escrow_resolves_through_the_identity_registry_beside_it() {
         .await
         .unwrap();
     let native = escrow.NATIVE().call().await.unwrap();
-    let refund_to: Address = ANVIL_NOTARY.parse().unwrap();
     let key: PrivateKeySigner = ANVIL_KEY.parse().unwrap();
+    let sender = key.address();
     let owned = ProviderBuilder::new()
         .wallet(EthereumWallet::from(key))
         .connect_http(anvil.endpoint_url());
     HandleEscrow::new(handle_escrow, &owned)
-        .depositToHandle(x, "alice".into(), native, U256::from(1), refund_to)
+        .depositToHandle(x, "alice".into(), native, U256::from(1))
         .value(U256::from(1))
         .send()
         .await
@@ -1238,10 +1238,11 @@ async fn the_handle_escrow_resolves_through_the_identity_registry_beside_it() {
     );
     assert_eq!(
         escrow
-            .refundable(node, native, refund_to)
+            .contribution(node, native, sender)
             .call()
             .await
-            .unwrap(),
+            .unwrap()
+            .amount,
         U256::from(1)
     );
 
