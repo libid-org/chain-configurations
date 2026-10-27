@@ -143,8 +143,8 @@ cargo run -- plan --network networks/eden-testnet.toml --print-addresses
 ```
 
 One deployer key per environment: testnet's lives in the libid-testnet AWS
-account and serves eden-testnet and Sepolia, mainnet's in libid-mainnet, so
-the two environments have different tables. The authoritative name table
+account and serves eden-testnet, Sepolia and Arbitrum Sepolia, mainnet's in
+libid-mainnet, so the two environments have different tables. The authoritative name table
 (`bin/libid-deploy/src/names.rs`). Renaming an entry = a NEW address,
 forever, on every network — names are frozen. The testnet table, deployer
 `0xdaeb247f5a90c53f2d7a80a81f6cb6acb0d8b907`:
