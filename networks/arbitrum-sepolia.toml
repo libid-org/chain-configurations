@@ -1,0 +1,120 @@
+# Arbitrum Sepolia — desired state for the libid identity stack.
+#
+# Every address under [contracts] is CANONICAL: each entry deploys through
+# LibidFactory via CREATE3 with `salt = keccak256(canonical name)`, so an address
+# depends only on the contract's name — not its bytecode, not its constructor
+# arguments, not which chain it is on. They are identical on every EVM chain, and
+# `validate` enforces that equality offline. Regenerate the table with
+# `libid-deploy plan --print-addresses`, never by hand.
+#
+# The first apply needs `confirm_fresh_deploy: true` while the factory is not yet
+# deployed here; that guard reads chain state, not this file.
+#
+# HOW TO READ THIS FILE
+#
+# Every value here is public: contract addresses, accounts, the fee. The
+# endpoint is not here: it is the `RPC_URL` secret of the `arbitrum-sepolia`
+# GitHub environment (`--rpc-url` on a host). The other secret in the flow is
+# the KMS key, which never leaves AWS.
+#
+# INPUT keys describe what should exist: the accounts the contracts trust and the
+# Notary Fee. You edit these.
+#
+# OUTPUT keys are everything under [contracts]. They are pre-filled and
+# declarative: `apply` reads chain state to decide what is missing and NEVER
+# rewrites this file.
+
+[network]
+name = "arbitrum-sepolia"
+chain_id = 421614
+
+[aws]
+region = "eu-central-1"
+# The deployer's KMS key: eden-testnet's, in the libid-testnet AWS account, and
+# necessarily so — one testnet deployer means one factory address and one table
+# on every testnet. It is the factory's genesis admin: this alias derives to
+# accounts.deployer below, the address baked into the factory's init code, and
+# `factory.deploy` is owner-gated, so no other key can perform this apply. It
+# pays Arbitrum Sepolia ETH: L2 gas plus the L1 data fee Arbitrum charges for
+# each transaction's calldata.
+kms_deployer = "alias/libid-testnet-deployer"
+
+# The ADDRESSES OF KEYS, not contracts.
+[accounts]
+# The deployer, the address of aws.kms_deployer: the genesis admin of the
+# factory, which every address under [contracts] is predicted from. The
+# testnet deployer lives in the libid-testnet AWS account, so testnet has its
+# own factory and its own table, apart from mainnet's.
+deployer = "0xdaeb247f5a90c53f2d7a80a81f6cb6acb0d8b907"
+# The notary SIGNER — the identity whose attestations the whole stack accepts.
+# The identity notary at testnet.notary.lib.id signs with this key for every
+# testnet: an attestation names no chain, so one notary serves every network.
+# `apply` initializes the Notary Service with this key and adds it to the
+# trusted set when it is missing. Dropping an outgoing key is a separate
+# governance call on purpose: the service holds a SET so a rotation can overlap,
+# and which key to stop trusting is not something this file can say.
+notary = "0x569ae51d9c356f838c2811389a932b681cb6491c"
+
+# The operational owner the factory ends up with. Empty = the deployer, which
+# on this network IS the KMS genesis admin, so the default is exact.
+owner = ""
+
+[notary_service]
+# What one attestation verification costs, in wei: 0.0001 ETH, as on Sepolia.
+# A TLSNotary profile carries two attestations, so an X or GitHub binding pays
+# 0.0002 ETH; Google's carries none. Editing it makes apply send `setFee`.
+fee_wei = "100000000000000"
+# The notary_fees Safe below: `sweep` sends the accrued fees there, and
+# anyone may call it. Editing it makes apply send `setFeeRecipient`.
+fee_recipient = "0x50c5fb6d2861c8b29df8880a13ce8d9e949f3c34"
+
+# OUTPUT: the canonical contract addresses. Do not hand-edit.
+[contracts]
+factory = "0x5294f6c0f1f086f70c9b510ba7990085d5976281"
+notary_service = "0xfcf39134654e3542b956ee6e315ca650e6ba3b8c"
+ceremony_proof_verifier = "0x6e4585c4f1ac48a20f49bb61163c466dc4f35004"
+identity_registry = "0x58ac0cd5ec19c850a75d6183b3c3b2de692fb20d"
+# Initialized with identity_registry above, which it resolves every handle
+# through for life: no setter moves it.
+handle_escrow = "0xe7eb0c675b757c12b1312df652242b863624bfab"
+# Deploys EMPTY. Until a keeper lands a notarized reading of Google's live JWKS,
+# every Google binding reverts with UntrustedModulus(). The deployment repo runs
+# the keeper hourly against this network too; the first tick has to be run
+# deliberately, right after this apply.
+google_jwt_roots = "0x4d9c43d4cf161452b7f66415fa492f4fc42ea583"
+x_platform_verifier = "0x655be95a91a26b4ade476a8992ee25c98bb774a6"
+github_platform_verifier = "0x13cdf6d5666a42e0eb586809f46ce10e469d11f7"
+google_platform_verifier = "0x355143c93a645ae914b1315eb1b580072207e0f2"
+
+# The ceremony circuit verifiers are NOT declared here. `libid-deploy`
+# carries them: `libid-contracts` embeds each circuit's bb-generated
+# UltraHonk verifier from the libid-circuits release it pins, and apply
+# deploys it through the factory under a CREATE3 name carrying that
+# release. Each Platform Verifier implementation compiles in the code
+# hash of its circuit's verifier, so a new circuits release is a new name,
+# a new address, an `--upgrade` of the Platform Verifiers and a
+# `setTrustRoots`, with the proxies and their registrations untouched.
+
+# Safe multisigs, one per [safes.<name>] table. A Safe's address follows from
+# its name and accounts.deployer alone: apply creates it through the Safe v1.4.1
+# SafeProxyFactory on the SafeL2 singleton with the deployer as its only owner,
+# so it lands at the same address on every chain this deployer deploys to.
+# `validate` checks `address` against that prediction, and renaming a table is
+# a new address. apply then sets `owners` and `threshold` in one Safe
+# transaction the deployer signs. Once the deployer can no longer sign alone,
+# apply sends nothing to the Safe: `plan` prints the calls its owners sign in
+# the Safe app.
+#
+# PLACEHOLDER owners: the deployer alone, until the owner lists are set.
+
+# Where the Notary Service sweeps its fees: notary_service.fee_recipient.
+[safes.notary_fees]
+address = "0x50c5fb6d2861c8b29df8880a13ce8d9e949f3c34"
+owners = ["0xdaeb247f5a90c53f2d7a80a81f6cb6acb0d8b907"]
+threshold = 1
+
+# The receiver of the handles.link service fee.
+[safes.registry_fees]
+address = "0x19bcbc5cf49025a8330e4fc32b4192bd08783096"
+owners = ["0xdaeb247f5a90c53f2d7a80a81f6cb6acb0d8b907"]
+threshold = 1
