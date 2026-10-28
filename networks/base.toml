@@ -1,0 +1,120 @@
+# Base — desired state for the libid identity stack.
+#
+# Every address under [contracts] is CANONICAL: each entry deploys through
+# LibidFactory via CREATE3 with `salt = keccak256(canonical name)`, so an address
+# depends only on the contract's name and the factory's genesis admin — not its
+# bytecode, not its constructor arguments, not which chain it is on. `validate`
+# enforces that equality offline. Regenerate the table with
+# `libid-deploy plan --print-addresses`, never by hand.
+#
+# The first apply needs `confirm_fresh_deploy: true` while the factory is not yet
+# deployed here; that guard reads chain state, not this file.
+#
+# HOW TO READ THIS FILE
+#
+# Every value here is public: contract addresses, accounts, the fee. The
+# endpoint is not here: it is the `RPC_URL` secret of the `base` GitHub
+# environment (`--rpc-url` on a host), whose required reviewers gate every
+# apply, admins included. The other secret in the flow is the KMS key, which
+# never leaves AWS.
+#
+# INPUT keys describe what should exist: the accounts the contracts trust and the
+# Notary Fee. You edit these.
+#
+# OUTPUT keys are everything under [contracts]. They are pre-filled and
+# declarative: `apply` reads chain state to decide what is missing and NEVER
+# rewrites this file.
+
+[network]
+name = "base"
+chain_id = 8453
+
+[aws]
+region = "eu-central-1"
+# The mainnet deployer's KMS key, in the libid-mainnet AWS account. It is the
+# factory's genesis admin: this alias derives to accounts.deployer below, the
+# address baked into the factory's init code, and `factory.deploy` is
+# owner-gated, so no other key can perform this apply. It pays ETH for gas: a
+# fresh deploy of the whole stack is about 28 transactions and 32M gas, the
+# keyless CREATE2 deployer and the Safe v1.4.1 contracts being already here.
+kms_deployer = "alias/libid-mainnet-deployer"
+
+# The ADDRESSES OF KEYS, not contracts.
+[accounts]
+# The deployer, the address of aws.kms_deployer: the genesis admin of the
+# factory, which every address under [contracts] is predicted from. Mainnet's
+# deployer is its own key, so mainnet has its own factory and its own table,
+# apart from testnet's.
+deployer = "0x7e00d33b5c571ca2b2879309c4846ddd80f4128e"
+# The notary SIGNER — the identity whose attestations the whole stack accepts:
+# alias/libid-mainnet-notary, the key of the mainnet notary. `apply`
+# initializes the Notary Service with this key and adds it to the trusted set
+# when it is missing. Dropping an outgoing key is a separate governance call:
+# the service holds a SET so a rotation can overlap.
+notary = "0xcb5bf326745666041f57af74c27a43da822081c1"
+
+# The operational owner the factory ends up with. Empty = the deployer, which
+# on this network IS the KMS genesis admin, so the default is exact.
+owner = ""
+
+[notary_service]
+# What one attestation verification costs, in wei: 0.00018 ETH, Ethereum
+# mainnet's fee. A TLSNotary profile carries two attestations, so an X or
+# GitHub binding pays 0.00036 ETH; Google's carries none. The fee
+# accrues in the Notary Service until it is swept to fee_recipient. Editing it
+# makes apply send `setFee`.
+fee_wei = "180000000000000"
+# The notary_fees Safe below: `sweep` sends the accrued fees there, and
+# anyone may call it. Editing it makes apply send `setFeeRecipient`.
+fee_recipient = "0x757b1a49b38b31c1be0456bbd77ae7c9c9eff65d"
+
+# DECLARED canonical addresses — the mainnet deployer's table, identical on
+# every EVM network that deployer deploys to; validated to equal
+# predict_address(factory, name).
+#
+# `handle_escrow` is initialized with `identity_registry` and resolves every
+# handle through it for life: no setter moves it.
+#
+# `google_jwt_roots` starts EMPTY on-chain — point a keeper at it, or every
+# Google binding reverts UntrustedModulus().
+[contracts]
+factory = "0x4ab4177683b8c3f40c487f9e765f77f0c5f5a023"
+notary_service = "0x4f624a90ae152e524b12258ce6aa9df6ed70ddfb"
+ceremony_proof_verifier = "0xcfee504d5a290d72c52b9ffd61d54444d727233b"
+identity_registry = "0xf39343febda25caa8c3861954e33f8a0189d4fda"
+handle_escrow = "0xf2731ab2c9451a9191e0ef64d7fd5352068eb1b5"
+google_jwt_roots = "0xa2c959b2940bdb8f97af52401c1603000a3aa46b"
+x_platform_verifier = "0xe9b6d548a070fcaa5b43344c0b495d982aaa9fc4"
+github_platform_verifier = "0x4f6d4a3486a00b260a1dd91f9dde6f333de6861f"
+google_platform_verifier = "0x731f3943879ccf40a21a7b84e9b7ec01776cb9cc"
+
+# The ceremony circuit verifiers are NOT declared here. `libid-deploy`
+# carries them: `libid-contracts` embeds each circuit's bb-generated
+# UltraHonk verifier from the libid-circuits release it pins, and apply
+# deploys it through the factory under a CREATE3 name carrying that
+# release. Each Platform Verifier implementation compiles in the code
+# hash of its circuit's verifier.
+
+# Safe multisigs, one per [safes.<name>] table. A Safe's address follows from
+# its name and accounts.deployer alone: apply creates it through the Safe v1.4.1
+# SafeProxyFactory on the SafeL2 singleton with the deployer as its only owner,
+# so it lands at the same address on every chain this deployer deploys to.
+# `validate` checks `address` against that prediction, and renaming a table is
+# a new address. apply then sets `owners` and `threshold` in one Safe
+# transaction the deployer signs. Once the deployer can no longer sign alone,
+# apply sends nothing to the Safe: `plan` prints the calls its owners sign in
+# the Safe app.
+#
+# PLACEHOLDER owners: the deployer alone, until the owner lists are set.
+
+# Where the Notary Service sweeps its fees: notary_service.fee_recipient.
+[safes.notary_fees]
+address = "0x757b1a49b38b31c1be0456bbd77ae7c9c9eff65d"
+owners = ["0x7e00d33b5c571ca2b2879309c4846ddd80f4128e"]
+threshold = 1
+
+# The receiver of the handles.link service fee.
+[safes.registry_fees]
+address = "0xca5b1b4b68b89ecd2aa25b8822b317741bb702ba"
+owners = ["0x7e00d33b5c571ca2b2879309c4846ddd80f4128e"]
+threshold = 1
