@@ -162,7 +162,7 @@ forever, on every network — names are frozen. The testnet table, deployer
 | `contracts.google_platform_verifier` | `libid.GooglePlatformVerifier.2` | `0x355143c93a645ae914b1315eb1b580072207e0f2` |
 
 The mainnet table, deployer `0x7e00d33b5c571ca2b2879309c4846ddd80f4128e`
-(Ethereum, `networks/ethereum.toml`):
+(Ethereum, Arbitrum One, Base and BNB Smart Chain, `networks/{ethereum,arbitrum,base,bsc}.toml`):
 
 | Config key | Address (mainnet) |
 |---|---|
