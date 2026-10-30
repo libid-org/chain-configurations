@@ -16,10 +16,7 @@ mod safes;
 use std::collections::BTreeMap;
 
 use alloy::{
-    primitives::{
-        keccak256,
-        Address,
-    },
+    primitives::Address,
     providers::{
         DynProvider,
         Provider,
@@ -70,8 +67,8 @@ use serde::Serialize;
 
 use crate::{
     circuits::{
-        self,
         Circuit,
+        Verifiers,
     },
     config::NetworkConfig,
     names,
@@ -313,13 +310,13 @@ impl Planner<'_> {
         }
 
         // ── The ceremony circuit verifiers ───────────────────────────────
-        // apply deploys these through the factory under a name carrying the
-        // pinned circuits release, so the address is a pure function of
-        // which artifact it is — known here before the chain has anything
-        // on it.
+        // The one the Platform Verifiers use when it holds the vendored
+        // code; otherwise apply deploys one through the factory under a name
+        // carrying the pinned circuits release, known here before the chain
+        // has anything on it.
         let mut verifiers: BTreeMap<Circuit, Address> = BTreeMap::new();
         for circuit in Circuit::ALL {
-            verifiers.insert(circuit, self.circuit(factory, circuit).await?);
+            verifiers.insert(circuit, self.circuit(circuit).await?);
         }
 
         // ── The Platform Verifiers ───────────────────────────────────────
@@ -452,22 +449,29 @@ impl Planner<'_> {
         self.push(RootsRotation { needed });
     }
 
-    /// A ceremony circuit's verifier under `factory`; returns where it is,
-    /// or would be, deployed.
-    async fn circuit(&mut self, factory: Address, circuit: Circuit) -> Result<Address> {
-        let name = circuits::factory_name(circuit)?;
-        let address = predict_address(factory, &name);
-        let code = self
-            .provider
-            .get_code_at(address)
-            .await
-            .map_err(|e| anyhow!("get_code({name}) failed: {e}"))?;
+    /// Reads which circuit verifiers the Platform Verifiers use, a new one
+    /// deploying under the declared factory.
+    fn verifiers(&self) -> Result<Verifiers<'_>> {
+        Ok(Verifiers {
+            provider: &self.provider,
+            artifacts: &self.artifacts,
+            contracts: &self.cfg.contracts,
+            factory: self.cfg.contracts.address("factory")?,
+        })
+    }
+
+    /// A ceremony circuit's verifier; returns where it is, or would be,
+    /// deployed.
+    async fn circuit(&mut self, circuit: Circuit) -> Result<Address> {
+        let verifiers = self.verifiers()?;
+        let site = verifiers.site(circuit).await?;
+        let address = site.address();
+        let codehash = verifiers.code_hash(address).await?;
         let vendored = circuit.runtime_codehash(&self.artifacts)?;
         self.push(CircuitVerifier {
             circuit,
-            name,
-            address,
-            codehash: (!code.is_empty()).then(|| keccak256(&code)),
+            site,
+            codehash,
             vendored,
         });
         Ok(address)
@@ -488,12 +492,12 @@ impl Planner<'_> {
         let proxy = self.cfg.contracts.address(platform.contracts_key)?;
 
         if self.code(&platform.component(), proxy).await? {
-            let verifier = PlatformVerifierBase::new(proxy, &self.provider);
-            let wired = verifier
-                .honkVerifier()
-                .call()
+            let wired = self
+                .verifiers()?
+                .wired(platform)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| format!("{e:#}"));
+            let verifier = PlatformVerifierBase::new(proxy, &self.provider);
             let pinned = verifier
                 .circuitCodehash()
                 .call()

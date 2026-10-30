@@ -27,7 +27,7 @@
 //! ceremony circuits' Honk verifiers do go through the factory — see
 //! [`crate::circuits::factory_name`] — but under a name carrying the
 //! circuits release rather than a frozen one, because a Honk verifier IS
-//! its verification key: a new circuits release must be a new address,
+//! its verification key: a release with new code must be a new address,
 //! not a silent replacement. Neither is declared in a network file.
 
 use libid_contracts::factory::{
@@ -153,10 +153,10 @@ pub fn render_address_table(genesis: FactoryGenesis) -> anyhow::Result<String> {
             c.name
         );
     }
-    // Not declared in any network file, but just as deterministic: an
-    // operator reading this table is reading every address apply will land
-    // on. The verifiers go through the same factory, under a name carrying
-    // the circuits release.
+    // Not declared in any network file, but just as deterministic: where
+    // apply deploys a circuit verifier when no Platform Verifier uses one
+    // with its code, through the same factory under a name carrying the
+    // circuits release.
     for circuit in Circuit::ALL {
         let name = circuits::factory_name(circuit)?;
         let addr = predict_address(factory, &name);

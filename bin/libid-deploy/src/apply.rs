@@ -92,8 +92,10 @@ use libid_contracts::{
 
 use crate::{
     circuits::{
-        self,
         Circuit,
+        Site,
+        Verifiers,
+        Wired,
     },
     config::{
         NetworkConfig,
@@ -295,10 +297,11 @@ pub struct Applier<'a> {
     stack: Stack,
     opts: Options,
     summary: Summary,
-    /// Circuit -> its verifier's address, for what this run has resolved
-    /// already. Two platforms share `bearer-link`, so without this a single
-    /// apply would resolve the same verifier twice.
-    circuits: BTreeMap<Circuit, Address>,
+    /// Circuit -> where its verifier is, located once before any circuit
+    /// verifier or Platform Verifier is deployed or rotated, so one this run
+    /// deploys or rotates does not move the answer for the platform after
+    /// it.
+    circuits: BTreeMap<Circuit, Site>,
 }
 
 impl<'a> Applier<'a> {
@@ -400,12 +403,14 @@ impl<'a> Applier<'a> {
             let declared = self.cfg.contracts.address(platform.contracts_key)?;
             needs_factory_deploy |= !self.code_present(declared).await?;
         }
-        // The circuit verifiers deploy through the factory too, under a name
-        // carrying the pinned circuits release.
+        // A circuit verifier no Platform Verifier uses yet deploys through
+        // the factory too, under a name carrying the pinned circuits release.
         for circuit in Circuit::ALL {
-            let predicted =
-                predict_address(self.factory, &circuits::factory_name(circuit)?);
-            needs_factory_deploy |= !self.code_present(predicted).await?;
+            let site = self.verifiers().site(circuit).await?;
+            if let Site::Named { address, .. } = site {
+                needs_factory_deploy |= !self.code_present(address).await?;
+            }
+            self.circuits.insert(circuit, site);
         }
         if needs_factory_deploy {
             self.ensure_factory_ownership().await?;
@@ -822,6 +827,16 @@ impl<'a> Applier<'a> {
         Ok(())
     }
 
+    /// Reads which circuit verifiers this chain's Platform Verifiers use.
+    fn verifiers(&self) -> Verifiers<'_> {
+        Verifiers {
+            provider: &self.provider,
+            artifacts: &self.artifacts,
+            contracts: &self.cfg.contracts,
+            factory: self.factory,
+        }
+    }
+
     /// Whether `addr` has code on-chain — the declarative presence check.
     async fn code_present(&self, addr: Address) -> Result<bool> {
         Ok(!self
@@ -1080,19 +1095,16 @@ impl<'a> Applier<'a> {
         self.factory_deploy_named(name, creation_code).await
     }
 
-    /// The circuit verifier for `circuit`, deployed if the chain lacks it.
-    ///
-    /// The verifier goes through the factory under
-    /// [`circuits::factory_name`], so its address is a pure function of
-    /// which artifact it is. That is what makes this idempotent: a second
-    /// apply finds code at the same address and sends nothing, and a
-    /// circuits release is a different name and a different address.
+    /// The circuit verifier for `circuit`: the one its Platform Verifiers
+    /// already use, or the copy under [`crate::circuits::factory_name`],
+    /// deployed if the chain lacks it. A second apply finds code at the same
+    /// address and sends nothing.
     async fn circuit_verifier(&mut self, circuit: Circuit) -> Result<Address> {
-        if let Some(&known) = self.circuits.get(&circuit) {
-            return Ok(known);
-        }
-        let name = circuits::factory_name(circuit)?;
-        let address = predict_address(self.factory, &name);
+        let (name, address) = match self.circuits.get(&circuit) {
+            Some(Site::InUse(address)) => return Ok(*address),
+            Some(Site::Named { name, address }) => (name.clone(), *address),
+            None => bail!("{} verifier was not located", circuit.name()),
+        };
         if !self.code_present(address).await? {
             let creation_code = self.artifacts.bytecode(circuit.contract())?;
             let deployed = self.factory_deploy_named(&name, creation_code).await?;
@@ -1107,7 +1119,6 @@ impl<'a> Applier<'a> {
                 .deployed
                 .push((format!("circuits.{}", circuit.name()), deployed));
         }
-        self.circuits.insert(circuit, address);
         Ok(address)
     }
 
@@ -1160,11 +1171,13 @@ impl<'a> Applier<'a> {
         self.register_verifier(platform, proxy).await
     }
 
-    /// Point a Platform Verifier at its circuit's verifier when the two have
-    /// drifted. A new circuits release lands under a new factory name, and
-    /// the proxy's implementation compiles in the code hash it accepts, so
-    /// the rotation needs `--upgrade` of that Platform Verifier in the same
-    /// run; without it apply stops before sending `setTrustRoots`.
+    /// Point a Platform Verifier at its circuit's verifier when the one it
+    /// uses lacks the vendored code; one that holds it stays, whatever its
+    /// address. A circuits release with new code lands under a new factory
+    /// name, and the proxy's implementation compiles in the code hash it
+    /// accepts, so the rotation needs `--upgrade` of that Platform Verifier
+    /// in the same run; without it apply stops before sending
+    /// `setTrustRoots`.
     ///
     /// The surface is `PlatformVerifierBase`'s, identical in every Platform
     /// Verifier. The Notary Service the proxy holds is kept: zero for
@@ -1175,12 +1188,11 @@ impl<'a> Applier<'a> {
         proxy: Address,
         circuit: Address,
     ) -> Result<()> {
-        let verifier = PlatformVerifierBase::new(proxy, &self.provider);
-        let wired =
-            verifier.honkVerifier().call().await.map_err(|e| {
-                anyhow!("{}.honkVerifier read failed: {e}", platform.label)
-            })?;
-        if wired == circuit {
+        let Wired {
+            address: wired,
+            vendored,
+        } = self.verifiers().wired(platform).await?;
+        if wired == circuit || vendored {
             return Ok(());
         }
         platform
@@ -1195,6 +1207,7 @@ impl<'a> Applier<'a> {
                     Upgrade::from(platform.verifier)
                 )
             })?;
+        let verifier = PlatformVerifierBase::new(proxy, &self.provider);
         let notary =
             verifier.notaryService().call().await.map_err(|e| {
                 anyhow!("{}.notaryService read failed: {e}", platform.label)

@@ -65,7 +65,8 @@ Then two steps `Deploy.s.sol` does not have:
 
 6. **A Honk verifier per ceremony circuit** — the bb-generated UltraHonk
    verifier each platform's proofs are checked under, deployed through the
-   factory under a CREATE3 name carrying the pinned circuits release.
+   factory under a CREATE3 name carrying the pinned circuits release,
+   unless the Platform Verifiers already use one with the same code.
 7. **A Platform Verifier per platform** — `XPlatformVerifier`,
    `GitHubPlatformVerifier`, `GooglePlatformVerifier` — deployed behind its
    own CREATE3 proxy, initialized with `(owner, notary, honkVerifier)`
@@ -111,14 +112,15 @@ circuits, not three: `oidc-google` proves the Google JWT, and
 because their statements are byte-identical — so both TLSNotary platforms
 pin one deployed verifier.
 
-Each one deploys through the factory under
-`libid.circuits.<circuit>.<version>`, so its address is a pure function of
-which artifact it is. That is what makes apply idempotent here: a second
-run finds code at the same address and sends nothing. A circuits release
-is a new name and a new address, and a new Platform Verifier
-implementation that pins its hash: apply rotates onto it only with
-`--upgrade <platform>-platform-verifier` in the same run, then sends
-`setTrustRoots`. The proxy and its registration do not move.
+A Platform Verifier whose verifier holds the vendored code keeps it,
+under whatever name it was deployed, so a circuits release that rebuilds
+the same verifiers deploys and rotates nothing. Otherwise the verifier
+deploys through the factory under `libid.circuits.<circuit>.<version>`,
+and a second run finds code at that address and sends nothing. A
+circuits release with new code is a new name and a new address, and a new
+Platform Verifier implementation that pins its hash: apply rotates onto it
+only with `--upgrade <platform>-platform-verifier` in the same run, then
+sends `setTrustRoots`. The proxy and its registration do not move.
 
 Each verifier is bb's optimized template, one contract that links
 nothing: a fresh chain pays for two verifiers, and a verifier's code hash —
@@ -178,8 +180,9 @@ The mainnet table, deployer `0x7e00d33b5c571ca2b2879309c4846ddd80f4128e`
 
 The circuit verifiers go through the same factory but are not in that
 table and not in any network file: their names carry the circuits release
-`libid-contracts` vendors, so they move when the contracts pin does. At
-`libid-circuits` 0.7.1 (`libid-contracts` 0.19.0) they are
+`libid-contracts` vendors, so a release with new code moves them. The
+verifiers in use are `libid-circuits` 0.7.1's, under its names;
+`libid-circuits` 0.8.0 builds the same code, so they stay:
 
 | Component | Name | Address (testnet) |
 |---|---|---|
@@ -189,8 +192,9 @@ table and not in any network file: their names carry the circuits release
 On mainnet they are `0xae0674895f5a8a63d2fa94a9e50f41152b9de50b` and
 `0xaa3e32ccd6bb0c497bf203deb3608eb986d3b571`.
 
-`plan --print-addresses` prints all of them together with the canonical
-table.
+`plan --print-addresses` prints the canonical table and the addresses the
+pinned circuits release names, where a verifier deploys when no Platform
+Verifier uses one with its code.
 
 Implementations stay plain CREATE deploys: their addresses are referenced
 by a proxy slot, not canonical, and upgrades replace them **without moving
@@ -237,8 +241,9 @@ in the flow is the KMS key, which never leaves AWS.
 
 The circuit verifiers are not in the file. They are a property of the
 binary's contracts pin — which carries the circuits release — not of a
-network, and their addresses derive from it the same way the canonical
-table derives from its names.
+network: a chain keeps the verifiers its Platform Verifiers use while their
+code matches the pin, and a new one's address derives from the pin the same
+way the canonical table derives from its names.
 
 The `[accounts].owner` flow: the factory's genesis owner is
 `accounts.deployer`, the apply signer. `apply` needs factory ownership only
