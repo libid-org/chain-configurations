@@ -153,10 +153,10 @@ pub fn render_address_table(genesis: FactoryGenesis) -> anyhow::Result<String> {
             c.name
         );
     }
-    // Not declared in any network file, but just as deterministic: an
-    // operator reading this table is reading every address apply will land
-    // on. The verifiers go through the same factory, under a name carrying
-    // the circuits release.
+    // Not declared in any network file, but just as deterministic: where
+    // apply deploys a circuit verifier when no Platform Verifier uses one
+    // with its code, through the same factory under a name carrying the
+    // circuits release.
     for circuit in Circuit::ALL {
         let name = circuits::factory_name(circuit)?;
         let addr = predict_address(factory, &name);

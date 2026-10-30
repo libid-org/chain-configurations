@@ -15,7 +15,10 @@ use super::{
 };
 use crate::{
     apply::Upgrade,
-    circuits::Circuit,
+    circuits::{
+        Circuit,
+        Site,
+    },
     names::CanonicalContract,
     platforms::{
         Platform,
@@ -347,15 +350,13 @@ impl From<RootsRotation> for Item {
     }
 }
 
-/// Whether a ceremony circuit's verifier sits at its factory address with
-/// the vendored code.
+/// Whether a ceremony circuit's verifier holds the vendored code: the one the
+/// Platform Verifiers use, or the copy at its factory address.
 pub(crate) struct CircuitVerifier {
     /// The circuit.
     pub(crate) circuit: Circuit,
-    /// The CREATE3 name it deploys under.
-    pub(crate) name: String,
-    /// Where that name lands.
-    pub(crate) address: Address,
+    /// Where its verifier is.
+    pub(crate) site: Site,
     /// The code hash there, `None` when the address holds no code.
     pub(crate) codehash: Option<B256>,
     /// The code hash of the vendored verifier.
@@ -366,12 +367,24 @@ impl From<CircuitVerifier> for Item {
     fn from(check: CircuitVerifier) -> Self {
         let CircuitVerifier {
             circuit,
-            name,
-            address,
+            site,
             codehash,
             vendored,
         } = check;
         let component = format!("circuits.{}", circuit.name());
+        let (address, name) = match site {
+            Site::InUse(address) => {
+                return Item::new(
+                    component,
+                    Status::Ok,
+                    format!(
+                        "{address:#x} (codehash {vendored:#x}), in use by the Platform \
+                         Verifiers"
+                    ),
+                )
+            }
+            Site::Named { name, address } => (address, name),
+        };
         match codehash {
             None => Item::new(
                 component,
@@ -402,6 +415,8 @@ pub(crate) struct TrustRoots {
     pub(crate) platform: &'static Platform,
     /// Where its circuit's verifier is, or would be, deployed.
     pub(crate) circuit_address: Address,
+    /// Whether the verifier it uses holds the vendored code.
+    pub(crate) in_use: bool,
     /// The code hash of the vendored circuit verifier.
     pub(crate) vendored: B256,
     /// `honkVerifier()`.
@@ -415,6 +430,7 @@ impl From<TrustRoots> for Item {
         let TrustRoots {
             platform,
             circuit_address,
+            in_use,
             vendored,
             wired,
             pinned,
@@ -431,7 +447,7 @@ impl From<TrustRoots> for Item {
                     Upgrade::from(platform.verifier)
                 ),
             ),
-            (Ok(addr), Ok(_)) if addr == circuit_address => {
+            (Ok(addr), Ok(_)) if addr == circuit_address || in_use => {
                 Item::new(component, Status::Ok, format!("pins {addr:#x} ({circuit})"))
             }
             (Ok(addr), Ok(_)) => Item::new(
@@ -662,6 +678,7 @@ mod tests {
         let item = Item::from(TrustRoots {
             platform: &X,
             circuit_address: DECLARED,
+            in_use: false,
             vendored: B256::repeat_byte(0xaa),
             wired: Ok(DECLARED),
             pinned: Ok(B256::repeat_byte(0xbb)),
@@ -682,11 +699,28 @@ mod tests {
         let item = Item::from(TrustRoots {
             platform: &GOOGLE,
             circuit_address: DECLARED,
+            in_use: false,
             vendored,
             wired: Ok(OTHER),
             pinned: Ok(vendored),
         });
         assert_eq!(item.status, Status::Configure);
+    }
+
+    /// Trust roots on another copy of the vendored verifier stay: the code,
+    /// not the address, is what the Platform Verifier needs.
+    #[test]
+    fn trust_roots_on_another_copy_of_the_vendored_verifier_are_ok() {
+        let vendored = B256::repeat_byte(0xaa);
+        let item = Item::from(TrustRoots {
+            platform: &GOOGLE,
+            circuit_address: DECLARED,
+            in_use: true,
+            vendored,
+            wired: Ok(OTHER),
+            pinned: Ok(vendored),
+        });
+        assert_eq!(item.status, Status::Ok);
     }
 
     /// Without a Proof Verifier the registration is part of the deploy.
@@ -718,12 +752,29 @@ mod tests {
     fn a_circuit_verifier_with_foreign_code_warns() {
         let item = Item::from(CircuitVerifier {
             circuit: X.circuit(),
-            name: "libid.circuits.test".into(),
-            address: DECLARED,
+            site: Site::Named {
+                name: "libid.circuits.test".into(),
+                address: DECLARED,
+            },
             codehash: Some(B256::repeat_byte(0xbb)),
             vendored: B256::repeat_byte(0xaa),
         });
         assert_eq!(item.status, Status::Warn);
+    }
+
+    /// A circuit verifier the Platform Verifiers use is in place, whatever
+    /// name it was deployed under.
+    #[test]
+    fn a_circuit_verifier_in_use_is_ok() {
+        let vendored = B256::repeat_byte(0xaa);
+        let item = Item::from(CircuitVerifier {
+            circuit: X.circuit(),
+            site: Site::InUse(OTHER),
+            codehash: Some(vendored),
+            vendored,
+        });
+        assert_eq!(item.status, Status::Ok);
+        assert!(item.detail.contains("in use"), "{}", item.detail);
     }
 
     /// A factory record the factory has not written yet is skipped.

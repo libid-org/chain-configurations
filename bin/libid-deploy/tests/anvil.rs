@@ -995,12 +995,13 @@ async fn platform_verifiers_deploy_wire_and_register() {
     );
 }
 
-/// A trust root that drifted off the pinned artifact is pulled back by the
-/// next apply, without redeploying anything. Moving the circuits pin is the
-/// same path: a release is a new CREATE3 name, so the verifier changes
-/// while the proxy — and therefore the registration — does not.
+/// A Platform Verifier on a verifier with the vendored code keeps it, under
+/// whatever name it was deployed: a circuits release that rebuilds the same
+/// verifiers finds nothing at its new names and still deploys and rotates
+/// nothing. The release is stood in for by moving every Platform Verifier
+/// onto copies off the canonical addresses and clearing those.
 #[tokio::test]
-async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
+async fn platform_verifiers_keep_a_verifier_with_the_vendored_code_under_any_name() {
     let anvil = spawn_anvil();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = prefilled_network_file(dir.path(), &anvil.endpoint());
@@ -1014,65 +1015,99 @@ async fn apply_pulls_a_drifted_trust_root_back_onto_the_pinned_verifier() {
     .await;
 
     let cfg = NetworkConfig::load(&path).expect("config loads");
-    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
-    let notary_service: Address = cfg.contracts.notary_service.get().unwrap();
-    let x_proxy: Address = cfg.contracts.x_platform_verifier.get().unwrap();
-    let pinned = circuit_verifier_address(platforms::X.circuit());
-
-    // Drift: the owner points X at a copy of its verifier off the
-    // canonical address.
-    let elsewhere =
-        deploy_verifier_copy(&anvil.endpoint(), ANVIL_KEY, platforms::X.circuit()).await;
-    assert_ne!(elsewhere, pinned);
     let key: PrivateKeySigner = ANVIL_KEY.parse().unwrap();
     let owned = ProviderBuilder::new()
         .wallet(EthereumWallet::from(key))
         .connect_http(anvil.endpoint_url());
-    PlatformVerifierBase::new(x_proxy, &owned)
-        .setTrustRoots(notary_service, elsewhere)
-        .send()
-        .await
-        .unwrap()
-        .get_receipt()
-        .await
-        .unwrap();
+    let mut copies = Vec::new();
+    for circuit in Circuit::ALL {
+        let copy = deploy_verifier_copy(&anvil.endpoint(), ANVIL_KEY, circuit).await;
+        assert_ne!(copy, circuit_verifier_address(circuit));
+        copies.push((circuit, copy));
+    }
+    let copy_of = |circuit: Circuit| {
+        copies
+            .iter()
+            .find(|(c, _)| *c == circuit)
+            .map(|&(_, copy)| copy)
+            .expect("every circuit has a copy")
+    };
+    for platform in platforms::LAUNCH {
+        let proxy = cfg.contracts.address(platform.contracts_key).unwrap();
+        let verifier = PlatformVerifierBase::new(proxy, &owned);
+        let notary = verifier.notaryService().call().await.unwrap();
+        verifier
+            .setTrustRoots(notary, copy_of(platform.circuit()))
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+    }
+    for circuit in Circuit::ALL {
+        owned
+            .anvil_set_code(circuit_verifier_address(circuit), Bytes::new())
+            .await
+            .expect("anvil_setCode");
+    }
 
-    let drifted = Plan::build(&cfg, &file_rpc(&cfg))
+    let plan = Plan::build(&cfg, &file_rpc(&cfg))
         .await
-        .expect("plan sees the pin drift");
-    assert_eq!(
-        drifted.status_of("contracts.x_platform_verifier.trust_roots"),
-        Some(Status::Configure)
-    );
-    assert!(!drifted.has_deploys(), "a rotation is not a redeploy");
+        .expect("plan reads the copies");
+    assert!(!plan.has_deploys(), "{}", plan.render());
+    for circuit in Circuit::ALL {
+        assert_eq!(
+            plan.status_of(&format!("circuits.{}", circuit.name())),
+            Some(Status::Ok),
+            "{}",
+            plan.render()
+        );
+    }
+    for platform in platforms::LAUNCH {
+        assert_eq!(
+            plan.status_of(&format!("{}.trust_roots", platform.component())),
+            Some(Status::Ok),
+            "{}",
+            plan.render()
+        );
+    }
 
-    let repaired = apply_with(&path, apply::Options::default()).await;
-    assert!(repaired.deployed.is_empty(), "{:?}", repaired.deployed);
-    let x = PlatformVerifierBase::new(x_proxy, &provider);
-    assert_eq!(x.honkVerifier().call().await.unwrap(), pinned);
-    assert_eq!(x.notaryService().call().await.unwrap(), notary_service);
-    // The proxy did not move: the registration still points at it.
-    assert_eq!(
-        CeremonyProofVerifier::new(
-            cfg.contracts.ceremony_proof_verifier.get().unwrap(),
-            &provider
-        )
-        .verifierOf(
-            platforms::platform_id(platforms::X.key),
-            LAUNCH_VERIFIER_VERSION
-        )
-        .call()
-        .await
-        .unwrap(),
-        x_proxy
-    );
+    let kept = apply_with(&path, apply::Options::default()).await;
+    assert!(kept.deployed.is_empty(), "{:?}", kept.deployed);
+    assert!(kept.configured.is_empty(), "{:?}", kept.configured);
+    for platform in platforms::LAUNCH {
+        let proxy = cfg.contracts.address(platform.contracts_key).unwrap();
+        assert_eq!(
+            PlatformVerifierBase::new(proxy, &owned)
+                .honkVerifier()
+                .call()
+                .await
+                .unwrap(),
+            copy_of(platform.circuit()),
+            "{} moved off its verifier",
+            platform.label
+        );
+    }
+    for circuit in Circuit::ALL {
+        assert!(
+            owned
+                .get_code_at(circuit_verifier_address(circuit))
+                .await
+                .unwrap()
+                .is_empty(),
+            "{} was deployed under its release name",
+            circuit.name()
+        );
+    }
 }
 
 /// A canonical circuit verifier whose code is not the one the Platform
 /// Verifier implementation pins cannot be rotated onto: plan warns, and
 /// apply stops before `setTrustRoots`, naming the `--upgrade` that ships
 /// an implementation pinning it. The test swaps the code under the
-/// canonical address, as a circuits release would move it.
+/// canonical address, as a circuits release would move it, and under the
+/// copy the Platform Verifiers use, so none holds the vendored code.
 #[tokio::test]
 async fn apply_refuses_a_rotation_onto_code_the_implementation_does_not_pin() {
     let anvil = spawn_anvil();
@@ -1112,10 +1147,12 @@ async fn apply_refuses_a_rotation_onto_code_the_implementation_does_not_pin() {
             .await
             .unwrap();
     }
-    provider
-        .raw_request::<_, ()>("anvil_setCode".into(), (pinned, Bytes::from(vec![0x00])))
-        .await
-        .expect("anvil_setCode");
+    for address in [pinned, copy] {
+        provider
+            .anvil_set_code(address, Bytes::from(vec![0x00]))
+            .await
+            .expect("anvil_setCode");
+    }
 
     let drifted = Plan::build(&cfg, &file_rpc(&cfg))
         .await
