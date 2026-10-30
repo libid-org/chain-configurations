@@ -93,8 +93,9 @@ google_platform_verifier = "0xfcb24d6491120569c91370dd8fa5441adb1d94ee"
 
 # The ceremony circuit verifiers are NOT declared here. `libid-deploy`
 # carries them: `libid-contracts` embeds each circuit's bb-generated
-# UltraHonk verifier from the libid-circuits release it pins, and apply
-# deploys it through the factory under a CREATE3 name carrying that
+# UltraHonk verifier from the libid-circuits release it pins. A Platform
+# Verifier keeps a verifier with that code under any name; otherwise apply
+# deploys one through the factory under a CREATE3 name carrying that
 # release. Each Platform Verifier implementation compiles in the code
 # hash of its circuit's verifier, so a circuits release with new code is a
 # new name, a new address, an `--upgrade` of the Platform Verifiers and a

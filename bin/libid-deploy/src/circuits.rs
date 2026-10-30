@@ -98,6 +98,16 @@ impl Site {
     }
 }
 
+/// The verifier a Platform Verifier uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wired {
+    /// `honkVerifier()`.
+    pub address: Address,
+    /// Whether the code there is the vendored verifier of the platform's
+    /// circuit.
+    pub vendored: bool,
+}
+
 /// Reads which circuit verifiers the Platform Verifiers of one chain use.
 pub struct Verifiers<'a> {
     /// The chain.
@@ -111,29 +121,40 @@ pub struct Verifiers<'a> {
 }
 
 impl Verifiers<'_> {
-    /// The verifier `platform`'s Platform Verifier uses, when it holds the
-    /// vendored code of the platform's circuit; `None` while the proxy has
-    /// no code or uses other code.
-    pub async fn in_use(&self, platform: &Platform) -> Result<Option<Address>> {
+    /// The verifier `platform`'s Platform Verifier uses. Its proxy must
+    /// have code.
+    pub async fn wired(&self, platform: &Platform) -> Result<Wired> {
         let proxy = self.contracts.address(platform.contracts_key)?;
-        if self.code_hash(proxy).await?.is_none() {
-            return Ok(None);
-        }
-        let wired = PlatformVerifierBase::new(proxy, self.provider)
+        let address = PlatformVerifierBase::new(proxy, self.provider)
             .honkVerifier()
             .call()
             .await
             .map_err(|e| anyhow!("{}.honkVerifier read failed: {e}", platform.label))?;
         let vendored = platform.circuit().runtime_codehash(self.artifacts)?;
-        Ok((self.code_hash(wired).await? == Some(vendored)).then_some(wired))
+        Ok(Wired {
+            address,
+            vendored: self.code_hash(address).await? == Some(vendored),
+        })
     }
 
     /// Where `circuit`'s verifier is: one a Platform Verifier of the circuit
-    /// already uses, else [`factory_name`]'s address.
+    /// already uses with the vendored code, else [`factory_name`]'s address.
+    /// A Platform Verifier whose verifier cannot be read offers none; the
+    /// read that converges it reports the failure.
     pub async fn site(&self, circuit: Circuit) -> Result<Site> {
         for platform in platforms::LAUNCH.iter().filter(|p| p.circuit() == circuit) {
-            if let Some(address) = self.in_use(platform).await? {
-                return Ok(Site::InUse(address));
+            let proxy = self.contracts.address(platform.contracts_key)?;
+            if self.code_hash(proxy).await?.is_none() {
+                continue;
+            }
+            match self.wired(platform).await {
+                Ok(wired) if wired.vendored => return Ok(Site::InUse(wired.address)),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    platform = platform.label,
+                    %error,
+                    "skipped while locating the circuit verifier"
+                ),
             }
         }
         let name = factory_name(circuit)?;

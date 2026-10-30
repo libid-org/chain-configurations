@@ -95,6 +95,7 @@ use crate::{
         Circuit,
         Site,
         Verifiers,
+        Wired,
     },
     config::{
         NetworkConfig,
@@ -296,9 +297,10 @@ pub struct Applier<'a> {
     stack: Stack,
     opts: Options,
     summary: Summary,
-    /// Circuit -> where its verifier is, located once before anything is
-    /// sent, so a Platform Verifier this run deploys or rotates does not
-    /// move the answer for the platform after it.
+    /// Circuit -> where its verifier is, located once before any circuit
+    /// verifier or Platform Verifier is deployed or rotated, so one this run
+    /// deploys or rotates does not move the answer for the platform after
+    /// it.
     circuits: BTreeMap<Circuit, Site>,
 }
 
@@ -1186,12 +1188,11 @@ impl<'a> Applier<'a> {
         proxy: Address,
         circuit: Address,
     ) -> Result<()> {
-        let verifier = PlatformVerifierBase::new(proxy, &self.provider);
-        let wired =
-            verifier.honkVerifier().call().await.map_err(|e| {
-                anyhow!("{}.honkVerifier read failed: {e}", platform.label)
-            })?;
-        if wired == circuit || self.verifiers().in_use(platform).await?.is_some() {
+        let Wired {
+            address: wired,
+            vendored,
+        } = self.verifiers().wired(platform).await?;
+        if wired == circuit || vendored {
             return Ok(());
         }
         platform
@@ -1206,6 +1207,7 @@ impl<'a> Applier<'a> {
                     Upgrade::from(platform.verifier)
                 )
             })?;
+        let verifier = PlatformVerifierBase::new(proxy, &self.provider);
         let notary =
             verifier.notaryService().call().await.map_err(|e| {
                 anyhow!("{}.notaryService read failed: {e}", platform.label)

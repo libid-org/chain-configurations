@@ -27,7 +27,7 @@
 //! ceremony circuits' Honk verifiers do go through the factory — see
 //! [`crate::circuits::factory_name`] — but under a name carrying the
 //! circuits release rather than a frozen one, because a Honk verifier IS
-//! its verification key: a new circuits release must be a new address,
+//! its verification key: a release with new code must be a new address,
 //! not a silent replacement. Neither is declared in a network file.
 
 use libid_contracts::factory::{

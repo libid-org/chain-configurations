@@ -492,13 +492,12 @@ impl Planner<'_> {
         let proxy = self.cfg.contracts.address(platform.contracts_key)?;
 
         if self.code(&platform.component(), proxy).await? {
-            let in_use = self.verifiers()?.in_use(platform).await?.is_some();
-            let verifier = PlatformVerifierBase::new(proxy, &self.provider);
-            let wired = verifier
-                .honkVerifier()
-                .call()
+            let wired = self
+                .verifiers()?
+                .wired(platform)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| format!("{e:#}"));
+            let verifier = PlatformVerifierBase::new(proxy, &self.provider);
             let pinned = verifier
                 .circuitCodehash()
                 .call()
@@ -507,7 +506,6 @@ impl Planner<'_> {
             self.push(TrustRoots {
                 platform,
                 circuit_address,
-                in_use,
                 vendored,
                 wired,
                 pinned,

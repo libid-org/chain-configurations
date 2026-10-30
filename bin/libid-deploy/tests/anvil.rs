@@ -14,6 +14,7 @@
 //! existed.
 
 use std::{
+    collections::BTreeMap,
     net::TcpListener,
     path::{
         Path,
@@ -930,8 +931,8 @@ async fn platform_verifiers_deploy_wire_and_register() {
     assert_eq!(pinned[0], pinned[1], "X and GitHub pin different copies");
     assert_ne!(pinned[0], pinned[2], "Google shares X's circuit");
 
-    // A second apply deploys and configures nothing more: the circuit
-    // verifiers are CREATE3-named, so a converged chain is recognised.
+    // A second apply deploys and configures nothing more: the Platform
+    // Verifiers already use verifiers with the vendored code.
     let again = apply_with(&path, apply::Options::default()).await;
     assert!(again.deployed.is_empty(), "{:?}", again.deployed);
     assert!(again.configured.is_empty(), "{:?}", again.configured);
@@ -995,11 +996,64 @@ async fn platform_verifiers_deploy_wire_and_register() {
     );
 }
 
+/// Each Platform Verifier on its own copy of the vendored verifiers, every
+/// one of them at a plain CREATE address. The verifiers at the release's
+/// names stay where the fresh apply put them.
+async fn wire_onto_copies(
+    anvil: &AnvilInstance,
+    cfg: &NetworkConfig,
+) -> BTreeMap<&'static str, Address> {
+    let mut copies = BTreeMap::new();
+    for platform in platforms::LAUNCH {
+        let copy =
+            deploy_verifier_copy(&anvil.endpoint(), ANVIL_KEY, platform.circuit()).await;
+        copies.insert(platform.label, copy);
+    }
+    // One signer after the copies are in: the deploys above sign with their
+    // own nonces.
+    let key: PrivateKeySigner = ANVIL_KEY.parse().unwrap();
+    let owned = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(key))
+        .connect_http(anvil.endpoint_url());
+    for platform in platforms::LAUNCH {
+        let proxy = cfg.contracts.address(platform.contracts_key).unwrap();
+        let verifier = PlatformVerifierBase::new(proxy, &owned);
+        let notary = verifier.notaryService().call().await.unwrap();
+        verifier
+            .setTrustRoots(notary, copies[platform.label])
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+    }
+    copies
+}
+
+/// What each Platform Verifier's `honkVerifier()` answers, by label.
+async fn wired_verifiers<P: Provider>(
+    provider: &P,
+    cfg: &NetworkConfig,
+) -> BTreeMap<&'static str, Address> {
+    let mut wired = BTreeMap::new();
+    for platform in platforms::LAUNCH {
+        let proxy = cfg.contracts.address(platform.contracts_key).unwrap();
+        let address = PlatformVerifierBase::new(proxy, provider)
+            .honkVerifier()
+            .call()
+            .await
+            .unwrap();
+        wired.insert(platform.label, address);
+    }
+    wired
+}
+
 /// A Platform Verifier on a verifier with the vendored code keeps it, under
-/// whatever name it was deployed: a circuits release that rebuilds the same
-/// verifiers finds nothing at its new names and still deploys and rotates
-/// nothing. The release is stood in for by moving every Platform Verifier
-/// onto copies off the canonical addresses and clearing those.
+/// whatever name it was deployed, X and GitHub each on a copy of their own:
+/// a circuits release that rebuilds the same verifiers finds nothing at its
+/// new names and still deploys and rotates nothing. The release is stood in
+/// for by clearing the code at the release's names.
 #[tokio::test]
 async fn platform_verifiers_keep_a_verifier_with_the_vendored_code_under_any_name() {
     let anvil = spawn_anvil();
@@ -1015,38 +1069,11 @@ async fn platform_verifiers_keep_a_verifier_with_the_vendored_code_under_any_nam
     .await;
 
     let cfg = NetworkConfig::load(&path).expect("config loads");
-    let key: PrivateKeySigner = ANVIL_KEY.parse().unwrap();
-    let owned = ProviderBuilder::new()
-        .wallet(EthereumWallet::from(key))
-        .connect_http(anvil.endpoint_url());
-    let mut copies = Vec::new();
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let copies = wire_onto_copies(&anvil, &cfg).await;
+    assert_ne!(copies[platforms::X.label], copies[platforms::GITHUB.label]);
     for circuit in Circuit::ALL {
-        let copy = deploy_verifier_copy(&anvil.endpoint(), ANVIL_KEY, circuit).await;
-        assert_ne!(copy, circuit_verifier_address(circuit));
-        copies.push((circuit, copy));
-    }
-    let copy_of = |circuit: Circuit| {
-        copies
-            .iter()
-            .find(|(c, _)| *c == circuit)
-            .map(|&(_, copy)| copy)
-            .expect("every circuit has a copy")
-    };
-    for platform in platforms::LAUNCH {
-        let proxy = cfg.contracts.address(platform.contracts_key).unwrap();
-        let verifier = PlatformVerifierBase::new(proxy, &owned);
-        let notary = verifier.notaryService().call().await.unwrap();
-        verifier
-            .setTrustRoots(notary, copy_of(platform.circuit()))
-            .send()
-            .await
-            .unwrap()
-            .get_receipt()
-            .await
-            .unwrap();
-    }
-    for circuit in Circuit::ALL {
-        owned
+        provider
             .anvil_set_code(circuit_verifier_address(circuit), Bytes::new())
             .await
             .expect("anvil_setCode");
@@ -1076,22 +1103,10 @@ async fn platform_verifiers_keep_a_verifier_with_the_vendored_code_under_any_nam
     let kept = apply_with(&path, apply::Options::default()).await;
     assert!(kept.deployed.is_empty(), "{:?}", kept.deployed);
     assert!(kept.configured.is_empty(), "{:?}", kept.configured);
-    for platform in platforms::LAUNCH {
-        let proxy = cfg.contracts.address(platform.contracts_key).unwrap();
-        assert_eq!(
-            PlatformVerifierBase::new(proxy, &owned)
-                .honkVerifier()
-                .call()
-                .await
-                .unwrap(),
-            copy_of(platform.circuit()),
-            "{} moved off its verifier",
-            platform.label
-        );
-    }
+    assert_eq!(wired_verifiers(&provider, &cfg).await, copies);
     for circuit in Circuit::ALL {
         assert!(
-            owned
+            provider
                 .get_code_at(circuit_verifier_address(circuit))
                 .await
                 .unwrap()
@@ -1100,6 +1115,70 @@ async fn platform_verifiers_keep_a_verifier_with_the_vendored_code_under_any_nam
             circuit.name()
         );
     }
+}
+
+/// A Platform Verifier whose verifier no longer holds the vendored code is
+/// rotated onto the verifier at the release's name with `setTrustRoots`,
+/// and the proxy and its registration stay. Swapping the code under the
+/// copies stands in for verifiers of another circuits release.
+#[tokio::test]
+async fn platform_verifiers_off_the_vendored_code_rotate_onto_the_release_verifier() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prefilled_network_file(dir.path(), &anvil.endpoint());
+    apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    for copy in wire_onto_copies(&anvil, &cfg).await.into_values() {
+        provider
+            .anvil_set_code(copy, Bytes::from(vec![0x00]))
+            .await
+            .expect("anvil_setCode");
+    }
+
+    let drifted = Plan::build(&cfg, &file_rpc(&cfg))
+        .await
+        .expect("plan sees the foreign code");
+    assert!(!drifted.has_deploys(), "{}", drifted.render());
+    for platform in platforms::LAUNCH {
+        assert_eq!(
+            drifted.status_of(&format!("{}.trust_roots", platform.component())),
+            Some(Status::Configure),
+            "{}",
+            drifted.render()
+        );
+    }
+
+    let repaired = apply_with(&path, apply::Options::default()).await;
+    assert!(repaired.deployed.is_empty(), "{:?}", repaired.deployed);
+    let release: BTreeMap<_, _> = platforms::LAUNCH
+        .iter()
+        .map(|platform| (platform.label, circuit_verifier_address(platform.circuit())))
+        .collect();
+    assert_eq!(wired_verifiers(&provider, &cfg).await, release);
+    let x_proxy: Address = cfg.contracts.x_platform_verifier.get().unwrap();
+    assert_eq!(
+        CeremonyProofVerifier::new(
+            cfg.contracts.ceremony_proof_verifier.get().unwrap(),
+            &provider
+        )
+        .verifierOf(
+            platforms::platform_id(platforms::X.key),
+            LAUNCH_VERIFIER_VERSION
+        )
+        .call()
+        .await
+        .unwrap(),
+        x_proxy
+    );
 }
 
 /// A canonical circuit verifier whose code is not the one the Platform

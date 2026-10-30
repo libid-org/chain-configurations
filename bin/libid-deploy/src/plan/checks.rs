@@ -18,6 +18,7 @@ use crate::{
     circuits::{
         Circuit,
         Site,
+        Wired,
     },
     names::CanonicalContract,
     platforms::{
@@ -378,8 +379,8 @@ impl From<CircuitVerifier> for Item {
                     component,
                     Status::Ok,
                     format!(
-                        "{address:#x} (codehash {vendored:#x}), in use by the Platform \
-                         Verifiers"
+                        "{address:#x} (codehash {vendored:#x}), in use by a Platform \
+                         Verifier"
                     ),
                 )
             }
@@ -415,12 +416,10 @@ pub(crate) struct TrustRoots {
     pub(crate) platform: &'static Platform,
     /// Where its circuit's verifier is, or would be, deployed.
     pub(crate) circuit_address: Address,
-    /// Whether the verifier it uses holds the vendored code.
-    pub(crate) in_use: bool,
     /// The code hash of the vendored circuit verifier.
     pub(crate) vendored: B256,
-    /// `honkVerifier()`.
-    pub(crate) wired: Answer<Address>,
+    /// `honkVerifier()`, and whether it holds the vendored code.
+    pub(crate) wired: Answer<Wired>,
     /// `circuitCodehash()`.
     pub(crate) pinned: Answer<B256>,
 }
@@ -430,7 +429,6 @@ impl From<TrustRoots> for Item {
         let TrustRoots {
             platform,
             circuit_address,
-            in_use,
             vendored,
             wired,
             pinned,
@@ -447,10 +445,16 @@ impl From<TrustRoots> for Item {
                     Upgrade::from(platform.verifier)
                 ),
             ),
-            (Ok(addr), Ok(_)) if addr == circuit_address || in_use => {
+            (
+                Ok(Wired {
+                    address: addr,
+                    vendored: holds_vendored,
+                }),
+                Ok(_),
+            ) if addr == circuit_address || holds_vendored => {
                 Item::new(component, Status::Ok, format!("pins {addr:#x} ({circuit})"))
             }
-            (Ok(addr), Ok(_)) => Item::new(
+            (Ok(Wired { address: addr, .. }), Ok(_)) => Item::new(
                 component,
                 Status::Configure,
                 format!(
@@ -678,9 +682,11 @@ mod tests {
         let item = Item::from(TrustRoots {
             platform: &X,
             circuit_address: DECLARED,
-            in_use: false,
             vendored: B256::repeat_byte(0xaa),
-            wired: Ok(DECLARED),
+            wired: Ok(Wired {
+                address: DECLARED,
+                vendored: false,
+            }),
             pinned: Ok(B256::repeat_byte(0xbb)),
         });
         assert_eq!(item.component, "contracts.x_platform_verifier.trust_roots");
@@ -699,9 +705,11 @@ mod tests {
         let item = Item::from(TrustRoots {
             platform: &GOOGLE,
             circuit_address: DECLARED,
-            in_use: false,
             vendored,
-            wired: Ok(OTHER),
+            wired: Ok(Wired {
+                address: OTHER,
+                vendored: false,
+            }),
             pinned: Ok(vendored),
         });
         assert_eq!(item.status, Status::Configure);
@@ -715,12 +723,28 @@ mod tests {
         let item = Item::from(TrustRoots {
             platform: &GOOGLE,
             circuit_address: DECLARED,
-            in_use: true,
             vendored,
-            wired: Ok(OTHER),
+            wired: Ok(Wired {
+                address: OTHER,
+                vendored: true,
+            }),
             pinned: Ok(vendored),
         });
         assert_eq!(item.status, Status::Ok);
+    }
+
+    /// A Platform Verifier whose verifier cannot be read is a warning, and
+    /// the rest of the plan still runs.
+    #[test]
+    fn an_unreadable_verifier_warns() {
+        let item = Item::from(TrustRoots {
+            platform: &X,
+            circuit_address: DECLARED,
+            vendored: B256::repeat_byte(0xaa),
+            wired: Err("X.honkVerifier read failed".into()),
+            pinned: Ok(B256::repeat_byte(0xaa)),
+        });
+        assert_eq!(item.status, Status::Warn);
     }
 
     /// Without a Proof Verifier the registration is part of the deploy.
