@@ -8,6 +8,8 @@
 //! under from `libid-contracts`. A key restated here would name a platform
 //! no deployed verifier serves.
 
+use std::collections::BTreeSet;
+
 use alloy::primitives::{
     keccak256,
     Address,
@@ -16,8 +18,8 @@ use alloy::primitives::{
 use libid_contracts::{
     circuits::Circuit,
     platform_verifier::{
-        GoogleRoots,
         Initializer,
+        OidcRoots,
         PlatformVerifier,
         TlsNotaryRoots,
     },
@@ -25,7 +27,10 @@ use libid_contracts::{
 use libid_identity::platforms;
 use libid_profiles as profiles;
 
-use crate::names;
+use crate::{
+    apply::Upgrade,
+    names,
+};
 
 /// The verifier version the launch profile is registered under.
 ///
@@ -52,6 +57,8 @@ pub struct Platform {
     /// points at, the ceremony circuit its proofs are checked under and
     /// whether it holds a Notary Service all follow from this.
     pub verifier: PlatformVerifier,
+    /// The `--upgrade` that replaces its Platform Verifier's implementation.
+    pub upgrade: Upgrade,
 }
 
 impl Platform {
@@ -85,9 +92,9 @@ impl Platform {
 
     /// What the Platform Verifier initializes with, shaped by what the
     /// profile notarizes: a TLSNotary profile pins the Notary Service, and
-    /// Google reads the JWT root list instead. `Initializer::check` refuses
-    /// what the contract would refuse — a zero owner, Honk verifier, Notary
-    /// Service or root list — before anything is sent.
+    /// an OIDC profile reads its JWT root list instead. `Initializer::check`
+    /// refuses what the contract would refuse — a zero owner, Honk verifier,
+    /// Notary Service or root list — before anything is sent.
     pub fn initializer(
         &self,
         owner: Address,
@@ -100,14 +107,16 @@ impl Platform {
             notary_service,
             honk_verifier,
         };
+        let oidc = OidcRoots {
+            owner,
+            honk_verifier,
+            jwt_roots,
+        };
         match self.verifier {
             PlatformVerifier::X => Initializer::X(tls_notary),
             PlatformVerifier::GitHub => Initializer::GitHub(tls_notary),
-            PlatformVerifier::Google => Initializer::Google(GoogleRoots {
-                owner,
-                honk_verifier,
-                jwt_roots,
-            }),
+            PlatformVerifier::Google => Initializer::Google(oidc),
+            PlatformVerifier::Telegram => Initializer::Telegram(oidc),
         }
     }
 }
@@ -119,6 +128,7 @@ pub const X: Platform = Platform {
     contracts_key: "x_platform_verifier",
     canonical_name: names::X_PLATFORM_VERIFIER,
     verifier: PlatformVerifier::X,
+    upgrade: Upgrade::XPlatformVerifier,
 };
 
 /// GitHub.
@@ -128,6 +138,7 @@ pub const GITHUB: Platform = Platform {
     contracts_key: "github_platform_verifier",
     canonical_name: names::GITHUB_PLATFORM_VERIFIER,
     verifier: PlatformVerifier::GitHub,
+    upgrade: Upgrade::GitHubPlatformVerifier,
 };
 
 /// Google.
@@ -137,11 +148,24 @@ pub const GOOGLE: Platform = Platform {
     contracts_key: "google_platform_verifier",
     canonical_name: names::GOOGLE_PLATFORM_VERIFIER,
     verifier: PlatformVerifier::Google,
+    upgrade: Upgrade::GooglePlatformVerifier,
 };
 
 /// The closed launch list, in deploy order. A platform outside it has no
 /// profile, and the ceremony contracts revert on one.
 pub const LAUNCH: &[Platform] = &[X, GITHUB, GOOGLE];
+
+/// The platforms `libid-contracts` ships a Platform Verifier for that this
+/// tool does not launch: no network file declares their contracts and
+/// apply deploys none of them. The registry knows their profiles, and
+/// accepts no binding for one until its verifier is registered.
+pub const NOT_LAUNCHED: &[PlatformVerifier] = &[PlatformVerifier::Telegram];
+
+/// The ceremony circuits the launch platforms prove under, in the crate's
+/// order: one verifier each, shared by the platforms of one circuit.
+pub fn circuits() -> BTreeSet<Circuit> {
+    LAUNCH.iter().map(Platform::circuit).collect()
+}
 
 /// The launch platform with this key, or nothing.
 pub fn by_key(key: &str) -> Option<&'static Platform> {
@@ -159,8 +183,8 @@ pub fn platform_id(key: &str) -> FixedBytes<32> {
 // The contract table (`PlatformVerifier::notarizes`) must agree with the
 // profile table. Checked where a mistake cannot run.
 const _: () = {
-    assert!(profiles::LAUNCH.len() == LAUNCH.len());
-    assert!(PlatformVerifier::ALL.len() == LAUNCH.len());
+    assert!(profiles::LAUNCH.len() == LAUNCH.len() + NOT_LAUNCHED.len());
+    assert!(PlatformVerifier::ALL.len() == LAUNCH.len() + NOT_LAUNCHED.len());
     assert!(X.verifier.notarizes());
     assert!(profiles::X.attestation_count() == 2);
     assert!(GITHUB.verifier.notarizes());
@@ -179,7 +203,7 @@ const _: () = {
     assert!(profiles::X.ceremony_version == LAUNCH_VERIFIER_VERSION);
     assert!(profiles::GITHUB.ceremony_version == LAUNCH_VERIFIER_VERSION);
     assert!(profiles::GOOGLE.ceremony_version == LAUNCH_VERIFIER_VERSION);
-    assert!(platforms::PLATFORMS.len() == LAUNCH.len());
+    assert!(platforms::PLATFORMS.len() == LAUNCH.len() + NOT_LAUNCHED.len());
 };
 
 #[cfg(test)]
@@ -204,34 +228,41 @@ mod tests {
     }
 
     /// Every platform the profile and identity tables know is a launch
-    /// platform here.
+    /// platform here or named as not launched, never both.
     #[test]
     fn the_launch_list_matches_the_generated_tables() {
+        let not_launched = |key: &str| NOT_LAUNCHED.iter().any(|v| v.platform() == key);
         for profile in profiles::LAUNCH {
             assert!(
-                by_key(profile.platform).is_some(),
-                "{} has a profile but no launch entry",
+                by_key(profile.platform).is_some() != not_launched(profile.platform),
+                "{} must be launched or named as not launched",
                 profile.platform
             );
         }
         for platform in &platforms::PLATFORMS {
             assert!(
-                by_key(platform.key).is_some(),
-                "{} is in the identity table but not launched",
+                by_key(platform.key).is_some() != not_launched(platform.key),
+                "{} must be launched or named as not launched",
                 platform.key
             );
         }
         assert!(by_key("discord").is_none());
+        assert!(by_key("telegram").is_none());
     }
 
     /// One circuit for both TLSNotary platforms, a separate one for
-    /// Google: the statement, not the platform, decides.
+    /// Google: the statement, not the platform, decides. A circuit only an
+    /// unlaunched platform proves under gets no verifier.
     #[test]
     fn the_circuits_follow_the_statements() {
         assert_eq!(X.circuit(), GITHUB.circuit());
         assert_ne!(X.circuit(), GOOGLE.circuit());
-        for platform in LAUNCH {
-            assert!(Circuit::ALL.contains(&platform.circuit()));
+        assert_eq!(
+            circuits().into_iter().collect::<Vec<_>>(),
+            [Circuit::BearerLink, Circuit::OidcGoogle]
+        );
+        for verifier in NOT_LAUNCHED {
+            assert!(!circuits().contains(&verifier.circuit()));
         }
     }
 

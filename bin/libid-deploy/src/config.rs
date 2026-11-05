@@ -13,6 +13,7 @@ use std::{
     fmt,
     path::Path,
     str::FromStr,
+    time::Duration,
 };
 
 use alloy::{
@@ -35,11 +36,18 @@ use libid_contracts::factory::{
 use serde::Deserialize;
 
 use crate::{
-    names,
+    names::{
+        self,
+        CanonicalContract,
+    },
     safes::{
         OwnerSet,
         Safe,
         SENTINEL_OWNERS,
+    },
+    splitter::{
+        Settings,
+        Splitter,
     },
 };
 
@@ -58,6 +66,10 @@ pub struct NetworkConfig {
     /// The canonical contract addresses — DECLARED, pre-filled with the
     /// canonical table.
     pub contracts: Contracts,
+    /// What the referral splitter is set to, on a network that declares
+    /// `contracts.referral_splitter`.
+    #[serde(default)]
+    pub referral_splitter: Option<ReferralSplitter>,
     /// The Safe multisigs, by name: `[safes.<name>]`.
     #[serde(default)]
     pub safes: BTreeMap<String, SafeConfig>,
@@ -180,8 +192,102 @@ impl NotaryService {
     }
 }
 
-/// `[contracts]` — declared canonical addresses. Every key is always
-/// present and equals `predict_address(factory, name)`.
+/// `[referral_splitter]` — the owner settings of the referral splitter.
+/// Its constructor takes them, and apply sends each setter whose value
+/// differs on-chain.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReferralSplitter {
+    /// The referrer's part of a referred bind's fee, in basis points: 0 to
+    /// 10 000.
+    pub share_bps: u16,
+    /// A fee below this pays the treasury alone, referral or not, in wei, as
+    /// a decimal string. Below the network's service fee, or no referral
+    /// there pays the referrer.
+    pub min_referral_fee_wei: String,
+    /// Where every part of a fee that is not a delivered share goes.
+    pub treasury: DeclaredAddress,
+    /// How long after its last deposit a share held for a node nobody holds
+    /// may be returned to the treasury. Absent keeps it for the referrer.
+    #[serde(default)]
+    pub expiry: Expiry,
+}
+
+impl ReferralSplitter {
+    /// The declared settings.
+    pub fn settings(&self) -> Result<Settings> {
+        if self.share_bps > SHARE_BPS_WHOLE {
+            bail!(
+                "referral_splitter.share_bps is {} but a share is 0 to {SHARE_BPS_WHOLE} \
+                 basis points",
+                self.share_bps
+            );
+        }
+        let min_referral_fee = self.min_referral_fee_wei.trim().parse().map_err(|e| {
+            anyhow!("invalid referral_splitter.min_referral_fee_wei: {e}")
+        })?;
+        Ok(Settings {
+            treasury: self.treasury.required("referral_splitter.treasury")?,
+            share_bps: self.share_bps,
+            min_referral_fee,
+            expiry: self.expiry,
+        })
+    }
+}
+
+/// A splitter's expiry: a whole number of seconds, written as a duration
+/// (`30days`). Zero, the default, returns nothing to the treasury.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct Expiry(Duration);
+
+impl Expiry {
+    /// The value `setExpiry` takes.
+    pub fn seconds(self) -> u64 {
+        self.0.as_secs()
+    }
+}
+
+impl From<u64> for Expiry {
+    fn from(seconds: u64) -> Self {
+        Self(Duration::from_secs(seconds))
+    }
+}
+
+impl FromStr for Expiry {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let duration = humantime::parse_duration(s.trim())
+            .map_err(|e| anyhow!("invalid expiry '{s}': {e}"))?;
+        if duration.subsec_nanos() != 0 {
+            bail!("expiry '{s}' is not a whole number of seconds");
+        }
+        Ok(Self(duration))
+    }
+}
+
+impl TryFrom<String> for Expiry {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        value.parse()
+    }
+}
+
+impl fmt::Display for Expiry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_zero() {
+            f.write_str("none")
+        } else {
+            write!(f, "{}", humantime::format_duration(self.0))
+        }
+    }
+}
+
+/// `[contracts]` — declared canonical addresses. Every required key is
+/// present and equals `predict_address(factory, name)`; an optional one
+/// does when the network declares it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Contracts {
@@ -207,6 +313,10 @@ pub struct Contracts {
     pub github_platform_verifier: DeclaredAddress,
     /// The `google/v1` Platform Verifier proxy.
     pub google_platform_verifier: DeclaredAddress,
+    /// The referral splitter, on a network that has one. It pays through
+    /// `identity_registry` and `handle_escrow` for life.
+    #[serde(default)]
+    pub referral_splitter: DeclaredAddress,
 }
 
 impl Contracts {
@@ -222,8 +332,16 @@ impl Contracts {
             "x_platform_verifier" => self.x_platform_verifier,
             "github_platform_verifier" => self.github_platform_verifier,
             "google_platform_verifier" => self.google_platform_verifier,
+            "referral_splitter" => self.referral_splitter,
             _ => return None,
         })
+    }
+
+    /// Every canonical contract the file declares, with its address.
+    pub fn canonical(&self) -> impl Iterator<Item = (CanonicalContract, Address)> + '_ {
+        names::CANONICAL_CONTRACTS
+            .iter()
+            .filter_map(|&c| Some((c, self.declared(c.key)?.get()?)))
     }
 
     /// The address declared for a canonical `[contracts]` key.
@@ -284,6 +402,9 @@ pub struct Stack {
     /// The Google JWT root list proxy.
     pub jwt_roots: Address,
 }
+
+/// A whole fee in basis points: the most `share_bps` can be.
+const SHARE_BPS_WHOLE: u16 = 10_000;
 
 /// An address field of the network file. Blank declares none, and so does
 /// the zero address: nothing legitimate deploys there.
@@ -374,7 +495,34 @@ impl NetworkConfig {
             bail!("aws.kms_deployer must not be empty");
         }
         self.validate_canonical_addresses()?;
+        self.splitter()?;
         self.validate_safes()
+    }
+
+    /// The referral splitter's declared address and settings, when the
+    /// network has one: `contracts.referral_splitter` and
+    /// `[referral_splitter]` come together or not at all.
+    pub fn splitter(&self) -> Result<Option<Splitter>> {
+        let (address, declared) = match (
+            self.contracts.referral_splitter.get(),
+            &self.referral_splitter,
+        ) {
+            (None, None) => return Ok(None),
+            (Some(address), Some(declared)) => (address, declared),
+            (Some(_), None) => bail!(
+                "contracts.referral_splitter is declared but [referral_splitter] is \
+                     missing: the splitter deploys with those settings"
+            ),
+            (None, Some(_)) => bail!(
+                "[referral_splitter] is set but contracts.referral_splitter is not \
+                     declared: declare the address `plan --print-addresses` names"
+            ),
+        };
+        let settings = declared.settings()?;
+        if settings.treasury == address {
+            bail!("referral_splitter.treasury cannot be the splitter itself");
+        }
+        Ok(Some(Splitter { address, settings }))
     }
 
     /// Every declared Safe: a name of `[a-z0-9_]`, distinct nonzero owners,
@@ -456,6 +604,9 @@ impl NetworkConfig {
                 .contracts
                 .declared(c.key)
                 .ok_or_else(|| anyhow!("{label} is not a known canonical key"))?;
+            if !c.required && raw.get().is_none() {
+                continue;
+            }
             let expected = predict_address(factory, c.name);
             let declared = raw.required(&label).map_err(|e| {
                 anyhow!(
@@ -719,6 +870,125 @@ google_platform_verifier = "{google}"
             let err = cfg.validate().unwrap_err().to_string();
             assert!(err.contains(needle), "{owners:?}/{threshold}: {err}");
         }
+    }
+
+    /// Where the test deployer's referral splitter lands.
+    fn test_splitter() -> Address {
+        predict_address(test_factory(), names::REFERRAL_SPLITTER)
+    }
+
+    const SPLITTER_TREASURY: &str = "0x7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e";
+
+    /// `[referral_splitter]` with `extra` lines, its share and fee
+    /// replaceable.
+    fn splitter_table(
+        share_bps: &str,
+        min_referral_fee_wei: &str,
+        extra: &str,
+    ) -> String {
+        format!(
+            "\n[referral_splitter]\nshare_bps = {share_bps}\n\
+             min_referral_fee_wei = \"{min_referral_fee_wei}\"\n\
+             treasury = \"{SPLITTER_TREASURY}\"\n{extra}"
+        )
+    }
+
+    /// The canonical file declaring `contracts.referral_splitter` at
+    /// `address`, followed by `table`.
+    fn with_splitter(address: Address, table: &str) -> String {
+        canonical_toml().replace(
+            "[contracts]\n",
+            &format!("[contracts]\nreferral_splitter = \"{address:#x}\"\n"),
+        ) + table
+    }
+
+    /// A declared splitter loads its settings: the fee as decimal wei, the
+    /// expiry as a duration.
+    #[test]
+    fn a_declared_splitter_loads_its_settings() {
+        let text = with_splitter(
+            test_splitter(),
+            &splitter_table("3000", "1850000000000000", "expiry = \"30days\"\n"),
+        );
+        let cfg: NetworkConfig = toml::from_str(&text).unwrap();
+        cfg.validate().expect("the splitter validates");
+        let splitter = cfg.splitter().unwrap().expect("declared");
+        assert_eq!(splitter.address, test_splitter());
+        assert_eq!(
+            splitter.settings,
+            Settings {
+                treasury: SPLITTER_TREASURY.parse().unwrap(),
+                share_bps: 3_000,
+                min_referral_fee: U256::from(1_850_000_000_000_000u64),
+                expiry: Expiry::from(2_592_000),
+            }
+        );
+    }
+
+    /// A network without a splitter has none, and a splitter without an
+    /// expiry keeps shares for their referrer.
+    #[test]
+    fn the_splitter_and_its_expiry_are_optional() {
+        let cfg: NetworkConfig = toml::from_str(&canonical_toml()).unwrap();
+        assert!(cfg.splitter().unwrap().is_none());
+        let text = with_splitter(test_splitter(), &splitter_table("0", "0", ""));
+        let cfg: NetworkConfig = toml::from_str(&text).unwrap();
+        let splitter = cfg.splitter().unwrap().expect("declared");
+        assert_eq!(splitter.settings.expiry.seconds(), 0);
+        assert_eq!(splitter.settings.expiry.to_string(), "none");
+    }
+
+    /// A splitter the chain would refuse, or that names no address, is
+    /// refused at load.
+    #[test]
+    fn an_unusable_splitter_is_an_error() {
+        let table = splitter_table("3000", "1850000000000000", "");
+        let declared_only = canonical_toml().replace(
+            "[contracts]\n",
+            &format!(
+                "[contracts]\nreferral_splitter = \"{:#x}\"\n",
+                test_splitter()
+            ),
+        );
+        for (text, needle) in [
+            (
+                canonical_toml() + &table,
+                "contracts.referral_splitter is not declared",
+            ),
+            (declared_only, "[referral_splitter] is missing"),
+            (
+                with_splitter(test_splitter(), &splitter_table("10001", "0", "")),
+                "share_bps",
+            ),
+            (
+                with_splitter(test_splitter(), &splitter_table("3000", "1.5", "")),
+                "min_referral_fee_wei",
+            ),
+            (
+                with_splitter(
+                    test_splitter(),
+                    &table.replace(SPLITTER_TREASURY, &format!("{:#x}", test_splitter())),
+                ),
+                "the splitter itself",
+            ),
+            (
+                with_splitter(test_safe("notary_fees"), &table),
+                "libid.ReferralSplitter",
+            ),
+        ] {
+            let cfg: NetworkConfig = toml::from_str(&text).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+    }
+
+    /// An expiry is whole seconds, written as a duration.
+    #[test]
+    fn an_expiry_parses_as_whole_seconds() {
+        assert_eq!("30days".parse::<Expiry>().unwrap().seconds(), 2_592_000);
+        assert_eq!("30days".parse::<Expiry>().unwrap().to_string(), "30days");
+        assert!("1500ms".parse::<Expiry>().is_err());
+        assert!("soon".parse::<Expiry>().is_err());
     }
 
     /// An empty canonical key is an error naming the fill-in value.

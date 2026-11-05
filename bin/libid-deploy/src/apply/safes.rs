@@ -1,19 +1,25 @@
 //! Creating the declared Safes and handing each to its declared owners.
 
+use alloy::providers::ext::AnvilApi;
 use anyhow::{
+    anyhow,
     bail,
     Result,
 };
 use libid_contracts::send_with_nonce_retry;
 
 use super::Applier;
-use crate::safes::{
-    ISafe,
-    ISafeProxyFactory,
-    OwnerSet,
-    Safe,
-    PROXY_FACTORY,
-    SAFE_CONTRACTS,
+use crate::{
+    rpc::DevChain,
+    safes::{
+        ISafe,
+        ISafeProxyFactory,
+        OwnerSet,
+        Safe,
+        SafeContract,
+        PROXY_FACTORY,
+        SAFE_CONTRACTS,
+    },
 };
 
 impl Applier<'_> {
@@ -25,8 +31,13 @@ impl Applier<'_> {
         if cfg.safes.is_empty() {
             return Ok(());
         }
+        let dev_chain = self.provider.is_dev_chain().await?;
         for contract in SAFE_CONTRACTS {
-            let codehash = contract.codehash_at(&self.provider).await?;
+            let mut codehash = contract.codehash_at(&self.provider).await?;
+            if codehash.is_none() && dev_chain {
+                self.install(contract).await?;
+                codehash = contract.codehash_at(&self.provider).await?;
+            }
             if codehash != Some(contract.codehash) {
                 bail!(
                     "{:#x} on '{}' holds no Safe v1.4.1 {} (codehash {codehash:?}); every \
@@ -44,6 +55,24 @@ impl Applier<'_> {
             };
             self.safe(safe, declared.owner_set()).await?;
         }
+        Ok(())
+    }
+
+    /// Put a Safe v1.4.1 contract's code at its canonical address on a dev
+    /// chain, which has no Safe deployment of its own.
+    async fn install(&mut self, contract: SafeContract) -> Result<()> {
+        self.provider
+            .anvil_set_code(contract.address, contract.runtime_code()?)
+            .await
+            .map_err(|e| anyhow!("anvil_setCode({}) failed: {e}", contract.name))?;
+        tracing::info!(
+            name = contract.name,
+            address = %contract.address,
+            "Safe contract installed on the dev chain"
+        );
+        self.summary
+            .deployed
+            .push((format!("safe_contracts.{}", contract.key), contract.address));
         Ok(())
     }
 

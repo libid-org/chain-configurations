@@ -32,6 +32,7 @@ use alloy::{
 };
 use anyhow::{
     anyhow,
+    bail,
     Result,
 };
 
@@ -133,6 +134,9 @@ pub struct SafeContract {
     pub address: Address,
     /// The code hash of its runtime code.
     pub codehash: B256,
+    /// Its runtime code as hex, as Ethereum holds it: what apply installs
+    /// on a dev chain.
+    pub code: &'static str,
 }
 
 /// The Safe v1.4.1 contracts a declared Safe is created and reconfigured
@@ -145,6 +149,7 @@ pub const SAFE_CONTRACTS: [SafeContract; 4] = [
         codehash: b256!(
             "50c3cdc4074750a7a974204a716c999edd37482f907608d960b2b025ee0b3317"
         ),
+        code: include_str!("../safe-1.4.1/SafeProxyFactory.hex"),
     },
     SafeContract {
         key: "singleton",
@@ -153,6 +158,7 @@ pub const SAFE_CONTRACTS: [SafeContract; 4] = [
         codehash: b256!(
             "b1f926978a0f44a2c0ec8fe822418ae969bd8c3f18d61e5103100339894f81ff"
         ),
+        code: include_str!("../safe-1.4.1/SafeL2.hex"),
     },
     SafeContract {
         key: "fallback_handler",
@@ -161,6 +167,7 @@ pub const SAFE_CONTRACTS: [SafeContract; 4] = [
         codehash: b256!(
             "7c6007a5d711cea8dfd5d91f5940ec29c7f200fe511eb1fc1397b367af3c42f9"
         ),
+        code: include_str!("../safe-1.4.1/CompatibilityFallbackHandler.hex"),
     },
     SafeContract {
         key: "multi_send_call_only",
@@ -169,10 +176,29 @@ pub const SAFE_CONTRACTS: [SafeContract; 4] = [
         codehash: b256!(
             "ecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939"
         ),
+        code: include_str!("../safe-1.4.1/MultiSendCallOnly.hex"),
     },
 ];
 
 impl SafeContract {
+    /// Its runtime code, refused unless it hashes to [`Self::codehash`].
+    pub fn runtime_code(&self) -> Result<Bytes> {
+        let code: Bytes = self
+            .code
+            .trim()
+            .parse()
+            .map_err(|e| anyhow!("the {} code is not hex: {e}", self.name))?;
+        let hash = keccak256(&code);
+        if hash != self.codehash {
+            bail!(
+                "the {} code hashes to {hash:#x}, not v1.4.1's {:#x}",
+                self.name,
+                self.codehash
+            );
+        }
+        Ok(code)
+    }
+
     /// The code hash at its address, `None` where the chain holds no code.
     pub async fn codehash_at<P: Provider>(&self, provider: &P) -> Result<Option<B256>> {
         let code = provider

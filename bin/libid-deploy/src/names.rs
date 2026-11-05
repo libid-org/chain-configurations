@@ -35,9 +35,9 @@ use libid_contracts::factory::{
     FactoryGenesis,
 };
 
-use crate::circuits::{
-    self,
-    Circuit,
+use crate::{
+    circuits,
+    platforms,
 };
 
 /// One canonical (factory-deployed) contract.
@@ -47,6 +47,9 @@ pub struct CanonicalContract {
     pub key: &'static str,
     /// The factory name — the ONLY input to the address.
     pub name: &'static str,
+    /// Whether every network file declares it. An optional contract is on
+    /// the networks whose file declares it, and only there.
+    pub required: bool,
 }
 
 /// The Notary Service proxy — deploys first; every notarized session is
@@ -72,40 +75,58 @@ pub const X_PLATFORM_VERIFIER: &str = "libid.XPlatformVerifier.2";
 pub const GITHUB_PLATFORM_VERIFIER: &str = "libid.GitHubPlatformVerifier.2";
 /// The `google/v1` Platform Verifier proxy.
 pub const GOOGLE_PLATFORM_VERIFIER: &str = "libid.GooglePlatformVerifier.2";
+/// The referral splitter: the fee receiver of a referred bind, which pays
+/// the referrer's handle its share through the handle escrow. Not a proxy:
+/// its registry and escrow are constructor arguments, so a new version is a
+/// new name.
+pub const REFERRAL_SPLITTER: &str = "libid.ReferralSplitter";
 
 /// Every canonical contract, in deploy order.
 pub const CANONICAL_CONTRACTS: &[CanonicalContract] = &[
     CanonicalContract {
         key: "notary_service",
         name: NOTARY_SERVICE,
+        required: true,
     },
     CanonicalContract {
         key: "ceremony_proof_verifier",
         name: CEREMONY_PROOF_VERIFIER,
+        required: true,
     },
     CanonicalContract {
         key: "identity_registry",
         name: IDENTITY_REGISTRY,
+        required: true,
     },
     CanonicalContract {
         key: "handle_escrow",
         name: HANDLE_ESCROW,
+        required: true,
     },
     CanonicalContract {
         key: "google_jwt_roots",
         name: GOOGLE_JWT_ROOTS,
+        required: true,
     },
     CanonicalContract {
         key: "x_platform_verifier",
         name: X_PLATFORM_VERIFIER,
+        required: true,
     },
     CanonicalContract {
         key: "github_platform_verifier",
         name: GITHUB_PLATFORM_VERIFIER,
+        required: true,
     },
     CanonicalContract {
         key: "google_platform_verifier",
         name: GOOGLE_PLATFORM_VERIFIER,
+        required: true,
+    },
+    CanonicalContract {
+        key: "referral_splitter",
+        name: REFERRAL_SPLITTER,
+        required: false,
     },
 ];
 
@@ -157,7 +178,7 @@ pub fn render_address_table(genesis: FactoryGenesis) -> anyhow::Result<String> {
     // apply deploys a circuit verifier when no Platform Verifier uses one
     // with its code, through the same factory under a name carrying the
     // circuits release.
-    for circuit in Circuit::ALL {
+    for circuit in platforms::circuits() {
         let name = circuits::factory_name(circuit)?;
         let addr = predict_address(factory, &name);
         let _ = writeln!(

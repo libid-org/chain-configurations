@@ -31,6 +31,7 @@ use alloy::{
     },
     primitives::{
         keccak256,
+        utils::Unit,
         Address,
         Bytes,
         B256,
@@ -41,8 +42,16 @@ use alloy::{
         Provider,
         ProviderBuilder,
     },
+    rpc::types::{
+        TransactionReceipt,
+        TransactionRequest,
+    },
     signers::local::PrivateKeySigner,
-    sol_types::SolError,
+    sol_types::{
+        SolCall,
+        SolError,
+        SolValue,
+    },
 };
 use libid_contracts::{
     bindings::{
@@ -62,6 +71,7 @@ use libid_contracts::{
         factory::LibidFactory,
         identity::IdentityRegistry,
         proxy::IUUPSUpgradeable,
+        referral::ReferralSplitter,
     },
     circuits::deploy_honk_verifier,
     deploy::deploy_contract_from,
@@ -69,7 +79,6 @@ use libid_contracts::{
         predict_address,
         FactoryGenesis,
     },
-    platform_verifier::PlatformVerifier,
     Artifacts,
 };
 use libid_deploy::{
@@ -248,11 +257,7 @@ async fn apply_with(path: &Path, opts: apply::Options) -> apply::Summary {
 /// and that the chain has CODE at every one of them.
 async fn assert_declared_and_present<P: Provider>(provider: &P, cfg: &NetworkConfig) {
     let factory = factory_address();
-    for c in names::CANONICAL_CONTRACTS {
-        let declared: Address = cfg
-            .contracts
-            .address(c.key)
-            .unwrap_or_else(|e| panic!("{} declared: {e}", c.key));
+    for (c, declared) in cfg.contracts.canonical() {
         assert_eq!(
             declared,
             predict_address(factory, c.name),
@@ -776,7 +781,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
         .collect();
     assert_eq!(
         circuit_components.len(),
-        Circuit::ALL.len(),
+        platforms::circuits().len(),
         "{:?}",
         fresh.deployed
     );
@@ -787,7 +792,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
     // a wrong-length proof comes back with, so that is what separates a
     // real verifier from a contract that merely has code.
     let mut log_n = Vec::new();
-    for circuit in Circuit::ALL {
+    for circuit in platforms::circuits() {
         let address = circuit_verifier_address(circuit);
         let code = provider.get_code_at(address).await.unwrap();
         assert!(
@@ -849,28 +854,27 @@ async fn platform_verifiers_deploy_wire_and_register() {
             platform.label
         );
 
-        match platform.verifier {
-            PlatformVerifier::X | PlatformVerifier::GitHub => {
-                assert_eq!(
-                    verifier.notaryService().call().await.unwrap(),
-                    notary_service
-                );
-            }
-            PlatformVerifier::Google => {
-                // A profile that notarizes nothing holds no Notary Service.
-                assert_eq!(
-                    verifier.notaryService().call().await.unwrap(),
-                    Address::ZERO
-                );
-                assert_eq!(
-                    GooglePlatformVerifier::new(proxy, &provider)
-                        .jwtRoots()
-                        .call()
-                        .await
-                        .unwrap(),
-                    jwt_roots
-                );
-            }
+        if platform.verifier.notarizes() {
+            assert_eq!(
+                verifier.notaryService().call().await.unwrap(),
+                notary_service
+            );
+        } else {
+            // A profile that notarizes nothing holds no Notary Service.
+            assert_eq!(
+                verifier.notaryService().call().await.unwrap(),
+                Address::ZERO
+            );
+        }
+        if platform.reads_jwt_roots() {
+            assert_eq!(
+                GooglePlatformVerifier::new(proxy, &provider)
+                    .jwtRoots()
+                    .call()
+                    .await
+                    .unwrap(),
+                jwt_roots
+            );
         }
 
         // Registered, so the platform can verify and the resolvers answer.
@@ -895,11 +899,10 @@ async fn platform_verifiers_deploy_wire_and_register() {
 
         // One Notary Fee per attestation the profile requires, quoted end
         // to end through the identity registry.
-        let expected_quote = match platform.verifier {
-            PlatformVerifier::X | PlatformVerifier::GitHub => {
-                U256::from(NOTARY_FEE_WEI) * U256::from(2)
-            }
-            PlatformVerifier::Google => U256::ZERO,
+        let expected_quote = if platform.verifier.notarizes() {
+            U256::from(NOTARY_FEE_WEI) * U256::from(2)
+        } else {
+            U256::ZERO
         };
         assert_eq!(
             registry
@@ -944,7 +947,7 @@ async fn platform_verifiers_deploy_wire_and_register() {
         "the settled plan still wants deploys:\n{}",
         settled.render()
     );
-    for circuit in Circuit::ALL {
+    for circuit in platforms::circuits() {
         assert_eq!(
             settled.status_of(&format!("circuits.{}", circuit.name())),
             Some(Status::Ok)
@@ -1072,7 +1075,7 @@ async fn platform_verifiers_keep_a_verifier_with_the_vendored_code_under_any_nam
     let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
     let copies = wire_onto_copies(&anvil, &cfg).await;
     assert_ne!(copies[platforms::X.label], copies[platforms::GITHUB.label]);
-    for circuit in Circuit::ALL {
+    for circuit in platforms::circuits() {
         provider
             .anvil_set_code(circuit_verifier_address(circuit), Bytes::new())
             .await
@@ -1083,7 +1086,7 @@ async fn platform_verifiers_keep_a_verifier_with_the_vendored_code_under_any_nam
         .await
         .expect("plan reads the copies");
     assert!(!plan.has_deploys(), "{}", plan.render());
-    for circuit in Circuit::ALL {
+    for circuit in platforms::circuits() {
         assert_eq!(
             plan.status_of(&format!("circuits.{}", circuit.name())),
             Some(Status::Ok),
@@ -1104,7 +1107,7 @@ async fn platform_verifiers_keep_a_verifier_with_the_vendored_code_under_any_nam
     assert!(kept.deployed.is_empty(), "{:?}", kept.deployed);
     assert!(kept.configured.is_empty(), "{:?}", kept.configured);
     assert_eq!(wired_verifiers(&provider, &cfg).await, copies);
-    for circuit in Circuit::ALL {
+    for circuit in platforms::circuits() {
         assert!(
             provider
                 .get_code_at(circuit_verifier_address(circuit))
@@ -1526,6 +1529,25 @@ async fn the_committed_local_dev_file_converges_an_anvil_through_rpc_url() {
             .unwrap(),
         ANVIL_OWNER.parse::<Address>().unwrap()
     );
+
+    // The splitter holds the file's settings and pays the registry_fees
+    // Safe, which apply created on the Safe contracts it installed.
+    let splitter = cfg.splitter().unwrap().expect("local-dev declares one");
+    let on_chain = splitter.on_chain(&provider).await.unwrap();
+    assert_eq!(on_chain.settings, splitter.settings);
+    assert_eq!(on_chain.owner, ANVIL_OWNER.parse::<Address>().unwrap());
+    let registry_fees = cfg
+        .safes
+        .get("registry_fees")
+        .unwrap()
+        .address
+        .get()
+        .unwrap();
+    assert_eq!(splitter.settings.treasury, registry_fees);
+    assert_eq!(
+        safe_owners(&provider, registry_fees).await,
+        (vec![ANVIL_OWNER.parse().unwrap()], U256::from(1))
+    );
 }
 
 /// `--rpc-url` moves the transport and nothing else. The file names an
@@ -1563,8 +1585,7 @@ async fn rpc_override_moves_only_the_transport() {
 
     // Every canonical component deployed, at exactly the file's address.
     let factory = factory_address();
-    for c in names::CANONICAL_CONTRACTS {
-        let declared: Address = cfg.contracts.address(c.key).unwrap();
+    for (c, declared) in cfg.contracts.canonical() {
         let landed = summary
             .deployed
             .iter()
@@ -1576,7 +1597,7 @@ async fn rpc_override_moves_only_the_transport() {
     }
     let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
     assert_declared_and_present(&provider, &cfg).await;
-    for circuit in Circuit::ALL {
+    for circuit in platforms::circuits() {
         let addr = circuit_verifier_address(circuit);
         assert!(
             !provider.get_code_at(addr).await.unwrap().is_empty(),
@@ -1778,32 +1799,6 @@ threshold = 1
     std::fs::write(path, body).expect("write network file");
 }
 
-/// Put the Safe v1.4.1 contracts at their canonical addresses, with the
-/// runtime code they hold on Ethereum.
-async fn install_safe_contracts<P: Provider>(provider: &P) {
-    for contract in safes::SAFE_CONTRACTS {
-        let hex = match contract.name {
-            "SafeProxyFactory" => {
-                include_str!("fixtures/safe-1.4.1/SafeProxyFactory.hex")
-            }
-            "SafeL2" => include_str!("fixtures/safe-1.4.1/SafeL2.hex"),
-            "CompatibilityFallbackHandler" => {
-                include_str!("fixtures/safe-1.4.1/CompatibilityFallbackHandler.hex")
-            }
-            "MultiSendCallOnly" => {
-                include_str!("fixtures/safe-1.4.1/MultiSendCallOnly.hex")
-            }
-            other => panic!("no fixture for {other}"),
-        };
-        let code: Bytes = hex.trim().parse().expect("fixture is hex");
-        assert_eq!(keccak256(&code), contract.codehash, "{}", contract.name);
-        provider
-            .anvil_set_code(contract.address, code)
-            .await
-            .expect("anvil_setCode");
-    }
-}
-
 /// The owners and threshold a Safe holds, the owners as a sorted list.
 async fn safe_owners<P: Provider>(provider: &P, safe: Address) -> (Vec<Address>, U256) {
     let safe = safes::ISafe::new(safe, provider);
@@ -1815,11 +1810,11 @@ async fn safe_owners<P: Provider>(provider: &P, safe: Address) -> (Vec<Address>,
     )
 }
 
-/// A Safe's life under apply: refused on a chain without the Safe
-/// contracts, created at its predicted address as the deployer's 1-of-1,
-/// handed to the declared owners in the same run, left alone by the next
-/// run, and — once the owners hold it — reported with the calls they sign,
-/// never sent to.
+/// A Safe's life under apply: on a dev chain, which has no Safe
+/// deployment, the Safe v1.4.1 contracts installed first; then created at
+/// its predicted address as the deployer's 1-of-1, handed to the declared
+/// owners in the same run, left alone by the next run, and — once the
+/// owners hold it — reported with the calls they sign, never sent to.
 #[tokio::test]
 async fn safes_are_created_handed_over_and_then_left_to_their_owners() {
     let anvil = spawn_anvil();
@@ -1831,45 +1826,45 @@ async fn safes_are_created_handed_over_and_then_left_to_their_owners() {
     let notary_fees = safe_address("notary_fees");
     let registry_fees = safe_address("registry_fees");
 
-    // No Safe contracts: the plan says so and apply refuses the Safes.
-    let bare = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
-    assert_eq!(
-        bare.status_of("safe_contracts.proxy_factory"),
-        Some(Status::Warn)
-    );
-    assert_eq!(bare.status_of("safes.notary_fees"), None);
-    let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
-    let refused = Applier::connect(
-        &cfg,
-        &file_rpc(&cfg),
-        &signer,
-        apply::Options {
-            confirm_fresh_deploy: true,
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("apply connects")
-    .run(&path)
-    .await
-    .expect_err("no Safe contracts, no Safes");
-    assert!(
-        refused
-            .to_string()
-            .contains("no Safe v1.4.1 SafeProxyFactory"),
-        "{refused}"
-    );
-
-    install_safe_contracts(&provider).await;
     let fresh = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
+    for contract in safes::SAFE_CONTRACTS {
+        assert_eq!(
+            fresh.status_of(&format!("safe_contracts.{}", contract.key)),
+            Some(Status::Deploy)
+        );
+    }
     assert_eq!(fresh.status_of("safes.notary_fees"), Some(Status::Deploy));
     assert_eq!(
         fresh.status_of("safes.notary_fees.owners"),
         Some(Status::Deploy)
     );
 
-    // Created at the predicted address and handed over in the same run.
-    let summary = apply_with(&path, apply::Options::default()).await;
+    // Installed, created at the predicted address and handed over in the
+    // same run.
+    let summary = apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    for contract in safes::SAFE_CONTRACTS {
+        assert_eq!(
+            contract.codehash_at(&provider).await.unwrap(),
+            Some(contract.codehash),
+            "{}",
+            contract.name
+        );
+        let component = format!("safe_contracts.{}", contract.key);
+        assert!(
+            summary
+                .deployed
+                .contains(&(component.clone(), contract.address)),
+            "{component}: {:?}",
+            summary.deployed
+        );
+    }
     for (component, address) in [
         ("safes.notary_fees", notary_fees),
         ("safes.registry_fees", registry_fees),
@@ -1950,4 +1945,512 @@ async fn safes_are_created_handed_over_and_then_left_to_their_owners() {
         safe_owners(&provider, notary_fees).await,
         (declared, U256::from(2))
     );
+}
+
+// Anvil accounts #3 and #5, two treasuries a splitter is moved between.
+const TREASURY: &str = "0x90F79bf6EB2c4f870365E785982E1f101E93b906";
+const OTHER_TREASURY: &str = "0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc";
+// Anvil account #6, a key the splitter is handed to.
+const OTHER_OWNER: &str = "0x976EA74026E726554dB657fA54763abd0C3a0aa9";
+// Anvil account #7, the wallet a referred bind binds.
+const BINDER: &str = "0x14dC79964da2C08b23698B3D3cc7Ca32193d9955";
+/// The splitter's minimum referral fee in the test files: half the fee
+/// [`REFERRED_FEE_WEI`].
+const MIN_REFERRAL_FEE_WEI: u64 = 1_850_000_000_000_000;
+/// A referred bind's fee, as a site on a dev chain charges it.
+const REFERRED_FEE_WEI: u64 = 3_700_000_000_000_000;
+
+/// Where the anvil #0 deployer's referral splitter lands.
+fn splitter_address() -> Address {
+    predict_address(factory_address(), names::REFERRAL_SPLITTER)
+}
+
+/// Declare in the network file at `path` the referral splitter paying
+/// `treasury` and the referrer `share_bps`, holding a share for `expiry`
+/// (blank: for good).
+fn declare_splitter(path: &Path, treasury: &str, share_bps: u16, expiry: &str) {
+    let body = std::fs::read_to_string(path).expect("read network file");
+    let expiry = if expiry.is_empty() {
+        String::new()
+    } else {
+        format!("expiry = \"{expiry}\"\n")
+    };
+    let body = body.replacen(
+        "[contracts]\n",
+        &format!(
+            "[contracts]\nreferral_splitter = \"{:#x}\"\n",
+            splitter_address()
+        ),
+        1,
+    ) + &format!(
+        r#"
+[referral_splitter]
+share_bps = {share_bps}
+min_referral_fee_wei = "{MIN_REFERRAL_FEE_WEI}"
+treasury = "{treasury}"
+{expiry}"#
+    );
+    std::fs::write(path, body).expect("write network file");
+}
+
+/// Calls sent as any account, on anvil's word that it signed them: how a
+/// contract caller, or a key the tests hold no wallet for, acts.
+trait Impersonate {
+    /// Send `call` to `to` from `from` with `value`, and its receipt once it
+    /// succeeded.
+    async fn send_as<C: SolCall>(
+        &self,
+        from: Address,
+        to: Address,
+        call: C,
+        value: U256,
+    ) -> TransactionReceipt;
+}
+
+impl<P: Provider> Impersonate for P {
+    async fn send_as<C: SolCall>(
+        &self,
+        from: Address,
+        to: Address,
+        call: C,
+        value: U256,
+    ) -> TransactionReceipt {
+        self.anvil_set_balance(from, Unit::ETHER.wei() + value)
+            .await
+            .expect("anvil_setBalance");
+        self.anvil_impersonate_account(from)
+            .await
+            .expect("anvil_impersonateAccount");
+        let tx = TransactionRequest::default()
+            .from(from)
+            .to(to)
+            .value(value)
+            .input(call.abi_encode().into());
+        let receipt = self
+            .send_transaction(tx)
+            .await
+            .expect("impersonated send")
+            .get_receipt()
+            .await
+            .expect("receipt");
+        self.anvil_stop_impersonating_account(from)
+            .await
+            .expect("anvil_stopImpersonatingAccount");
+        assert!(receipt.status(), "{receipt:?}");
+        receipt
+    }
+}
+
+/// The referral splitter on a virgin chain: one apply deploys it after the
+/// escrow it pays through, owned by the identity registry's owner and
+/// paying the `registry_fees` Safe. A referred fee, paid as the registry
+/// pays it, leaves the share in the escrow for the referrer's handle and
+/// the rest in the Safe, the splitter keeping nothing; a second apply sends
+/// nothing and the file stays byte-identical.
+#[tokio::test]
+async fn the_referral_splitter_splits_a_referred_fee_between_the_treasury_and_the_escrow()
+{
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_network_file(dir.path(), &anvil.endpoint());
+    declare_safes(&path, &SAFE_OWNERS, 2);
+    let treasury = safe_address("registry_fees");
+    declare_splitter(&path, &format!("{treasury:#x}"), 3_000, "");
+    let before = std::fs::read(&path).expect("read config");
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let stack = cfg.contracts.stack().unwrap();
+    let splitter = splitter_address();
+
+    let virgin = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
+    assert_eq!(
+        virgin.status_of("contracts.referral_splitter"),
+        Some(Status::Deploy)
+    );
+
+    let fresh = apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let position = |component: &str| {
+        fresh
+            .deployed
+            .iter()
+            .position(|(c, _)| c == component)
+            .unwrap_or_else(|| panic!("{component} not deployed: {:?}", fresh.deployed))
+    };
+    assert!(
+        position("contracts.handle_escrow") < position("contracts.referral_splitter")
+    );
+    assert_eq!(
+        fresh.deployed[position("contracts.referral_splitter")].1,
+        splitter
+    );
+
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let contract = ReferralSplitter::new(splitter, &provider);
+    let registry = IdentityRegistry::new(stack.identity_registry, &provider);
+    assert_eq!(
+        contract.REGISTRY().call().await.unwrap(),
+        stack.identity_registry
+    );
+    assert_eq!(contract.ESCROW().call().await.unwrap(), stack.handle_escrow);
+    assert_eq!(
+        contract.owner().call().await.unwrap(),
+        registry.owner().call().await.unwrap()
+    );
+    assert_eq!(contract.treasury().call().await.unwrap(), treasury);
+    assert_eq!(contract.shareBps().call().await.unwrap(), 3_000);
+    assert_eq!(
+        contract.minReferralFee().call().await.unwrap(),
+        U256::from(MIN_REFERRAL_FEE_WEI)
+    );
+    assert_eq!(contract.expiry().call().await.unwrap(), 0);
+
+    // A fee naming a referrer whose handle nobody holds yet.
+    let x = platforms::platform_id(platforms::X.key);
+    let referrer = registry
+        .handleNodeOf(x, "alice".into())
+        .call()
+        .await
+        .unwrap();
+    let fee = U256::from(REFERRED_FEE_WEI);
+    let treasury_before = provider.get_balance(treasury).await.unwrap();
+    let receipt = provider
+        .send_as(
+            stack.identity_registry,
+            splitter,
+            ReferralSplitter::onBindFeeCall {
+                binder: BINDER.parse().unwrap(),
+                platformId: x,
+                handleNode: B256::repeat_byte(0x0b),
+                sessionId: B256::repeat_byte(0x5e),
+                feeData: (x, referrer).abi_encode_params().into(),
+            },
+            fee,
+        )
+        .await;
+    let referred = receipt
+        .decoded_log::<ReferralSplitter::Referred>()
+        .expect("a Referred log");
+    let share = fee * U256::from(3_000) / U256::from(10_000);
+    assert_eq!(referred.share, share);
+    // Outcome 0 is `Paid`: the escrow took the share.
+    assert_eq!(referred.outcome, 0);
+
+    let escrow = HandleEscrow::new(stack.handle_escrow, &provider);
+    let native = escrow.NATIVE().call().await.unwrap();
+    assert_eq!(
+        escrow.escrowed(referrer, native).call().await.unwrap(),
+        share
+    );
+    assert_eq!(
+        escrow
+            .contribution(referrer, native, splitter)
+            .call()
+            .await
+            .unwrap()
+            .amount,
+        share
+    );
+    assert_eq!(
+        provider.get_balance(treasury).await.unwrap() - treasury_before,
+        fee - share
+    );
+    assert_eq!(provider.get_balance(splitter).await.unwrap(), U256::ZERO);
+
+    // The next run sends nothing.
+    let deployer: Address = ANVIL_OWNER.parse().unwrap();
+    let nonce = provider.get_transaction_count(deployer).await.unwrap();
+    let again = apply_with(&path, apply::Options::default()).await;
+    assert!(again.deployed.is_empty(), "{:?}", again.deployed);
+    assert!(again.configured.is_empty(), "{:?}", again.configured);
+    assert_eq!(
+        provider.get_transaction_count(deployer).await.unwrap(),
+        nonce
+    );
+    let settled = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
+    assert!(!settled.has_deploys(), "{}", settled.render());
+    for component in [
+        "identity_registry.fee_call",
+        "contracts.referral_splitter",
+        "referral_splitter.wiring",
+        "referral_splitter.settings",
+    ] {
+        assert_eq!(
+            settled.status_of(component),
+            Some(Status::Ok),
+            "{}",
+            settled.render()
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+/// The splitter's settings follow the file while the deployer owns it: a
+/// new treasury, share and expiry are sent and the next apply sends
+/// nothing; an expiry under the escrow's refund grace is refused before any
+/// call; once another key owns the splitter, apply names the calls that key
+/// signs and sends nothing.
+#[tokio::test]
+async fn the_splitter_settings_follow_the_file_while_the_deployer_owns_it() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_network_file(dir.path(), &anvil.endpoint());
+    declare_splitter(&path, TREASURY, 3_000, "");
+    apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let splitter = splitter_address();
+    let contract = ReferralSplitter::new(splitter, &provider);
+    let deployer: Address = ANVIL_OWNER.parse().unwrap();
+
+    write_network_file(dir.path(), &anvil.endpoint());
+    declare_splitter(&path, OTHER_TREASURY, 2_500, "30days");
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let drifted = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
+    assert_eq!(
+        drifted.status_of("referral_splitter.settings"),
+        Some(Status::Configure)
+    );
+    let other_treasury: Address = OTHER_TREASURY.parse().unwrap();
+    let converged = apply_with(&path, apply::Options::default()).await;
+    assert_eq!(
+        converged.configured,
+        [format!(
+            "referral splitter setTreasury({other_treasury:#x}), setShare(2500), \
+             setExpiry(2592000)"
+        )]
+    );
+    assert_eq!(contract.treasury().call().await.unwrap(), other_treasury);
+    assert_eq!(contract.shareBps().call().await.unwrap(), 2_500);
+    assert_eq!(contract.expiry().call().await.unwrap(), 2_592_000);
+    let again = apply_with(&path, apply::Options::default()).await;
+    assert!(again.configured.is_empty(), "{:?}", again.configured);
+
+    // A day is under the escrow's 30-day refund grace.
+    write_network_file(dir.path(), &anvil.endpoint());
+    declare_splitter(&path, OTHER_TREASURY, 2_500, "1day");
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let nonce = provider.get_transaction_count(deployer).await.unwrap();
+    let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
+    let err = Applier::connect(&cfg, &file_rpc(&cfg), &signer, apply::Options::default())
+        .await
+        .expect("apply connects")
+        .run(&path)
+        .await
+        .expect_err("an expiry under the refund grace")
+        .to_string();
+    assert!(err.contains("refund grace"), "got: {err}");
+    assert_eq!(
+        provider.get_transaction_count(deployer).await.unwrap(),
+        nonce
+    );
+
+    // Handed to another key, which accepts.
+    let other_owner: Address = OTHER_OWNER.parse().unwrap();
+    provider
+        .send_as(
+            deployer,
+            splitter,
+            ReferralSplitter::transferOwnershipCall {
+                newOwner: other_owner,
+            },
+            U256::ZERO,
+        )
+        .await;
+    provider
+        .send_as(
+            other_owner,
+            splitter,
+            ReferralSplitter::acceptOwnershipCall {},
+            U256::ZERO,
+        )
+        .await;
+    write_network_file(dir.path(), &anvil.endpoint());
+    declare_splitter(&path, OTHER_TREASURY, 2_000, "30days");
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let plan = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
+    let settings = plan
+        .items
+        .iter()
+        .find(|i| i.component == "referral_splitter.settings")
+        .expect("the settings line");
+    assert_eq!(settings.status, Status::Warn);
+    assert!(
+        settings
+            .detail
+            .ends_with(&format!("its owner {other_owner:#x} signs setShare(2000)")),
+        "{}",
+        settings.detail
+    );
+    let nonce = provider.get_transaction_count(deployer).await.unwrap();
+    let report = apply_with(&path, apply::Options::default()).await;
+    assert_eq!(
+        report.configured,
+        [format!(
+            "referral_splitter NOT converged: its owner {other_owner:#x} signs \
+             setShare(2000)"
+        )]
+    );
+    assert_eq!(
+        provider.get_transaction_count(deployer).await.unwrap(),
+        nonce
+    );
+    assert_eq!(contract.shareBps().call().await.unwrap(), 2_500);
+}
+
+/// A network gaining the splitter over an identity registry whose
+/// implementation predates `bindWithFeeCall`, as every live one does: the
+/// plan names the upgrade, apply refuses before sending anything, and one
+/// apply with `--upgrade identity-registry` upgrades the registry and
+/// deploys the splitter. A NotaryService implementation stands in for the
+/// old registry: it answers no `bindWithFeeCall` and keeps the owner.
+#[tokio::test]
+async fn the_splitter_lands_with_the_registry_upgrade_that_pays_it() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prefilled_network_file(dir.path(), &anvil.endpoint());
+    apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let identity_registry: Address = cfg.contracts.identity_registry.get().unwrap();
+
+    let key: PrivateKeySigner = ANVIL_KEY.parse().unwrap();
+    let owned = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(key))
+        .connect_http(anvil.endpoint_url());
+    let stale_impl = deploy_contract_from(
+        &owned,
+        Artifacts::embedded().bytecode("NotaryService").unwrap(),
+        "an implementation without bindWithFeeCall",
+        None,
+    )
+    .await
+    .expect("stand-in implementation deploys");
+    IUUPSUpgradeable::new(identity_registry, &owned)
+        .upgradeToAndCall(stale_impl, Bytes::new())
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+
+    declare_splitter(&path, TREASURY, 3_000, "");
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let stale = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
+    let fee_call = stale
+        .items
+        .iter()
+        .find(|i| i.component == "identity_registry.fee_call")
+        .expect("the fee call line");
+    assert_eq!(fee_call.status, Status::Warn);
+    assert!(
+        fee_call.detail.contains("--upgrade identity-registry"),
+        "{}",
+        fee_call.detail
+    );
+    assert_eq!(
+        stale.status_of("contracts.referral_splitter"),
+        Some(Status::Deploy)
+    );
+
+    let deployer: Address = ANVIL_OWNER.parse().unwrap();
+    let nonce = owned.get_transaction_count(deployer).await.unwrap();
+    let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
+    let err = Applier::connect(&cfg, &file_rpc(&cfg), &signer, apply::Options::default())
+        .await
+        .expect("apply connects")
+        .run(&path)
+        .await
+        .expect_err("no splitter over a registry that never pays it")
+        .to_string();
+    assert!(err.contains("predates bindWithFeeCall"), "got: {err}");
+    assert_eq!(owned.get_transaction_count(deployer).await.unwrap(), nonce);
+
+    let upgraded = apply_with(
+        &path,
+        apply::Options {
+            upgrades: vec!["identity-registry".parse().unwrap()],
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(upgraded.upgraded.len(), 1);
+    assert_eq!(
+        upgraded.deployed,
+        [(
+            "contracts.referral_splitter".to_string(),
+            splitter_address()
+        )]
+    );
+    let settled = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
+    assert!(!settled.has_deploys(), "{}", settled.render());
+    assert_eq!(
+        settled.status_of("identity_registry.fee_call"),
+        Some(Status::Ok)
+    );
+}
+
+/// Code at a Safe contract's address that is not the release's stops
+/// apply before any Safe, on a dev chain too: apply installs the release
+/// only where the chain holds no code.
+#[tokio::test]
+async fn apply_refuses_safes_over_other_code_at_a_safe_contract_address() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_network_file(dir.path(), &anvil.endpoint());
+    declare_safes(&path, &SAFE_OWNERS, 2);
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    provider
+        .anvil_set_code(safes::PROXY_FACTORY, Bytes::from(vec![0x00]))
+        .await
+        .expect("anvil_setCode");
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+
+    let plan = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
+    assert_eq!(
+        plan.status_of("safe_contracts.proxy_factory"),
+        Some(Status::Warn)
+    );
+    assert_eq!(plan.status_of("safes.notary_fees"), None);
+
+    let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
+    let err = Applier::connect(
+        &cfg,
+        &file_rpc(&cfg),
+        &signer,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("apply connects")
+    .run(&path)
+    .await
+    .expect_err("no Safe over another factory's code")
+    .to_string();
+    assert!(err.contains("no Safe v1.4.1 SafeProxyFactory"), "{err}");
+    assert!(provider
+        .get_code_at(safe_address("notary_fees"))
+        .await
+        .unwrap()
+        .is_empty());
 }
