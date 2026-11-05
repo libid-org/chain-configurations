@@ -14,7 +14,6 @@ use super::{
     Status,
 };
 use crate::{
-    apply::Upgrade,
     circuits::{
         Circuit,
         Site,
@@ -442,7 +441,7 @@ impl From<TrustRoots> for Item {
                 format!(
                     "the implementation pins circuit codehash {hash:#x}, the vendored \
                      {circuit} verifier is {vendored:#x} — apply needs --upgrade {}",
-                    Upgrade::from(platform.verifier)
+                    platform.upgrade
                 ),
             ),
             (
@@ -532,7 +531,7 @@ pub(crate) struct FactoryRecord {
 
 impl From<FactoryRecord> for Item {
     fn from(check: FactoryRecord) -> Self {
-        let CanonicalContract { key, name } = check.contract;
+        let CanonicalContract { key, name, .. } = check.contract;
         let declared = check.declared;
         let component = format!("factory.record.{key}");
         match check.recorded {
@@ -808,6 +807,7 @@ mod tests {
             contract: CanonicalContract {
                 key: "handle_escrow",
                 name: "libid.HandleEscrow",
+                required: true,
             },
             declared: DECLARED,
             recorded: Ok(Address::ZERO),

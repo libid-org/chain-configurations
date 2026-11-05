@@ -74,7 +74,20 @@ Then two steps `Deploy.s.sol` does not have:
    Supported Version Set with
    `CeremonyProofVerifier.setVerifier(platformId, 1, verifier)`. Until that
    registration lands, `acceptsBindings` is false for the platform and
-   `bind` reverts `UnknownVersion`.
+   `bind` reverts `UnknownVersion`. `libid-contracts` also ships a Telegram
+   Platform Verifier, its circuit and its JWT root list; Telegram is not
+   launched here, so apply deploys none of them.
+
+Where a network declares one, the **ReferralSplitter** deploys right after
+the escrow. It is the fee receiver of a referred bind: the registry's
+`bindWithFeeCall` pays it the service fee through `onBindFee`, and it
+delivers `share_bps` of a fee of at least `min_referral_fee` to the
+referrer's handle through the escrow and the rest to the treasury. It is
+not a proxy: the registry and the escrow are constructor arguments, fixed
+for life, and its owner is the identity registry's owner when apply deploys
+it. A registry implementation that predates `bindWithFeeCall` never pays
+it, so apply refuses to deploy the splitter over one unless the same run
+upgrades the registry (`--upgrade identity-registry`).
 
 ## The ceremony contracts
 
@@ -236,7 +249,8 @@ in the flow is the KMS key, which never leaves AWS.
 | `[aws]` | input | `region`, `kms_deployer` (key id / `alias/...` / ARN; the default signer) |
 | `[accounts]` | input | `notary` (the notary **signer** — see below), `owner` (the operational owner the factory ends up with; empty = the deployer) — addresses of **keys**, not contracts |
 | `[notary_service]` | input | `fee_wei` — what one attestation verification costs, as a decimal string; `fee_recipient` — where `sweep` sends the accrued fees (optional) |
-| `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_registry`, `handle_escrow`, `google_jwt_roots`, `x_platform_verifier`, `github_platform_verifier`, `google_platform_verifier` — always present, pre-filled with the canonical table, validated against the prediction |
+| `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_registry`, `handle_escrow`, `google_jwt_roots`, `x_platform_verifier`, `github_platform_verifier`, `google_platform_verifier` — always present, pre-filled with the canonical table, validated against the prediction; `referral_splitter` — on a network that has one, validated the same way |
+| `[referral_splitter]` | input | with `contracts.referral_splitter` and only with it: `share_bps` (0 to 10 000), `min_referral_fee_wei` (a decimal string, below the network's service fee), `treasury`, `expiry` (a duration such as `30days`, at least the escrow's 30-day refund grace; absent = none). The constructor takes the first three; apply sends each setter whose value differs on-chain while the deployer owns the splitter, and otherwise reports the calls its owner signs |
 | `[safes.<name>]` | input + declared | `owners`, `threshold` — what the Safe ends up with; `address` — pre-filled with the address the name predicts, validated against it |
 
 The circuit verifiers are not in the file. They are a property of the
@@ -298,6 +312,12 @@ contracts, which `plan` checks by code hash and apply requires:
 | `SafeL2` (the singleton) | `0x29fcB43b46531BcA003ddC8FCB67FFE91900C762` |
 | `CompatibilityFallbackHandler` | `0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99` |
 | `MultiSendCallOnly` | `0x9641d764fc13c8B624c04430C7356C1C7C8102e2` |
+
+A dev chain (anvil or hardhat) has no Safe deployment: there apply first
+installs each missing contract at its address with the code Ethereum holds
+(`bin/libid-deploy/safe-1.4.1/`), and `plan` shows it as DEPLOY. Anywhere
+else, and wherever other code sits at one of these addresses, apply refuses
+every declared Safe.
 
 1. **Create.** `createProxyWithNonce` on the `SafeL2` singleton, with
    `setup(owners = [deployer], threshold = 1, fallback handler)` and salt
@@ -369,7 +389,10 @@ a registration. Each upgrade runs inside its component's own step, before
 apply reads or wires that component: a proxy whose running implementation
 predates a getter the wiring reads (`plan` flags it as `WARN ... read
 failed`) converges in the same `apply --upgrade` run instead of aborting
-at the read.
+at the read. A network gaining the referral splitter upgrades the identity
+registry in the same run: `plan` shows `identity_registry.fee_call` as WARN
+until it does, and apply refuses the splitter without `--upgrade
+identity-registry`.
 
 For anvil rehearsal the local dev config names anvil #0 as `deployer` and
 `owner` alike, so the local signer owns the factory from genesis and no
@@ -411,7 +434,10 @@ notary signer, and a **non-zero** Notary Fee — a local stack that meters at
 no charge lets a client attaching the wrong value pass, and `WrongValue` is
 then first seen where it costs something. The deployer spec in the file is
 anvil's own published test key: `--signer` specs are classified by shape,
-so 64 hex characters is a local key and no AWS call happens.
+so 64 hex characters is a local key and no AWS call happens. It declares the
+referral splitter, paying the `registry_fees` Safe, with a minimum referral
+fee of 0.00185, half the 0.0037 a bind's service fee is there; apply
+installs the Safe contracts on the anvil and creates the Safe.
 
 Its `rpc_url` is the compose service name, `http://anvil:8545`, which only
 resolves inside that network. From anywhere else — the host, a CI job that
@@ -472,6 +498,10 @@ release` consumes the newest Linux x86_64 asset.
   virgin anvil lands everything AT the declared addresses → second apply is
   a no-op without any flag → the file is BYTE-IDENTICAL throughout — plus
   drift repair, the handle escrow bound to the IdentityRegistry beside it,
+  the referral splitter — its deploy, a referred fee reconciled between the
+  treasury Safe and the escrow, its settings following the file, and its
+  landing with the registry upgrade that pays it — the Safes on Safe
+  contracts apply installs,
   the Platform Verifier deploy/register/rotate path, the network-invariance
   proof: two separate bare anvils converge onto the same
   declared canonical addresses, and the `--rpc-url` contract: the committed
