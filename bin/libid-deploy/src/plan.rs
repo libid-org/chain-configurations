@@ -297,14 +297,14 @@ impl Planner<'_> {
             self.identity_registry(stack.identity_registry, stack.proof_verifier)
                 .await;
         }
-        if self
+        let handle_escrow_present = self
             .code("contracts.handle_escrow", stack.handle_escrow)
-            .await?
-        {
+            .await?;
+        if handle_escrow_present {
             self.handle_escrow(stack.handle_escrow, stack.identity_registry)
                 .await;
         }
-        self.referral_splitter(stack, identity_registry_present)
+        self.referral_splitter(stack, identity_registry_present, handle_escrow_present)
             .await?;
         if self
             .code("contracts.google_jwt_roots", stack.jwt_roots)

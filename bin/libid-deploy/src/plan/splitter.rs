@@ -1,9 +1,13 @@
 //! The plan lines of the referral splitter: whether the identity registry
-//! pays it, whether it exists, what it pays through, and whether its
-//! settings are the declared ones.
+//! pays it, whether it exists, what it pays through, whether its escrow
+//! takes the declared expiry, and whether its settings are the declared
+//! ones.
 
 use alloy::primitives::Address;
-use anyhow::Result;
+use anyhow::{
+    anyhow,
+    Result,
+};
 use libid_contracts::bindings::identity::IdentityRegistry;
 
 use super::{
@@ -13,7 +17,10 @@ use super::{
     Status,
 };
 use crate::{
-    config::Stack,
+    config::{
+        Expiry,
+        Stack,
+    },
     splitter::{
         Change,
         FeeCall,
@@ -85,45 +92,83 @@ impl From<SplitterWiring> for Item {
     }
 }
 
-/// Whether a deployed splitter holds the declared settings, and who can set
-/// them.
+/// Whether the splitter's `setExpiry` takes the declared expiry, checked
+/// against the escrow's refund grace.
+pub(crate) struct SplitterExpiry {
+    /// What the file declares.
+    pub(crate) expiry: Expiry,
+    /// What the check answered.
+    pub(crate) check: Answer<()>,
+}
+
+impl From<SplitterExpiry> for Item {
+    fn from(check: SplitterExpiry) -> Self {
+        let component = "referral_splitter.expiry";
+        match check.check {
+            Ok(()) => Item::new(
+                component,
+                Status::Ok,
+                format!("{}, at least the escrow's refund grace", check.expiry),
+            ),
+            Err(e) => Item::new(
+                component,
+                Status::Warn,
+                format!("{e} — apply stops before its first send"),
+            ),
+        }
+    }
+}
+
+/// Whether a splitter holds the declared settings, and who can set them.
 pub(crate) struct SplitterSettings {
     /// What the file declares.
     pub(crate) declared: Settings,
     /// The key apply signs with.
     pub(crate) deployer: Address,
-    /// What the splitter holds.
-    pub(crate) on_chain: OnChain,
+    /// The splitter's owner.
+    pub(crate) owner: Address,
+    /// What the splitter holds, or holds right after apply deploys it.
+    pub(crate) held: Settings,
+    /// Whether apply deploys the splitter first.
+    pub(crate) deploys: bool,
 }
 
 impl From<SplitterSettings> for Item {
     fn from(check: SplitterSettings) -> Self {
         let component = "referral_splitter.settings";
-        let OnChain {
-            owner, settings, ..
-        } = check.on_chain;
-        let changes = settings.changes_to(&check.declared);
+        let SplitterSettings {
+            declared,
+            deployer,
+            owner,
+            held,
+            deploys,
+        } = check;
+        let holds = if deploys {
+            format!("the constructor sets {held}")
+        } else {
+            format!("{held} on-chain")
+        };
+        let changes = held.changes_to(&declared);
         if changes.is_empty() {
-            return Item::new(component, Status::Ok, settings.to_string());
+            return Item::new(component, Status::Ok, holds);
         }
         let calls = changes
             .iter()
             .map(Change::to_string)
             .collect::<Vec<_>>()
             .join(", ");
-        if owner == check.deployer {
+        if owner == deployer {
             Item::new(
                 component,
                 Status::Configure,
-                format!("{settings} on-chain — apply sends {calls}"),
+                format!("{holds} — apply sends {calls}"),
             )
         } else {
             Item::new(
                 component,
                 Status::Warn,
                 format!(
-                    "{settings} on-chain — apply sends nothing: its owner {owner:#x} \
-                     signs {calls}"
+                    "{holds} — apply sends no setting: its owner {owner:#x} signs {calls}"
                 ),
             )
         }
@@ -136,6 +181,7 @@ impl Planner<'_> {
         &mut self,
         stack: Stack,
         identity_registry_present: bool,
+        handle_escrow_present: bool,
     ) -> Result<()> {
         let Some(splitter) = self.cfg.splitter()? else {
             return Ok(());
@@ -147,21 +193,41 @@ impl Planner<'_> {
                 .map_err(|e| e.to_string());
             self.push(RegistryFeeCall { calls });
         }
-        if !self
-            .code("contracts.referral_splitter", splitter.address)
-            .await?
-        {
-            return Ok(());
+        let expiry = splitter.settings.expiry;
+        if handle_escrow_present && expiry.seconds() != 0 {
+            let check = splitter
+                .check_expiry(&stack, &self.provider)
+                .await
+                .map_err(|e| e.to_string());
+            self.push(SplitterExpiry { expiry, check });
         }
-        match splitter.on_chain(&self.provider).await {
-            Ok(on_chain) => {
-                self.push(SplitterWiring { stack, on_chain });
-                self.push(SplitterSettings {
-                    declared: splitter.settings,
-                    deployer: self.cfg.accounts.deployer_address()?,
-                    on_chain,
-                });
+        let deployer = self.cfg.accounts.deployer_address()?;
+        let present = self
+            .code("contracts.referral_splitter", splitter.address)
+            .await?;
+        let held = if present {
+            match splitter.on_chain(&self.provider).await {
+                Ok(on_chain) => {
+                    self.push(SplitterWiring { stack, on_chain });
+                    Ok((on_chain.owner, on_chain.settings))
+                }
+                Err(e) => Err(e),
             }
+        } else {
+            // Apply deploys it owned by the identity registry's owner, the
+            // deployer on a chain that has no registry yet.
+            self.splitter_owner(stack, identity_registry_present, deployer)
+                .await
+                .map(|owner| (owner, splitter.settings.at_deploy()))
+        };
+        match held {
+            Ok((owner, held)) => self.push(SplitterSettings {
+                declared: splitter.settings,
+                deployer,
+                owner,
+                held,
+                deploys: !present,
+            }),
             Err(e) => self.push(Item::new(
                 "referral_splitter.settings",
                 Status::Warn,
@@ -169,6 +235,23 @@ impl Planner<'_> {
             )),
         }
         Ok(())
+    }
+
+    /// The owner apply deploys the splitter with.
+    async fn splitter_owner(
+        &self,
+        stack: Stack,
+        identity_registry_present: bool,
+        deployer: Address,
+    ) -> Result<Address> {
+        if !identity_registry_present {
+            return Ok(deployer);
+        }
+        IdentityRegistry::new(stack.identity_registry, &self.provider)
+            .owner()
+            .call()
+            .await
+            .map_err(|e| anyhow!("IdentityRegistry.owner read failed: {e}"))
     }
 }
 
@@ -190,16 +273,13 @@ mod tests {
         }
     }
 
-    fn check(owner: Address, settings: Settings) -> Item {
+    fn check(owner: Address, held: Settings) -> Item {
         Item::from(SplitterSettings {
             declared: declared(),
             deployer: DEPLOYER,
-            on_chain: OnChain {
-                registry: Address::repeat_byte(0x01),
-                escrow: Address::repeat_byte(0x02),
-                owner,
-                settings,
-            },
+            owner,
+            held,
+            deploys: false,
         })
     }
 
@@ -236,6 +316,44 @@ mod tests {
         assert!(
             item.detail
                 .contains(&format!("its owner {owner:#x} signs setShare(3000)")),
+            "{}",
+            item.detail
+        );
+    }
+
+    /// A new splitter's expiry is the call apply sends after the deploy.
+    #[test]
+    fn a_new_splitter_lists_the_call_after_its_deploy() {
+        let declared = Settings {
+            expiry: Expiry::from(2_592_000),
+            ..declared()
+        };
+        let item = Item::from(SplitterSettings {
+            declared,
+            deployer: DEPLOYER,
+            owner: DEPLOYER,
+            held: declared.at_deploy(),
+            deploys: true,
+        });
+        assert_eq!(item.status, Status::Configure);
+        assert!(
+            item.detail.starts_with("the constructor sets ")
+                && item.detail.ends_with("apply sends setExpiry(2592000)"),
+            "{}",
+            item.detail
+        );
+    }
+
+    /// An expiry the escrow refuses stops apply.
+    #[test]
+    fn a_refused_expiry_warns() {
+        let item = Item::from(SplitterExpiry {
+            expiry: Expiry::from(86_400),
+            check: Err("under the refund grace".into()),
+        });
+        assert_eq!(item.status, Status::Warn);
+        assert!(
+            item.detail.ends_with("apply stops before its first send"),
             "{}",
             item.detail
         );

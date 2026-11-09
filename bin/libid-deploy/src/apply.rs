@@ -394,7 +394,9 @@ impl<'a> Applier<'a> {
             && identity_registry_present
             && handle_escrow_present
             && jwt_roots_present);
-        needs_factory_deploy |= self.splitter_deploys(identity_registry_present).await?;
+        needs_factory_deploy |= self
+            .splitter_deploys(identity_registry_present, handle_escrow_present)
+            .await?;
         for platform in platforms::LAUNCH {
             let declared = self.cfg.contracts.address(platform.contracts_key)?;
             needs_factory_deploy |= !self.code_present(declared).await?;
@@ -1358,6 +1360,16 @@ mod tests {
                 names::canonical_name(upgrade.contracts_key()).is_some(),
                 "{value} names no canonical contract"
             );
+        }
+    }
+
+    /// Each launch platform's `--upgrade` replaces that platform's
+    /// Platform Verifier.
+    #[test]
+    fn each_platform_names_the_upgrade_of_its_own_verifier() {
+        for platform in platforms::LAUNCH {
+            assert_eq!(platform.upgrade.contracts_key(), platform.contracts_key);
+            assert_eq!(platform.upgrade.contract(), platform.contract());
         }
     }
 

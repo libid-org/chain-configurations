@@ -1,6 +1,5 @@
 //! Deploying the referral splitter and converging its settings.
 
-use alloy::primitives::U256;
 use anyhow::{
     anyhow,
     bail,
@@ -8,7 +7,6 @@ use anyhow::{
 };
 use libid_contracts::{
     bindings::{
-        escrow::HandleEscrow,
         identity::IdentityRegistry,
         referral::ReferralSplitter,
     },
@@ -31,14 +29,19 @@ impl Applier<'_> {
     /// Whether the declared splitter still has to deploy through the
     /// factory. Refuses, before anything is sent, a splitter the identity
     /// registry would never pay: one whose implementation predates
-    /// `bindWithFeeCall` and that this run does not upgrade.
+    /// `bindWithFeeCall` and that this run does not upgrade. Where the
+    /// escrow exists, it also refuses an expiry under its refund grace.
     pub(crate) async fn splitter_deploys(
         &self,
         identity_registry_present: bool,
+        handle_escrow_present: bool,
     ) -> Result<bool> {
         let Some(splitter) = self.cfg.splitter()? else {
             return Ok(false);
         };
+        if handle_escrow_present {
+            splitter.check_expiry(&self.stack, &self.provider).await?;
+        }
         let registry = self.stack.identity_registry;
         if identity_registry_present
             && !self.opts.upgrades.contains(&Upgrade::IdentityRegistry)
@@ -64,6 +67,9 @@ impl Applier<'_> {
             return Ok(());
         };
         let stack = self.stack;
+        // Checked again: on a new chain the escrow deployed in this run, and
+        // an escrow upgrade may move its grace.
+        splitter.check_expiry(&stack, &self.provider).await?;
         if !self.code_present(splitter.address).await? {
             let owner = IdentityRegistry::new(stack.identity_registry, &self.provider)
                 .owner()
@@ -119,26 +125,6 @@ impl Applier<'_> {
                 on_chain.owner
             ));
             return Ok(());
-        }
-
-        // `setExpiry` refuses a nonzero expiry under the escrow's refund
-        // grace: checked before the first call is sent.
-        let expiry = changes.iter().find_map(|change| match change {
-            Change::Expiry(expiry) if expiry.seconds() != 0 => Some(*expiry),
-            _ => None,
-        });
-        if let Some(expiry) = expiry {
-            let grace = HandleEscrow::new(stack.handle_escrow, &self.provider)
-                .REFUND_GRACE()
-                .call()
-                .await
-                .map_err(|e| anyhow!("HandleEscrow.REFUND_GRACE read failed: {e}"))?;
-            if U256::from(expiry.seconds()) < grace {
-                bail!(
-                    "referral_splitter.expiry is {expiry} but the splitter takes none \
-                     under the escrow's refund grace of {grace} seconds"
-                );
-            }
         }
 
         let contract = ReferralSplitter::new(splitter.address, &self.provider);

@@ -19,10 +19,12 @@ use alloy::{
 };
 use anyhow::{
     anyhow,
+    bail,
     Result,
 };
 use libid_contracts::{
     bindings::{
+        escrow::HandleEscrow,
         identity::IdentityRegistry,
         referral::ReferralSplitter,
     },
@@ -48,6 +50,15 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// What a splitter constructed with these settings holds: the
+    /// constructor takes every setting but the expiry.
+    pub fn at_deploy(&self) -> Settings {
+        Settings {
+            expiry: Expiry::default(),
+            ..*self
+        }
+    }
+
     /// The owner calls that move these settings onto `declared`.
     pub fn changes_to(&self, declared: &Settings) -> Vec<Change> {
         [
@@ -130,6 +141,31 @@ impl Splitter {
             .abi_encode(),
         );
         Ok(code.into())
+    }
+
+    /// Refuses a declared expiry the splitter's `setExpiry` reverts on: a
+    /// nonzero one under the refund grace of `stack`'s escrow.
+    pub async fn check_expiry<P: Provider>(
+        &self,
+        stack: &Stack,
+        provider: &P,
+    ) -> Result<()> {
+        let expiry = self.settings.expiry;
+        if expiry.seconds() == 0 {
+            return Ok(());
+        }
+        let grace = HandleEscrow::new(stack.handle_escrow, provider)
+            .REFUND_GRACE()
+            .call()
+            .await
+            .map_err(|e| anyhow!("HandleEscrow.REFUND_GRACE read failed: {e}"))?;
+        if U256::from(expiry.seconds()) < grace {
+            bail!(
+                "referral_splitter.expiry is {expiry} but the splitter takes none under \
+                 the escrow's refund grace of {grace} seconds"
+            );
+        }
+        Ok(())
     }
 
     /// What the chain holds at its address.
@@ -268,5 +304,18 @@ mod tests {
             ]
         );
         assert_eq!(changes[1].to_string(), "setExpiry(2592000)");
+    }
+
+    /// The constructor sets all but the expiry, which stays one call.
+    #[test]
+    fn a_new_splitter_leaves_only_the_expiry_to_set() {
+        let declared = Settings {
+            expiry: Expiry::from(2_592_000),
+            ..settings()
+        };
+        assert_eq!(
+            declared.at_deploy().changes_to(&declared),
+            [Change::Expiry(Expiry::from(2_592_000))]
+        );
     }
 }
