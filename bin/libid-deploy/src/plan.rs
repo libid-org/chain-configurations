@@ -7,11 +7,13 @@
 //! at a WRONG address never reaches the plan: `NetworkConfig::load` rejects
 //! a canonical key that does not equal `predict_address(factory, name)`.
 //! Once the factory exists the plan also diffs its on-chain `deployedAt`
-//! records against the config to surface drift. The declared Safes close
-//! the plan: see [`crate::safes`].
+//! records against the config to surface drift. A declared referral
+//! splitter follows the escrow it pays through ([`crate::splitter`]), and
+//! the declared Safes close the plan: see [`crate::safes`].
 
 mod checks;
 mod safes;
+mod splitter;
 
 use std::collections::BTreeMap;
 
@@ -295,13 +297,15 @@ impl Planner<'_> {
             self.identity_registry(stack.identity_registry, stack.proof_verifier)
                 .await;
         }
-        if self
+        let handle_escrow_present = self
             .code("contracts.handle_escrow", stack.handle_escrow)
-            .await?
-        {
+            .await?;
+        if handle_escrow_present {
             self.handle_escrow(stack.handle_escrow, stack.identity_registry)
                 .await;
         }
+        self.referral_splitter(stack, identity_registry_present)
+            .await?;
         if self
             .code("contracts.google_jwt_roots", stack.jwt_roots)
             .await?
@@ -315,7 +319,7 @@ impl Planner<'_> {
         // carrying the pinned circuits release, known here before the chain
         // has anything on it.
         let mut verifiers: BTreeMap<Circuit, Address> = BTreeMap::new();
-        for circuit in Circuit::ALL {
+        for circuit in platforms::circuits() {
             verifiers.insert(circuit, self.circuit(circuit).await?);
         }
 
@@ -534,11 +538,7 @@ impl Planner<'_> {
     /// table, and its owner against `accounts.owner`.
     async fn factory_records(&mut self, factory: Address) {
         let contract = LibidFactory::new(factory, &self.provider);
-        for &c in names::CANONICAL_CONTRACTS {
-            let Some(declared) = self.cfg.contracts.declared(c.key).and_then(|d| d.get())
-            else {
-                continue;
-            };
+        for (c, declared) in self.cfg.contracts.canonical() {
             let recorded = contract
                 .deployedAt(c.name.to_string())
                 .call()

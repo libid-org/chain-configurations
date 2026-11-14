@@ -23,14 +23,17 @@
 //! notarized session is authenticated through, the Proof Verifier the
 //! identity registry dispatches bindings through, the identity registry
 //! itself, and the Google JWT root list that pays the Notary Service for
-//! each rotation. Two steps that script does not have: the handle escrow,
-//! right after the identity registry it resolves through, and at the end
-//! the ceremony circuits' Honk verifiers and a Platform Verifier per
-//! platform pinned to one of them and registered into the Supported Version
-//! Set, without which the registry accepts no binding for the platform.
-//! The declared Safes come last ([`crate::safes`]).
+//! each rotation. Three steps that script does not have: the handle escrow,
+//! right after the identity registry it resolves through; the referral
+//! splitter, where the network declares one, right after the escrow it pays
+//! through ([`crate::splitter`]); and at the end the ceremony circuits'
+//! Honk verifiers and a Platform Verifier per platform pinned to one of them
+//! and registered into the Supported Version Set, without which the
+//! registry accepts no binding for the platform. The declared Safes come
+//! last ([`crate::safes`]).
 
 mod safes;
+mod splitter;
 
 use std::{
     collections::BTreeMap,
@@ -85,7 +88,6 @@ use libid_contracts::{
         predict_address,
         FactoryGenesis,
     },
-    platform_verifier::PlatformVerifier,
     send_with_nonce_retry,
     Artifacts,
 };
@@ -107,7 +109,10 @@ use crate::{
         Platform,
         LAUNCH_VERIFIER_VERSION,
     },
-    rpc::RpcEndpoint,
+    rpc::{
+        DevChain,
+        RpcEndpoint,
+    },
     signer::SignerSource,
 };
 
@@ -183,16 +188,6 @@ impl Upgrade {
         "github-platform-verifier",
         "google-platform-verifier",
     ];
-}
-
-impl From<PlatformVerifier> for Upgrade {
-    fn from(verifier: PlatformVerifier) -> Self {
-        match verifier {
-            PlatformVerifier::X => Self::XPlatformVerifier,
-            PlatformVerifier::GitHub => Self::GitHubPlatformVerifier,
-            PlatformVerifier::Google => Self::GooglePlatformVerifier,
-        }
-    }
 }
 
 impl fmt::Display for Upgrade {
@@ -399,13 +394,14 @@ impl<'a> Applier<'a> {
             && identity_registry_present
             && handle_escrow_present
             && jwt_roots_present);
+        needs_factory_deploy |= self.splitter_deploys(identity_registry_present).await?;
         for platform in platforms::LAUNCH {
             let declared = self.cfg.contracts.address(platform.contracts_key)?;
             needs_factory_deploy |= !self.code_present(declared).await?;
         }
         // A circuit verifier no Platform Verifier uses yet deploys through
         // the factory too, under a name carrying the pinned circuits release.
-        for circuit in Circuit::ALL {
+        for circuit in platforms::circuits() {
             let site = self.verifiers().site(circuit).await?;
             if let Site::Named { address, .. } = site {
                 needs_factory_deploy |= !self.code_present(address).await?;
@@ -421,6 +417,7 @@ impl<'a> Applier<'a> {
         self.proof_verifier(proof_verifier_present).await?;
         self.identity_registry(identity_registry_present).await?;
         self.handle_escrow(handle_escrow_present).await?;
+        self.referral_splitter().await?;
         self.jwt_roots(jwt_roots_present).await?;
 
         // ── 6. A Platform Verifier per platform, on its circuit's verifier ─
@@ -896,7 +893,7 @@ impl<'a> Applier<'a> {
             tracing::info!(from = %sender, to = %desired, "factory ownership handover initiated");
         }
 
-        if self.is_dev_chain().await? {
+        if self.provider.is_dev_chain().await? {
             // Complete the two-step locally: impersonate the operational
             // owner (e.g. the anvil #0 wallet) and accept.
             self.provider
@@ -930,18 +927,6 @@ impl<'a> Applier<'a> {
             ));
         }
         Ok(())
-    }
-
-    /// Whether the RPC's `web3_clientVersion` reports a dev chain (anvil or
-    /// hardhat).
-    async fn is_dev_chain(&self) -> Result<bool> {
-        let version = self
-            .provider
-            .get_client_version()
-            .await
-            .map_err(|e| anyhow!("web3_clientVersion failed: {e}"))?
-            .to_lowercase();
-        Ok(version.contains("anvil") || version.contains("hardhat"))
     }
 
     /// Make sure the apply signer owns the factory (its `deploy` is
@@ -1203,8 +1188,7 @@ impl<'a> Applier<'a> {
                 format!(
                     "{} pins {wired:#x}; rotating it onto {circuit:#x} takes \
                      --upgrade {} in the same apply",
-                    platform.label,
-                    Upgrade::from(platform.verifier)
+                    platform.label, platform.upgrade
                 )
             })?;
         let verifier = PlatformVerifierBase::new(proxy, &self.provider);
@@ -1374,6 +1358,16 @@ mod tests {
                 names::canonical_name(upgrade.contracts_key()).is_some(),
                 "{value} names no canonical contract"
             );
+        }
+    }
+
+    /// Each launch platform's `--upgrade` replaces that platform's
+    /// Platform Verifier.
+    #[test]
+    fn each_platform_names_the_upgrade_of_its_own_verifier() {
+        for platform in platforms::LAUNCH {
+            assert_eq!(platform.upgrade.contracts_key(), platform.contracts_key);
+            assert_eq!(platform.upgrade.contract(), platform.contract());
         }
     }
 

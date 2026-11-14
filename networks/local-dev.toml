@@ -82,6 +82,8 @@ google_jwt_roots = "0x6d5bc82c9a8a6a05a9319c9e9d5fc43ff80552ac"
 x_platform_verifier = "0x37be0160c6e2e2e089010d178c7be3ee27602628"
 github_platform_verifier = "0x1aafd47fb1e7c68a1c9afc19d06ccccd958cc4d6"
 google_platform_verifier = "0xfcb24d6491120569c91370dd8fa5441adb1d94ee"
+# The fee receiver of a referred bind, set up by [referral_splitter] below.
+referral_splitter = "0xdb87a06a28a5dce92eb19d6aaad886cd58e85af0"
 
 # The ceremony circuit verifiers are NOT declared here. `libid-deploy`
 # carries them: `libid-contracts` embeds each circuit's bb-generated
@@ -92,3 +94,26 @@ google_platform_verifier = "0xfcb24d6491120569c91370dd8fa5441adb1d94ee"
 # hash of its circuit's verifier, so a circuits release with new code is a
 # new name, a new address, an `--upgrade` of the Platform Verifiers and a
 # `setTrustRoots`, with the proxies and their registrations untouched.
+
+# The referral splitter. A referred bind pays its service fee here; the
+# splitter delivers `share_bps` of it to the referrer's handle through the
+# handle escrow and the rest to `treasury`. Its owner is the identity
+# registry's owner, and a held share waits for its referrer.
+[referral_splitter]
+share_bps = 3000
+# 0.00185 native: half the 0.0037 a bind's service fee is on this chain, so
+# every referred bind pays its referrer.
+min_referral_fee_wei = "1850000000000000"
+# The registry_fees Safe below.
+treasury = "0x74b5acb7db366e1b3d205f9499804fbcf2c0cc97"
+
+# Safe multisigs, one per [safes.<name>] table, at the address its name and
+# accounts.deployer predict; see networks/sepolia.toml. A dev chain has no
+# Safe deployment, so apply first installs the Safe v1.4.1 contracts at their
+# canonical addresses with the code Ethereum holds.
+#
+# The treasury of the referral splitter: the handles.link service fee.
+[safes.registry_fees]
+address = "0x74b5acb7db366e1b3d205f9499804fbcf2c0cc97"
+owners = ["0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"]
+threshold = 1
