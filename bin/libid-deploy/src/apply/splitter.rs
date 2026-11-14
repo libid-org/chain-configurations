@@ -135,8 +135,8 @@ impl Applier<'_> {
                     &self.provider,
                     self.sender
                 )?,
-                Change::MinReferralFee(fee) => send_with_nonce_retry!(
-                    contract.setMinReferralFee(fee),
+                Change::Fee(fee) => send_with_nonce_retry!(
+                    contract.setFee(fee),
                     label,
                     &self.provider,
                     self.sender

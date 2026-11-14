@@ -200,10 +200,11 @@ pub struct ReferralSplitter {
     /// The referrer's part of a referred bind's fee, in basis points: 0 to
     /// 10 000.
     pub share_bps: u16,
-    /// A fee below this pays the treasury alone, referral or not, in wei, as
-    /// a decimal string. Below the network's service fee, or no referral
-    /// there pays the referrer.
-    pub min_referral_fee_wei: String,
+    /// What a bind through the splitter pays, referral or not, in wei, as a
+    /// decimal string. The splitter reverts any other amount, and the site
+    /// reads it from the splitter. Above zero: the registry refuses a zero
+    /// fee, so at zero every bind through the splitter reverts.
+    pub fee_wei: String,
     /// Where every part of a fee that is not a delivered share goes.
     pub treasury: DeclaredAddress,
 }
@@ -218,13 +219,21 @@ impl ReferralSplitter {
                 self.share_bps
             );
         }
-        let min_referral_fee = self.min_referral_fee_wei.trim().parse().map_err(|e| {
-            anyhow!("invalid referral_splitter.min_referral_fee_wei: {e}")
-        })?;
+        let fee: U256 = self
+            .fee_wei
+            .trim()
+            .parse()
+            .map_err(|e| anyhow!("invalid referral_splitter.fee_wei: {e}"))?;
+        if fee.is_zero() {
+            bail!(
+                "referral_splitter.fee_wei is 0, and the registry refuses every bind \
+                 that pays the splitter nothing"
+            );
+        }
         Ok(Settings {
             treasury: self.treasury.required("referral_splitter.treasury")?,
             share_bps: self.share_bps,
-            min_referral_fee,
+            fee,
         })
     }
 }
@@ -825,14 +834,10 @@ google_platform_verifier = "{google}"
 
     /// `[referral_splitter]` with `extra` lines, its share and fee
     /// replaceable.
-    fn splitter_table(
-        share_bps: &str,
-        min_referral_fee_wei: &str,
-        extra: &str,
-    ) -> String {
+    fn splitter_table(share_bps: &str, fee_wei: &str, extra: &str) -> String {
         format!(
             "\n[referral_splitter]\nshare_bps = {share_bps}\n\
-             min_referral_fee_wei = \"{min_referral_fee_wei}\"\n\
+             fee_wei = \"{fee_wei}\"\n\
              treasury = \"{SPLITTER_TREASURY}\"\n{extra}"
         )
     }
@@ -851,7 +856,7 @@ google_platform_verifier = "{google}"
     fn a_declared_splitter_loads_its_settings() {
         let text = with_splitter(
             test_splitter(),
-            &splitter_table("3000", "1850000000000000", ""),
+            &splitter_table("3000", "3700000000000000", ""),
         );
         let cfg: NetworkConfig = toml::from_str(&text).unwrap();
         cfg.validate().expect("the splitter validates");
@@ -862,7 +867,7 @@ google_platform_verifier = "{google}"
             Settings {
                 treasury: SPLITTER_TREASURY.parse().unwrap(),
                 share_bps: 3_000,
-                min_referral_fee: U256::from(1_850_000_000_000_000u64),
+                fee: U256::from(3_700_000_000_000_000u64),
             }
         );
     }
@@ -878,7 +883,7 @@ google_platform_verifier = "{google}"
     /// refused at load.
     #[test]
     fn an_unusable_splitter_is_an_error() {
-        let table = splitter_table("3000", "1850000000000000", "");
+        let table = splitter_table("3000", "3700000000000000", "");
         let declared_only = canonical_toml().replace(
             "[contracts]\n",
             &format!(
@@ -893,12 +898,16 @@ google_platform_verifier = "{google}"
             ),
             (declared_only, "[referral_splitter] is missing"),
             (
-                with_splitter(test_splitter(), &splitter_table("10001", "0", "")),
+                with_splitter(test_splitter(), &splitter_table("10001", "1", "")),
                 "share_bps",
             ),
             (
                 with_splitter(test_splitter(), &splitter_table("3000", "1.5", "")),
-                "min_referral_fee_wei",
+                "invalid referral_splitter.fee_wei",
+            ),
+            (
+                with_splitter(test_splitter(), &splitter_table("3000", "0", "")),
+                "referral_splitter.fee_wei is 0",
             ),
             (
                 with_splitter(

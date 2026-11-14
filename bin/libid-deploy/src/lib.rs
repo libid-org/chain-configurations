@@ -13,7 +13,7 @@
 //! `libid-identity` and `libid-profiles`, generated from the same sources
 //! the contracts are. What this crate adds is WHERE things land
 //! ([`names`], [`circuits`]) and the convergence that puts them there,
-//! the referral splitter a referred bind pays ([`splitter`]), and the Safe
+//! the referral splitter a bind pays its fee to ([`splitter`]), and the Safe
 //! multisigs a network holds beside the stack ([`safes`]).
 
 pub mod apply;

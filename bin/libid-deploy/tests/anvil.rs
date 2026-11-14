@@ -1954,20 +1954,19 @@ const OTHER_TREASURY: &str = "0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc";
 const OTHER_OWNER: &str = "0x976EA74026E726554dB657fA54763abd0C3a0aa9";
 // Anvil account #7, the wallet a referred bind binds.
 const BINDER: &str = "0x14dC79964da2C08b23698B3D3cc7Ca32193d9955";
-/// The splitter's minimum referral fee in the test files: half the fee
-/// [`REFERRED_FEE_WEI`].
-const MIN_REFERRAL_FEE_WEI: u64 = 1_850_000_000_000_000;
-/// A referred bind's fee, as a site on a dev chain charges it.
-const REFERRED_FEE_WEI: u64 = 3_700_000_000_000_000;
+/// The fee a bind through the splitter pays in the test files.
+const SPLITTER_FEE_WEI: u64 = 3_700_000_000_000_000;
+/// The fee a later edit of the test files moves the splitter to.
+const OTHER_SPLITTER_FEE_WEI: u64 = 4_000_000_000_000_000;
 
 /// Where the anvil #0 deployer's referral splitter lands.
 fn splitter_address() -> Address {
     predict_address(factory_address(), names::REFERRAL_SPLITTER)
 }
 
-/// Declare in the network file at `path` the referral splitter paying
-/// `treasury` and the referrer `share_bps`.
-fn declare_splitter(path: &Path, treasury: &str, share_bps: u16) {
+/// Declare in the network file at `path` the referral splitter charging
+/// `fee_wei` and paying `treasury` and the referrer `share_bps`.
+fn declare_splitter(path: &Path, treasury: &str, share_bps: u16, fee_wei: u64) {
     let body = std::fs::read_to_string(path).expect("read network file");
     let body = body.replacen(
         "[contracts]\n",
@@ -1980,7 +1979,7 @@ fn declare_splitter(path: &Path, treasury: &str, share_bps: u16) {
         r#"
 [referral_splitter]
 share_bps = {share_bps}
-min_referral_fee_wei = "{MIN_REFERRAL_FEE_WEI}"
+fee_wei = "{fee_wei}"
 treasury = "{treasury}"
 "#
     );
@@ -2049,7 +2048,7 @@ async fn the_referral_splitter_splits_a_referred_fee_between_the_treasury_and_th
     let path = write_network_file(dir.path(), &anvil.endpoint());
     declare_safes(&path, &SAFE_OWNERS, 2);
     let treasury = safe_address("registry_fees");
-    declare_splitter(&path, &format!("{treasury:#x}"), 3_000);
+    declare_splitter(&path, &format!("{treasury:#x}"), 3_000, SPLITTER_FEE_WEI);
     let before = std::fs::read(&path).expect("read config");
     let cfg = NetworkConfig::load(&path).expect("config loads");
     let stack = cfg.contracts.stack().unwrap();
@@ -2099,8 +2098,8 @@ async fn the_referral_splitter_splits_a_referred_fee_between_the_treasury_and_th
     assert_eq!(contract.treasury().call().await.unwrap(), treasury);
     assert_eq!(contract.shareBps().call().await.unwrap(), 3_000);
     assert_eq!(
-        contract.minReferralFee().call().await.unwrap(),
-        U256::from(MIN_REFERRAL_FEE_WEI)
+        contract.fee().call().await.unwrap(),
+        U256::from(SPLITTER_FEE_WEI)
     );
 
     // A fee naming a referrer whose handle nobody holds yet.
@@ -2110,7 +2109,7 @@ async fn the_referral_splitter_splits_a_referred_fee_between_the_treasury_and_th
         .call()
         .await
         .unwrap();
-    let fee = U256::from(REFERRED_FEE_WEI);
+    let fee = U256::from(SPLITTER_FEE_WEI);
     let treasury_before = provider.get_balance(treasury).await.unwrap();
     let receipt = provider
         .send_as(
@@ -2192,7 +2191,7 @@ async fn the_splitter_settings_follow_the_file_while_the_deployer_owns_it() {
     let anvil = spawn_anvil();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = write_network_file(dir.path(), &anvil.endpoint());
-    declare_splitter(&path, TREASURY, 3_000);
+    declare_splitter(&path, TREASURY, 3_000, SPLITTER_FEE_WEI);
     apply_with(
         &path,
         apply::Options {
@@ -2207,7 +2206,7 @@ async fn the_splitter_settings_follow_the_file_while_the_deployer_owns_it() {
     let deployer: Address = ANVIL_OWNER.parse().unwrap();
 
     write_network_file(dir.path(), &anvil.endpoint());
-    declare_splitter(&path, OTHER_TREASURY, 2_500);
+    declare_splitter(&path, OTHER_TREASURY, 2_500, OTHER_SPLITTER_FEE_WEI);
     let cfg = NetworkConfig::load(&path).expect("config loads");
     let drifted = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
     assert_eq!(
@@ -2219,11 +2218,16 @@ async fn the_splitter_settings_follow_the_file_while_the_deployer_owns_it() {
     assert_eq!(
         converged.configured,
         [format!(
-            "referral splitter setTreasury({other_treasury:#x}), setShare(2500)"
+            "referral splitter setTreasury({other_treasury:#x}), setShare(2500), \
+             setFee({OTHER_SPLITTER_FEE_WEI})"
         )]
     );
     assert_eq!(contract.treasury().call().await.unwrap(), other_treasury);
     assert_eq!(contract.shareBps().call().await.unwrap(), 2_500);
+    assert_eq!(
+        contract.fee().call().await.unwrap(),
+        U256::from(OTHER_SPLITTER_FEE_WEI)
+    );
     let again = apply_with(&path, apply::Options::default()).await;
     assert!(again.configured.is_empty(), "{:?}", again.configured);
 
@@ -2248,7 +2252,7 @@ async fn the_splitter_settings_follow_the_file_while_the_deployer_owns_it() {
         )
         .await;
     write_network_file(dir.path(), &anvil.endpoint());
-    declare_splitter(&path, OTHER_TREASURY, 2_000);
+    declare_splitter(&path, OTHER_TREASURY, 2_000, OTHER_SPLITTER_FEE_WEI);
     let cfg = NetworkConfig::load(&path).expect("config loads");
     let plan = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
     let settings = plan
@@ -2323,7 +2327,7 @@ async fn the_splitter_lands_with_the_registry_upgrade_that_pays_it() {
         .await
         .unwrap();
 
-    declare_splitter(&path, TREASURY, 3_000);
+    declare_splitter(&path, TREASURY, 3_000, SPLITTER_FEE_WEI);
     let cfg = NetworkConfig::load(&path).expect("config loads");
     let stale = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
     let fee_call = stale

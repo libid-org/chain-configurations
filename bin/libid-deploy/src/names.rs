@@ -75,8 +75,8 @@ pub const X_PLATFORM_VERIFIER: &str = "libid.XPlatformVerifier.2";
 pub const GITHUB_PLATFORM_VERIFIER: &str = "libid.GitHubPlatformVerifier.2";
 /// The `google/v1` Platform Verifier proxy.
 pub const GOOGLE_PLATFORM_VERIFIER: &str = "libid.GooglePlatformVerifier.2";
-/// The referral splitter: the fee receiver of a referred bind, which pays
-/// the referrer's handle its share through the handle escrow. Not a proxy:
+/// The referral splitter: the fee receiver of a bind, which pays a
+/// referrer's handle its share through the handle escrow. Not a proxy:
 /// its registry and escrow are constructor arguments, so a new version is a
 /// new name.
 pub const REFERRAL_SPLITTER: &str = "libid.ReferralSplitter";

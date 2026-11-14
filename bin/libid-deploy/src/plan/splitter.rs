@@ -227,7 +227,7 @@ mod tests {
         Settings {
             treasury: Address::repeat_byte(0x7e),
             share_bps: 3_000,
-            min_referral_fee: U256::from(1_850_000_000_000_000u64),
+            fee: U256::from(3_700_000_000_000_000u64),
         }
     }
 

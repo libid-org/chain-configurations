@@ -1,6 +1,6 @@
-//! The referral splitter: the fee receiver of a referred bind. It pays the
-//! referrer's handle its share of the fee through the handle escrow and the
-//! treasury the rest. The identity registry and the escrow are constructor
+//! The referral splitter: the fee receiver of a bind, which takes exactly
+//! its fee. With a referral it pays the referrer's handle its share of the
+//! fee through the handle escrow, and the treasury the rest. The identity registry and the escrow are constructor
 //! arguments, fixed for life; its owner, the identity registry's owner when
 //! apply deploys it, keeps the settings below.
 
@@ -38,8 +38,9 @@ pub struct Settings {
     pub treasury: Address,
     /// The referrer's part of a referred fee, in basis points.
     pub share_bps: u16,
-    /// The smallest fee that pays a referrer, in wei.
-    pub min_referral_fee: U256,
+    /// What a bind through the splitter pays, in wei; the splitter reverts
+    /// any other amount.
+    pub fee: U256,
 }
 
 impl Settings {
@@ -50,8 +51,7 @@ impl Settings {
                 .then_some(Change::Treasury(declared.treasury)),
             (self.share_bps != declared.share_bps)
                 .then_some(Change::Share(declared.share_bps)),
-            (self.min_referral_fee != declared.min_referral_fee)
-                .then_some(Change::MinReferralFee(declared.min_referral_fee)),
+            (self.fee != declared.fee).then_some(Change::Fee(declared.fee)),
         ]
         .into_iter()
         .flatten()
@@ -63,8 +63,8 @@ impl fmt::Display for Settings {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "treasury {:#x}, share {} bps, min referral fee {} wei",
-            self.treasury, self.share_bps, self.min_referral_fee
+            "treasury {:#x}, share {} bps, fee {} wei",
+            self.treasury, self.share_bps, self.fee
         )
     }
 }
@@ -76,8 +76,8 @@ pub enum Change {
     Treasury(Address),
     /// `setShare`.
     Share(u16),
-    /// `setMinReferralFee`.
-    MinReferralFee(U256),
+    /// `setFee`.
+    Fee(U256),
 }
 
 impl fmt::Display for Change {
@@ -85,7 +85,7 @@ impl fmt::Display for Change {
         match self {
             Self::Treasury(treasury) => write!(f, "setTreasury({treasury:#x})"),
             Self::Share(share_bps) => write!(f, "setShare({share_bps})"),
-            Self::MinReferralFee(fee) => write!(f, "setMinReferralFee({fee})"),
+            Self::Fee(fee) => write!(f, "setFee({fee})"),
         }
     }
 }
@@ -116,7 +116,7 @@ impl Splitter {
                 owner_: owner,
                 treasury_: self.settings.treasury,
                 shareBps_: self.settings.share_bps,
-                minReferralFee_: self.settings.min_referral_fee,
+                fee_: self.settings.fee,
             }
             .abi_encode(),
         );
@@ -126,26 +126,25 @@ impl Splitter {
     /// What the chain holds at its address.
     pub async fn on_chain<P: Provider>(&self, provider: &P) -> Result<OnChain> {
         let contract = ReferralSplitter::new(self.address, provider);
-        let (registry, escrow, owner, treasury, share_bps, min_referral_fee) = (
+        let (registry, escrow, owner, treasury, share_bps, fee) = (
             contract.REGISTRY(),
             contract.ESCROW(),
             contract.owner(),
             contract.treasury(),
             contract.shareBps(),
-            contract.minReferralFee(),
+            contract.fee(),
         );
-        let (registry, escrow, owner, treasury, share_bps, min_referral_fee) =
-            tokio::try_join!(
-                registry.call(),
-                escrow.call(),
-                owner.call(),
-                treasury.call(),
-                share_bps.call(),
-                min_referral_fee.call(),
-            )
-            .map_err(|e| {
-                anyhow!("ReferralSplitter read at {:#x} failed: {e}", self.address)
-            })?;
+        let (registry, escrow, owner, treasury, share_bps, fee) = tokio::try_join!(
+            registry.call(),
+            escrow.call(),
+            owner.call(),
+            treasury.call(),
+            share_bps.call(),
+            fee.call(),
+        )
+        .map_err(|e| {
+            anyhow!("ReferralSplitter read at {:#x} failed: {e}", self.address)
+        })?;
         Ok(OnChain {
             registry,
             escrow,
@@ -153,7 +152,7 @@ impl Splitter {
             settings: Settings {
                 treasury,
                 share_bps,
-                min_referral_fee,
+                fee,
             },
         })
     }
@@ -228,7 +227,7 @@ mod tests {
         Settings {
             treasury: TREASURY,
             share_bps: 3_000,
-            min_referral_fee: U256::from(1_850_000_000_000_000u64),
+            fee: U256::from(3_700_000_000_000_000u64),
         }
     }
 
@@ -243,17 +242,14 @@ mod tests {
     fn each_differing_setting_is_one_call() {
         let declared = Settings {
             share_bps: 2_500,
-            min_referral_fee: U256::from(1u64),
+            fee: U256::from(1u64),
             ..settings()
         };
         let changes = settings().changes_to(&declared);
         assert_eq!(
             changes,
-            [
-                Change::Share(2_500),
-                Change::MinReferralFee(U256::from(1u64))
-            ]
+            [Change::Share(2_500), Change::Fee(U256::from(1u64))]
         );
-        assert_eq!(changes[1].to_string(), "setMinReferralFee(1)");
+        assert_eq!(changes[1].to_string(), "setFee(1)");
     }
 }
