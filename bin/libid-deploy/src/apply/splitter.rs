@@ -29,19 +29,14 @@ impl Applier<'_> {
     /// Whether the declared splitter still has to deploy through the
     /// factory. Refuses, before anything is sent, a splitter the identity
     /// registry would never pay: one whose implementation predates
-    /// `bindWithFeeCall` and that this run does not upgrade. Where the
-    /// escrow exists, it also refuses an expiry under its refund grace.
+    /// `bindWithFeeCall` and that this run does not upgrade.
     pub(crate) async fn splitter_deploys(
         &self,
         identity_registry_present: bool,
-        handle_escrow_present: bool,
     ) -> Result<bool> {
         let Some(splitter) = self.cfg.splitter()? else {
             return Ok(false);
         };
-        if handle_escrow_present {
-            splitter.check_expiry(&self.stack, &self.provider).await?;
-        }
         let registry = self.stack.identity_registry;
         if identity_registry_present
             && !self.opts.upgrades.contains(&Upgrade::IdentityRegistry)
@@ -67,9 +62,6 @@ impl Applier<'_> {
             return Ok(());
         };
         let stack = self.stack;
-        // Checked again: on a new chain the escrow deployed in this run, and
-        // an escrow upgrade may move its grace.
-        splitter.check_expiry(&stack, &self.provider).await?;
         if !self.code_present(splitter.address).await? {
             let owner = IdentityRegistry::new(stack.identity_registry, &self.provider)
                 .owner()
@@ -145,12 +137,6 @@ impl Applier<'_> {
                 )?,
                 Change::MinReferralFee(fee) => send_with_nonce_retry!(
                     contract.setMinReferralFee(fee),
-                    label,
-                    &self.provider,
-                    self.sender
-                )?,
-                Change::Expiry(expiry) => send_with_nonce_retry!(
-                    contract.setExpiry(expiry.seconds()),
                     label,
                     &self.provider,
                     self.sender

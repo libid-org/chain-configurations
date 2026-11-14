@@ -1,7 +1,6 @@
 //! The plan lines of the referral splitter: whether the identity registry
-//! pays it, whether it exists, what it pays through, whether its escrow
-//! takes the declared expiry, and whether its settings are the declared
-//! ones.
+//! pays it, whether it exists, what it pays through, and whether its
+//! settings are the declared ones.
 
 use alloy::primitives::Address;
 use anyhow::{
@@ -17,10 +16,7 @@ use super::{
     Status,
 };
 use crate::{
-    config::{
-        Expiry,
-        Stack,
-    },
+    config::Stack,
     splitter::{
         Change,
         FeeCall,
@@ -92,33 +88,6 @@ impl From<SplitterWiring> for Item {
     }
 }
 
-/// Whether the splitter's `setExpiry` takes the declared expiry, checked
-/// against the escrow's refund grace.
-pub(crate) struct SplitterExpiry {
-    /// What the file declares.
-    pub(crate) expiry: Expiry,
-    /// What the check answered.
-    pub(crate) check: Answer<()>,
-}
-
-impl From<SplitterExpiry> for Item {
-    fn from(check: SplitterExpiry) -> Self {
-        let component = "referral_splitter.expiry";
-        match check.check {
-            Ok(()) => Item::new(
-                component,
-                Status::Ok,
-                format!("{}, at least the escrow's refund grace", check.expiry),
-            ),
-            Err(e) => Item::new(
-                component,
-                Status::Warn,
-                format!("{e} — apply stops before its first send"),
-            ),
-        }
-    }
-}
-
 /// Whether a splitter holds the declared settings, and who can set them.
 pub(crate) struct SplitterSettings {
     /// What the file declares.
@@ -181,7 +150,6 @@ impl Planner<'_> {
         &mut self,
         stack: Stack,
         identity_registry_present: bool,
-        handle_escrow_present: bool,
     ) -> Result<()> {
         let Some(splitter) = self.cfg.splitter()? else {
             return Ok(());
@@ -192,14 +160,6 @@ impl Planner<'_> {
                 .await
                 .map_err(|e| e.to_string());
             self.push(RegistryFeeCall { calls });
-        }
-        let expiry = splitter.settings.expiry;
-        if handle_escrow_present && expiry.seconds() != 0 {
-            let check = splitter
-                .check_expiry(&stack, &self.provider)
-                .await
-                .map_err(|e| e.to_string());
-            self.push(SplitterExpiry { expiry, check });
         }
         let deployer = self.cfg.accounts.deployer_address()?;
         let present = self
@@ -218,7 +178,7 @@ impl Planner<'_> {
             // deployer on a chain that has no registry yet.
             self.splitter_owner(stack, identity_registry_present, deployer)
                 .await
-                .map(|owner| (owner, splitter.settings.at_deploy()))
+                .map(|owner| (owner, splitter.settings))
         };
         match held {
             Ok((owner, held)) => self.push(SplitterSettings {
@@ -260,7 +220,6 @@ mod tests {
     use alloy::primitives::U256;
 
     use super::*;
-    use crate::config::Expiry;
 
     const DEPLOYER: Address = Address::repeat_byte(0xdd);
 
@@ -269,7 +228,6 @@ mod tests {
             treasury: Address::repeat_byte(0x7e),
             share_bps: 3_000,
             min_referral_fee: U256::from(1_850_000_000_000_000u64),
-            expiry: Expiry::default(),
         }
     }
 
@@ -321,39 +279,19 @@ mod tests {
         );
     }
 
-    /// A new splitter's expiry is the call apply sends after the deploy.
+    /// A new splitter's constructor sets every declared setting.
     #[test]
-    fn a_new_splitter_lists_the_call_after_its_deploy() {
-        let declared = Settings {
-            expiry: Expiry::from(2_592_000),
-            ..declared()
-        };
+    fn a_new_splitter_needs_no_call_after_its_deploy() {
         let item = Item::from(SplitterSettings {
-            declared,
+            declared: declared(),
             deployer: DEPLOYER,
             owner: DEPLOYER,
-            held: declared.at_deploy(),
+            held: declared(),
             deploys: true,
         });
-        assert_eq!(item.status, Status::Configure);
+        assert_eq!(item.status, Status::Ok);
         assert!(
-            item.detail.starts_with("the constructor sets ")
-                && item.detail.ends_with("apply sends setExpiry(2592000)"),
-            "{}",
-            item.detail
-        );
-    }
-
-    /// An expiry the escrow refuses stops apply.
-    #[test]
-    fn a_refused_expiry_warns() {
-        let item = Item::from(SplitterExpiry {
-            expiry: Expiry::from(86_400),
-            check: Err("under the refund grace".into()),
-        });
-        assert_eq!(item.status, Status::Warn);
-        assert!(
-            item.detail.ends_with("apply stops before its first send"),
+            item.detail.starts_with("the constructor sets "),
             "{}",
             item.detail
         );

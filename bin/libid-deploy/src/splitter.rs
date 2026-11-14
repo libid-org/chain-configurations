@@ -19,22 +19,17 @@ use alloy::{
 };
 use anyhow::{
     anyhow,
-    bail,
     Result,
 };
 use libid_contracts::{
     bindings::{
-        escrow::HandleEscrow,
         identity::IdentityRegistry,
         referral::ReferralSplitter,
     },
     Artifacts,
 };
 
-use crate::config::{
-    Expiry,
-    Stack,
-};
+use crate::config::Stack;
 
 /// The settings a splitter's owner changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,20 +40,9 @@ pub struct Settings {
     pub share_bps: u16,
     /// The smallest fee that pays a referrer, in wei.
     pub min_referral_fee: U256,
-    /// How long a held share waits for its node's holder.
-    pub expiry: Expiry,
 }
 
 impl Settings {
-    /// What a splitter constructed with these settings holds: the
-    /// constructor takes every setting but the expiry.
-    pub fn at_deploy(&self) -> Settings {
-        Settings {
-            expiry: Expiry::default(),
-            ..*self
-        }
-    }
-
     /// The owner calls that move these settings onto `declared`.
     pub fn changes_to(&self, declared: &Settings) -> Vec<Change> {
         [
@@ -68,7 +52,6 @@ impl Settings {
                 .then_some(Change::Share(declared.share_bps)),
             (self.min_referral_fee != declared.min_referral_fee)
                 .then_some(Change::MinReferralFee(declared.min_referral_fee)),
-            (self.expiry != declared.expiry).then_some(Change::Expiry(declared.expiry)),
         ]
         .into_iter()
         .flatten()
@@ -80,8 +63,8 @@ impl fmt::Display for Settings {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "treasury {:#x}, share {} bps, min referral fee {} wei, expiry {}",
-            self.treasury, self.share_bps, self.min_referral_fee, self.expiry
+            "treasury {:#x}, share {} bps, min referral fee {} wei",
+            self.treasury, self.share_bps, self.min_referral_fee
         )
     }
 }
@@ -95,8 +78,6 @@ pub enum Change {
     Share(u16),
     /// `setMinReferralFee`.
     MinReferralFee(U256),
-    /// `setExpiry`.
-    Expiry(Expiry),
 }
 
 impl fmt::Display for Change {
@@ -105,7 +86,6 @@ impl fmt::Display for Change {
             Self::Treasury(treasury) => write!(f, "setTreasury({treasury:#x})"),
             Self::Share(share_bps) => write!(f, "setShare({share_bps})"),
             Self::MinReferralFee(fee) => write!(f, "setMinReferralFee({fee})"),
-            Self::Expiry(expiry) => write!(f, "setExpiry({})", expiry.seconds()),
         }
     }
 }
@@ -143,44 +123,18 @@ impl Splitter {
         Ok(code.into())
     }
 
-    /// Refuses a declared expiry the splitter's `setExpiry` reverts on: a
-    /// nonzero one under the refund grace of `stack`'s escrow.
-    pub async fn check_expiry<P: Provider>(
-        &self,
-        stack: &Stack,
-        provider: &P,
-    ) -> Result<()> {
-        let expiry = self.settings.expiry;
-        if expiry.seconds() == 0 {
-            return Ok(());
-        }
-        let grace = HandleEscrow::new(stack.handle_escrow, provider)
-            .REFUND_GRACE()
-            .call()
-            .await
-            .map_err(|e| anyhow!("HandleEscrow.REFUND_GRACE read failed: {e}"))?;
-        if U256::from(expiry.seconds()) < grace {
-            bail!(
-                "referral_splitter.expiry is {expiry} but the splitter takes none under \
-                 the escrow's refund grace of {grace} seconds"
-            );
-        }
-        Ok(())
-    }
-
     /// What the chain holds at its address.
     pub async fn on_chain<P: Provider>(&self, provider: &P) -> Result<OnChain> {
         let contract = ReferralSplitter::new(self.address, provider);
-        let (registry, escrow, owner, treasury, share_bps, min_referral_fee, expiry) = (
+        let (registry, escrow, owner, treasury, share_bps, min_referral_fee) = (
             contract.REGISTRY(),
             contract.ESCROW(),
             contract.owner(),
             contract.treasury(),
             contract.shareBps(),
             contract.minReferralFee(),
-            contract.expiry(),
         );
-        let (registry, escrow, owner, treasury, share_bps, min_referral_fee, expiry) =
+        let (registry, escrow, owner, treasury, share_bps, min_referral_fee) =
             tokio::try_join!(
                 registry.call(),
                 escrow.call(),
@@ -188,7 +142,6 @@ impl Splitter {
                 treasury.call(),
                 share_bps.call(),
                 min_referral_fee.call(),
-                expiry.call(),
             )
             .map_err(|e| {
                 anyhow!("ReferralSplitter read at {:#x} failed: {e}", self.address)
@@ -201,7 +154,6 @@ impl Splitter {
                 treasury,
                 share_bps,
                 min_referral_fee,
-                expiry: expiry.into(),
             },
         })
     }
@@ -277,7 +229,6 @@ mod tests {
             treasury: TREASURY,
             share_bps: 3_000,
             min_referral_fee: U256::from(1_850_000_000_000_000u64),
-            expiry: Expiry::default(),
         }
     }
 
@@ -292,7 +243,7 @@ mod tests {
     fn each_differing_setting_is_one_call() {
         let declared = Settings {
             share_bps: 2_500,
-            expiry: Expiry::from(2_592_000),
+            min_referral_fee: U256::from(1u64),
             ..settings()
         };
         let changes = settings().changes_to(&declared);
@@ -300,22 +251,9 @@ mod tests {
             changes,
             [
                 Change::Share(2_500),
-                Change::Expiry(Expiry::from(2_592_000))
+                Change::MinReferralFee(U256::from(1u64))
             ]
         );
-        assert_eq!(changes[1].to_string(), "setExpiry(2592000)");
-    }
-
-    /// The constructor sets all but the expiry, which stays one call.
-    #[test]
-    fn a_new_splitter_leaves_only_the_expiry_to_set() {
-        let declared = Settings {
-            expiry: Expiry::from(2_592_000),
-            ..settings()
-        };
-        assert_eq!(
-            declared.at_deploy().changes_to(&declared),
-            [Change::Expiry(Expiry::from(2_592_000))]
-        );
+        assert_eq!(changes[1].to_string(), "setMinReferralFee(1)");
     }
 }

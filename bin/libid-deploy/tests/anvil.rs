@@ -1966,15 +1966,9 @@ fn splitter_address() -> Address {
 }
 
 /// Declare in the network file at `path` the referral splitter paying
-/// `treasury` and the referrer `share_bps`, holding a share for `expiry`
-/// (blank: for good).
-fn declare_splitter(path: &Path, treasury: &str, share_bps: u16, expiry: &str) {
+/// `treasury` and the referrer `share_bps`.
+fn declare_splitter(path: &Path, treasury: &str, share_bps: u16) {
     let body = std::fs::read_to_string(path).expect("read network file");
-    let expiry = if expiry.is_empty() {
-        String::new()
-    } else {
-        format!("expiry = \"{expiry}\"\n")
-    };
     let body = body.replacen(
         "[contracts]\n",
         &format!(
@@ -1988,7 +1982,7 @@ fn declare_splitter(path: &Path, treasury: &str, share_bps: u16, expiry: &str) {
 share_bps = {share_bps}
 min_referral_fee_wei = "{MIN_REFERRAL_FEE_WEI}"
 treasury = "{treasury}"
-{expiry}"#
+"#
     );
     std::fs::write(path, body).expect("write network file");
 }
@@ -2055,7 +2049,7 @@ async fn the_referral_splitter_splits_a_referred_fee_between_the_treasury_and_th
     let path = write_network_file(dir.path(), &anvil.endpoint());
     declare_safes(&path, &SAFE_OWNERS, 2);
     let treasury = safe_address("registry_fees");
-    declare_splitter(&path, &format!("{treasury:#x}"), 3_000, "");
+    declare_splitter(&path, &format!("{treasury:#x}"), 3_000);
     let before = std::fs::read(&path).expect("read config");
     let cfg = NetworkConfig::load(&path).expect("config loads");
     let stack = cfg.contracts.stack().unwrap();
@@ -2108,7 +2102,6 @@ async fn the_referral_splitter_splits_a_referred_fee_between_the_treasury_and_th
         contract.minReferralFee().call().await.unwrap(),
         U256::from(MIN_REFERRAL_FEE_WEI)
     );
-    assert_eq!(contract.expiry().call().await.unwrap(), 0);
 
     // A fee naming a referrer whose handle nobody holds yet.
     let x = platforms::platform_id(platforms::X.key);
@@ -2191,16 +2184,15 @@ async fn the_referral_splitter_splits_a_referred_fee_between_the_treasury_and_th
 }
 
 /// The splitter's settings follow the file while the deployer owns it: a
-/// new treasury, share and expiry are sent and the next apply sends
-/// nothing; an expiry under the escrow's refund grace is refused before any
-/// call; once another key owns the splitter, apply names the calls that key
-/// signs and sends nothing.
+/// new treasury and share are sent and the next apply sends nothing; once
+/// another key owns the splitter, apply names the calls that key signs and
+/// sends nothing.
 #[tokio::test]
 async fn the_splitter_settings_follow_the_file_while_the_deployer_owns_it() {
     let anvil = spawn_anvil();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = write_network_file(dir.path(), &anvil.endpoint());
-    declare_splitter(&path, TREASURY, 3_000, "");
+    declare_splitter(&path, TREASURY, 3_000);
     apply_with(
         &path,
         apply::Options {
@@ -2215,7 +2207,7 @@ async fn the_splitter_settings_follow_the_file_while_the_deployer_owns_it() {
     let deployer: Address = ANVIL_OWNER.parse().unwrap();
 
     write_network_file(dir.path(), &anvil.endpoint());
-    declare_splitter(&path, OTHER_TREASURY, 2_500, "30days");
+    declare_splitter(&path, OTHER_TREASURY, 2_500);
     let cfg = NetworkConfig::load(&path).expect("config loads");
     let drifted = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
     assert_eq!(
@@ -2227,34 +2219,13 @@ async fn the_splitter_settings_follow_the_file_while_the_deployer_owns_it() {
     assert_eq!(
         converged.configured,
         [format!(
-            "referral splitter setTreasury({other_treasury:#x}), setShare(2500), \
-             setExpiry(2592000)"
+            "referral splitter setTreasury({other_treasury:#x}), setShare(2500)"
         )]
     );
     assert_eq!(contract.treasury().call().await.unwrap(), other_treasury);
     assert_eq!(contract.shareBps().call().await.unwrap(), 2_500);
-    assert_eq!(contract.expiry().call().await.unwrap(), 2_592_000);
     let again = apply_with(&path, apply::Options::default()).await;
     assert!(again.configured.is_empty(), "{:?}", again.configured);
-
-    // A day is under the escrow's 30-day refund grace.
-    write_network_file(dir.path(), &anvil.endpoint());
-    declare_splitter(&path, OTHER_TREASURY, 2_500, "1day");
-    let cfg = NetworkConfig::load(&path).expect("config loads");
-    let nonce = provider.get_transaction_count(deployer).await.unwrap();
-    let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
-    let err = Applier::connect(&cfg, &file_rpc(&cfg), &signer, apply::Options::default())
-        .await
-        .expect("apply connects")
-        .run(&path)
-        .await
-        .expect_err("an expiry under the refund grace")
-        .to_string();
-    assert!(err.contains("refund grace"), "got: {err}");
-    assert_eq!(
-        provider.get_transaction_count(deployer).await.unwrap(),
-        nonce
-    );
 
     // Handed to another key, which accepts.
     let other_owner: Address = OTHER_OWNER.parse().unwrap();
@@ -2277,7 +2248,7 @@ async fn the_splitter_settings_follow_the_file_while_the_deployer_owns_it() {
         )
         .await;
     write_network_file(dir.path(), &anvil.endpoint());
-    declare_splitter(&path, OTHER_TREASURY, 2_000, "30days");
+    declare_splitter(&path, OTHER_TREASURY, 2_000);
     let cfg = NetworkConfig::load(&path).expect("config loads");
     let plan = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
     let settings = plan
@@ -2312,9 +2283,8 @@ async fn the_splitter_settings_follow_the_file_while_the_deployer_owns_it() {
 /// A network gaining the splitter over an identity registry whose
 /// implementation predates `bindWithFeeCall`, as every live one does: the
 /// plan names the upgrade, apply refuses before sending anything, so does
-/// the apply with the upgrade while the expiry is under the escrow's refund
-/// grace, and one apply with `--upgrade identity-registry` upgrades the
-/// registry and deploys the splitter. A NotaryService implementation stands in for the
+/// and one apply with `--upgrade identity-registry` upgrades the registry
+/// and deploys the splitter. A NotaryService implementation stands in for the
 /// old registry: it answers no `bindWithFeeCall` and keeps the owner.
 #[tokio::test]
 async fn the_splitter_lands_with_the_registry_upgrade_that_pays_it() {
@@ -2353,7 +2323,7 @@ async fn the_splitter_lands_with_the_registry_upgrade_that_pays_it() {
         .await
         .unwrap();
 
-    declare_splitter(&path, TREASURY, 3_000, "");
+    declare_splitter(&path, TREASURY, 3_000);
     let cfg = NetworkConfig::load(&path).expect("config loads");
     let stale = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
     let fee_call = stale
@@ -2385,34 +2355,6 @@ async fn the_splitter_lands_with_the_registry_upgrade_that_pays_it() {
     assert!(err.contains("predates bindWithFeeCall"), "got: {err}");
     assert_eq!(owned.get_transaction_count(deployer).await.unwrap(), nonce);
 
-    write_network_file(dir.path(), &anvil.endpoint());
-    declare_splitter(&path, TREASURY, 3_000, "1day");
-    let short = NetworkConfig::load(&path).expect("config loads");
-    let plan = Plan::build(&short, &file_rpc(&short)).await.expect("plan");
-    assert_eq!(
-        plan.status_of("referral_splitter.expiry"),
-        Some(Status::Warn)
-    );
-    let err = Applier::connect(
-        &short,
-        &file_rpc(&short),
-        &signer,
-        apply::Options {
-            upgrades: vec!["identity-registry".parse().unwrap()],
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("apply connects")
-    .run(&path)
-    .await
-    .expect_err("an expiry under the refund grace")
-    .to_string();
-    assert!(err.contains("refund grace"), "got: {err}");
-    assert_eq!(owned.get_transaction_count(deployer).await.unwrap(), nonce);
-    write_network_file(dir.path(), &anvil.endpoint());
-    declare_splitter(&path, TREASURY, 3_000, "");
-
     let upgraded = apply_with(
         &path,
         apply::Options {
@@ -2434,78 +2376,6 @@ async fn the_splitter_lands_with_the_registry_upgrade_that_pays_it() {
     assert_eq!(
         settled.status_of("identity_registry.fee_call"),
         Some(Status::Ok)
-    );
-}
-
-/// A virgin chain declaring an expiry under the escrow's refund grace: the
-/// plan shows the `setExpiry` apply sends after the splitter deploys, apply
-/// refuses before the splitter deploys, and once the file is fixed the next
-/// apply deploys the splitter and sets its expiry.
-#[tokio::test]
-async fn a_virgin_chain_refuses_a_short_expiry_before_the_splitter_deploys() {
-    let anvil = spawn_anvil();
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = write_network_file(dir.path(), &anvil.endpoint());
-    declare_splitter(&path, TREASURY, 3_000, "1day");
-    let cfg = NetworkConfig::load(&path).expect("config loads");
-    let virgin = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
-    let settings = virgin
-        .items
-        .iter()
-        .find(|i| i.component == "referral_splitter.settings")
-        .expect("the settings line");
-    assert_eq!(settings.status, Status::Configure);
-    assert!(
-        settings.detail.ends_with("apply sends setExpiry(86400)"),
-        "{}",
-        settings.detail
-    );
-
-    let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
-    let err = Applier::connect(
-        &cfg,
-        &file_rpc(&cfg),
-        &signer,
-        apply::Options {
-            confirm_fresh_deploy: true,
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("apply connects")
-    .run(&path)
-    .await
-    .expect_err("an expiry under the refund grace")
-    .to_string();
-    assert!(err.contains("refund grace"), "got: {err}");
-    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
-    let splitter = splitter_address();
-    assert!(provider.get_code_at(splitter).await.unwrap().is_empty());
-
-    write_network_file(dir.path(), &anvil.endpoint());
-    declare_splitter(&path, TREASURY, 3_000, "30days");
-    let fixed = apply_with(&path, apply::Options::default()).await;
-    assert!(
-        fixed
-            .deployed
-            .contains(&("contracts.referral_splitter".to_string(), splitter)),
-        "{:?}",
-        fixed.deployed
-    );
-    assert!(
-        fixed
-            .configured
-            .contains(&"referral splitter setExpiry(2592000)".to_string()),
-        "{:?}",
-        fixed.configured
-    );
-    assert_eq!(
-        ReferralSplitter::new(splitter, &provider)
-            .expiry()
-            .call()
-            .await
-            .unwrap(),
-        2_592_000
     );
 }
 

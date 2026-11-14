@@ -13,7 +13,6 @@ use std::{
     fmt,
     path::Path,
     str::FromStr,
-    time::Duration,
 };
 
 use alloy::{
@@ -207,10 +206,6 @@ pub struct ReferralSplitter {
     pub min_referral_fee_wei: String,
     /// Where every part of a fee that is not a delivered share goes.
     pub treasury: DeclaredAddress,
-    /// How long after its last deposit a share held for a node nobody holds
-    /// may be returned to the treasury. Absent keeps it for the referrer.
-    #[serde(default)]
-    pub expiry: Expiry,
 }
 
 impl ReferralSplitter {
@@ -230,58 +225,7 @@ impl ReferralSplitter {
             treasury: self.treasury.required("referral_splitter.treasury")?,
             share_bps: self.share_bps,
             min_referral_fee,
-            expiry: self.expiry,
         })
-    }
-}
-
-/// A splitter's expiry: a whole number of seconds, written as a duration
-/// (`30days`). Zero, the default, returns nothing to the treasury.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "String")]
-pub struct Expiry(Duration);
-
-impl Expiry {
-    /// The value `setExpiry` takes.
-    pub fn seconds(self) -> u64 {
-        self.0.as_secs()
-    }
-}
-
-impl From<u64> for Expiry {
-    fn from(seconds: u64) -> Self {
-        Self(Duration::from_secs(seconds))
-    }
-}
-
-impl FromStr for Expiry {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        let duration = humantime::parse_duration(s.trim())
-            .map_err(|e| anyhow!("invalid expiry '{s}': {e}"))?;
-        if duration.subsec_nanos() != 0 {
-            bail!("expiry '{s}' is not a whole number of seconds");
-        }
-        Ok(Self(duration))
-    }
-}
-
-impl TryFrom<String> for Expiry {
-    type Error = anyhow::Error;
-
-    fn try_from(value: String) -> Result<Self> {
-        value.parse()
-    }
-}
-
-impl fmt::Display for Expiry {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0.is_zero() {
-            f.write_str("none")
-        } else {
-            write!(f, "{}", humantime::format_duration(self.0))
-        }
     }
 }
 
@@ -902,13 +846,12 @@ google_platform_verifier = "{google}"
         ) + table
     }
 
-    /// A declared splitter loads its settings: the fee as decimal wei, the
-    /// expiry as a duration.
+    /// A declared splitter loads its settings, the fee as decimal wei.
     #[test]
     fn a_declared_splitter_loads_its_settings() {
         let text = with_splitter(
             test_splitter(),
-            &splitter_table("3000", "1850000000000000", "expiry = \"30days\"\n"),
+            &splitter_table("3000", "1850000000000000", ""),
         );
         let cfg: NetworkConfig = toml::from_str(&text).unwrap();
         cfg.validate().expect("the splitter validates");
@@ -920,22 +863,15 @@ google_platform_verifier = "{google}"
                 treasury: SPLITTER_TREASURY.parse().unwrap(),
                 share_bps: 3_000,
                 min_referral_fee: U256::from(1_850_000_000_000_000u64),
-                expiry: Expiry::from(2_592_000),
             }
         );
     }
 
-    /// A network without a splitter has none, and a splitter without an
-    /// expiry keeps shares for their referrer.
+    /// A network without a splitter has none.
     #[test]
-    fn the_splitter_and_its_expiry_are_optional() {
+    fn the_splitter_is_optional() {
         let cfg: NetworkConfig = toml::from_str(&canonical_toml()).unwrap();
         assert!(cfg.splitter().unwrap().is_none());
-        let text = with_splitter(test_splitter(), &splitter_table("0", "0", ""));
-        let cfg: NetworkConfig = toml::from_str(&text).unwrap();
-        let splitter = cfg.splitter().unwrap().expect("declared");
-        assert_eq!(splitter.settings.expiry.seconds(), 0);
-        assert_eq!(splitter.settings.expiry.to_string(), "none");
     }
 
     /// A splitter the chain would refuse, or that names no address, is
@@ -980,15 +916,6 @@ google_platform_verifier = "{google}"
             let err = cfg.validate().unwrap_err().to_string();
             assert!(err.contains(needle), "{needle}: {err}");
         }
-    }
-
-    /// An expiry is whole seconds, written as a duration.
-    #[test]
-    fn an_expiry_parses_as_whole_seconds() {
-        assert_eq!("30days".parse::<Expiry>().unwrap().seconds(), 2_592_000);
-        assert_eq!("30days".parse::<Expiry>().unwrap().to_string(), "30days");
-        assert!("1500ms".parse::<Expiry>().is_err());
-        assert!("soon".parse::<Expiry>().is_err());
     }
 
     /// An empty canonical key is an error naming the fill-in value.

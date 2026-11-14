@@ -304,7 +304,7 @@ impl Planner<'_> {
             self.handle_escrow(stack.handle_escrow, stack.identity_registry)
                 .await;
         }
-        self.referral_splitter(stack, identity_registry_present, handle_escrow_present)
+        self.referral_splitter(stack, identity_registry_present)
             .await?;
         if self
             .code("contracts.google_jwt_roots", stack.jwt_roots)

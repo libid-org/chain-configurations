@@ -98,8 +98,7 @@ referral_splitter = "0xdb87a06a28a5dce92eb19d6aaad886cd58e85af0"
 # The referral splitter. A referred bind pays its service fee here; the
 # splitter delivers `share_bps` of it to the referrer's handle through the
 # handle escrow and the rest to `treasury`. Its owner is the identity
-# registry's owner, and no expiry is set: a held share waits for its
-# referrer.
+# registry's owner, and a held share waits for its referrer.
 [referral_splitter]
 share_bps = 3000
 # 0.00185 native: half the 0.0037 a bind's service fee is on this chain, so

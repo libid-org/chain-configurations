@@ -394,9 +394,7 @@ impl<'a> Applier<'a> {
             && identity_registry_present
             && handle_escrow_present
             && jwt_roots_present);
-        needs_factory_deploy |= self
-            .splitter_deploys(identity_registry_present, handle_escrow_present)
-            .await?;
+        needs_factory_deploy |= self.splitter_deploys(identity_registry_present).await?;
         for platform in platforms::LAUNCH {
             let declared = self.cfg.contracts.address(platform.contracts_key)?;
             needs_factory_deploy |= !self.code_present(declared).await?;
