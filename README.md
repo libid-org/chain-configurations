@@ -85,9 +85,10 @@ the registry's `bindWithFeeCall` pays it the service fee through
 referral it delivers `share_bps` of the fee to the referrer's handle
 through the escrow, and the rest goes to the treasury. It is not a proxy:
 the registry and the escrow are constructor arguments, fixed for life, and
-its owner is the identity registry's owner when apply deploys it. A registry implementation that predates `bindWithFeeCall` never pays
-it, so apply refuses to deploy the splitter over one unless the same run
-upgrades the registry (`--upgrade identity-registry`).
+its owner is the identity registry's owner when apply deploys it. A
+registry implementation that predates `bindWithFeeCall` never pays it, so
+apply refuses to deploy the splitter over one unless the same run upgrades
+the registry (`--upgrade identity-registry`).
 
 ## The ceremony contracts
 

@@ -2183,9 +2183,9 @@ async fn the_referral_splitter_splits_a_referred_fee_between_the_treasury_and_th
 }
 
 /// The splitter's settings follow the file while the deployer owns it: a
-/// new treasury and share are sent and the next apply sends nothing; once
-/// another key owns the splitter, apply names the calls that key signs and
-/// sends nothing.
+/// new treasury, share and fee are sent and the next apply sends nothing;
+/// once another key owns the splitter, apply names the calls that key signs
+/// and sends nothing.
 #[tokio::test]
 async fn the_splitter_settings_follow_the_file_while_the_deployer_owns_it() {
     let anvil = spawn_anvil();
@@ -2286,9 +2286,9 @@ async fn the_splitter_settings_follow_the_file_while_the_deployer_owns_it() {
 
 /// A network gaining the splitter over an identity registry whose
 /// implementation predates `bindWithFeeCall`, as every live one does: the
-/// plan names the upgrade, apply refuses before sending anything, so does
-/// and one apply with `--upgrade identity-registry` upgrades the registry
-/// and deploys the splitter. A NotaryService implementation stands in for the
+/// plan names the upgrade, apply refuses before sending anything, and one
+/// apply with `--upgrade identity-registry` upgrades the registry and
+/// deploys the splitter. A NotaryService implementation stands in for the
 /// old registry: it answers no `bindWithFeeCall` and keeps the owner.
 #[tokio::test]
 async fn the_splitter_lands_with_the_registry_upgrade_that_pays_it() {

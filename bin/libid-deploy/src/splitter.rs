@@ -1,8 +1,9 @@
 //! The referral splitter: the fee receiver of a bind, which takes exactly
 //! its fee. With a referral it pays the referrer's handle its share of the
-//! fee through the handle escrow, and the treasury the rest. The identity registry and the escrow are constructor
-//! arguments, fixed for life; its owner, the identity registry's owner when
-//! apply deploys it, keeps the settings below.
+//! fee through the handle escrow, and the treasury the rest. The identity
+//! registry and the escrow are constructor arguments, fixed for life; its
+//! owner, the identity registry's owner when apply deploys it, keeps the
+//! settings below.
 
 use std::fmt;
 
