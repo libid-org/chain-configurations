@@ -12,6 +12,7 @@
 //! moves: the declared chain id is enforced against whatever answers, and
 //! every address stays a function of the file's declarations.
 
+use alloy::providers::Provider;
 use anyhow::{
     anyhow,
     bail,
@@ -21,6 +22,24 @@ use anyhow::{
 use url::Url;
 
 use crate::config::NetworkConfig;
+
+/// What kind of node answers: a dev chain (anvil or hardhat) takes the
+/// cheat calls apply makes there and nowhere else.
+pub(crate) trait DevChain {
+    /// Whether `web3_clientVersion` reports anvil or hardhat.
+    async fn is_dev_chain(&self) -> Result<bool>;
+}
+
+impl<P: Provider> DevChain for P {
+    async fn is_dev_chain(&self) -> Result<bool> {
+        let version = self
+            .get_client_version()
+            .await
+            .map_err(|e| anyhow!("web3_clientVersion failed: {e}"))?
+            .to_lowercase();
+        Ok(version.contains("anvil") || version.contains("hardhat"))
+    }
+}
 
 /// Parse an HTTP(S) JSON-RPC URL; `label` names its source in the error.
 /// The transport is HTTP only, so any other scheme is rejected here rather

@@ -11,11 +11,14 @@ use super::{
     Planner,
     Status,
 };
-use crate::safes::{
-    OwnerSet,
-    Safe,
-    SafeContract,
-    SAFE_CONTRACTS,
+use crate::{
+    rpc::DevChain,
+    safes::{
+        OwnerSet,
+        Safe,
+        SafeContract,
+        SAFE_CONTRACTS,
+    },
 };
 
 /// Whether a Safe v1.4.1 contract sits at its canonical address.
@@ -24,12 +27,19 @@ pub(crate) struct SafeContractCode {
     pub(crate) contract: SafeContract,
     /// The code hash at its address, `None` without code.
     pub(crate) codehash: Option<B256>,
+    /// Whether the chain is a dev chain, where apply installs missing code.
+    pub(crate) dev_chain: bool,
 }
 
 impl SafeContractCode {
     /// Whether the chain holds the release's code there.
     fn is_canonical(&self) -> bool {
         self.codehash == Some(self.contract.codehash)
+    }
+
+    /// Whether apply puts the release's code there before any Safe.
+    fn installs(&self) -> bool {
+        self.codehash.is_none() && self.dev_chain
     }
 }
 
@@ -44,6 +54,14 @@ impl From<SafeContractCode> for Item {
                 component,
                 Status::Ok,
                 format!("{address:#x} ({name} v1.4.1)"),
+            ),
+            None if check.dev_chain => Item::new(
+                component,
+                Status::Deploy,
+                format!(
+                    "no code at {address:#x}: apply installs Safe v1.4.1 {name} there, \
+                     as it does on a dev chain only"
+                ),
             ),
             None => Item::new(
                 component,
@@ -143,13 +161,15 @@ impl Planner<'_> {
         if cfg.safes.is_empty() {
             return Ok(());
         }
+        let dev_chain = self.provider.is_dev_chain().await?;
         let mut canonical = true;
         for contract in SAFE_CONTRACTS {
             let check = SafeContractCode {
                 contract,
                 codehash: contract.codehash_at(&self.provider).await?,
+                dev_chain,
             };
-            canonical &= check.is_canonical();
+            canonical &= check.is_canonical() || check.installs();
             self.push(check);
         }
         if !canonical {
