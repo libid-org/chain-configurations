@@ -81,6 +81,8 @@ google_jwt_roots = "0x4d9c43d4cf161452b7f66415fa492f4fc42ea583"
 x_platform_verifier = "0x655be95a91a26b4ade476a8992ee25c98bb774a6"
 github_platform_verifier = "0x13cdf6d5666a42e0eb586809f46ce10e469d11f7"
 google_platform_verifier = "0x355143c93a645ae914b1315eb1b580072207e0f2"
+# The fee receiver of a bind, set up by [referral_splitter] below.
+referral_splitter = "0x7a1b71e0337dd42dfb15752374c87f39e8cbfcc9"
 
 # The ceremony circuit verifiers are NOT declared here. `libid-deploy`
 # carries them: `libid-contracts` embeds each circuit's bb-generated
@@ -91,6 +93,18 @@ google_platform_verifier = "0x355143c93a645ae914b1315eb1b580072207e0f2"
 # hash of its circuit's verifier, so a circuits release with new code is a
 # new name, a new address, an `--upgrade` of the Platform Verifiers and a
 # `setTrustRoots`, with the proxies and their registrations untouched.
+
+# The referral splitter. A bind through it pays exactly `fee_wei` here; with
+# a referral the splitter delivers `share_bps` of it to the referrer's handle
+# through the handle escrow, and the rest goes to `treasury`. Its owner is
+# the identity registry's owner, and a held share waits for its referrer.
+[referral_splitter]
+share_bps = 3000
+# 28 TIA, about $10: what every bind through the splitter pays; any other
+# amount reverts the bind.
+fee_wei = "28000000000000000000"
+# The registry_fees Safe below.
+treasury = "0x19bcbc5cf49025a8330e4fc32b4192bd08783096"
 
 # Safe multisigs, one per [safes.<name>] table. A Safe's address follows from
 # its name and accounts.deployer alone: apply creates it through the Safe v1.4.1
@@ -110,7 +124,7 @@ address = "0x50c5fb6d2861c8b29df8880a13ce8d9e949f3c34"
 owners = ["0xdaeb247f5a90c53f2d7a80a81f6cb6acb0d8b907"]
 threshold = 1
 
-# The receiver of the handles.link service fee.
+# The treasury of the referral splitter: the handles.link service fee.
 [safes.registry_fees]
 address = "0x19bcbc5cf49025a8330e4fc32b4192bd08783096"
 owners = ["0xdaeb247f5a90c53f2d7a80a81f6cb6acb0d8b907"]
