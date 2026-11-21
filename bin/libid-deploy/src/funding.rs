@@ -26,8 +26,8 @@ pub struct FundedChain {
     pub chain_id: u64,
     /// The network file that describes it.
     pub network: &'static str,
-    /// The largest `top_up_to_wei` its file may declare: the most one run
-    /// sends to one address.
+    /// The most one run sends on the chain: the largest sum of
+    /// `top_up_to_wei` its file may declare.
     pub max_top_up_wei: U256,
 }
 
@@ -62,8 +62,8 @@ pub const FUNDED_CHAINS: &[FundedChain] = &[
     FundedChain {
         chain_id: 31_337,
         network: "local-dev",
-        // 1 ETH
-        max_top_up_wei: U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]),
+        // 10 ETH
+        max_top_up_wei: U256::from_limbs([10_000_000_000_000_000_000, 0, 0, 0]),
     },
 ];
 

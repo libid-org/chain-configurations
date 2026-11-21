@@ -567,19 +567,12 @@ impl NetworkConfig {
                 Some((format!("safes.{name}"), safe.address.get()?))
             }))
             .collect();
-        self.funding
+        let fundings = self
+            .funding
             .iter()
             .map(|(name, declared_funding)| {
                 let funding = declared_funding.funding(name)?;
                 let label = funding.component();
-                if funding.target > chain.max_top_up_wei {
-                    bail!(
-                        "{label}.top_up_to_wei is {} wei, above the {} wei one run may \
-                         send on chain {chain}",
-                        funding.target,
-                        chain.max_top_up_wei
-                    );
-                }
                 if funding.address == deployer {
                     bail!(
                         "{label}.address is accounts.deployer, which every top-up is \
@@ -597,7 +590,19 @@ impl NetworkConfig {
                 }
                 Ok(funding)
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        // At or above the cap is all that matters, so a sum past U256 may stop at MAX.
+        let total = fundings.iter().fold(U256::ZERO, |total, funding| {
+            total.saturating_add(funding.target)
+        });
+        if total > chain.max_top_up_wei {
+            bail!(
+                "[funding] tops up to {total} wei in all, above the {} wei one run may \
+                 send on chain {chain}",
+                chain.max_top_up_wei
+            );
+        }
+        Ok(fundings)
     }
 
     /// Every declared Safe: a name of `[a-z0-9_]`, distinct nonzero owners,
@@ -704,6 +709,7 @@ pub(crate) mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::funding::FundedChain;
 
     fn networks_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../networks")
@@ -1045,8 +1051,11 @@ google_platform_verifier = "{google}"
         }
     }
 
-    /// The address the funding tests top up.
+    /// The addresses the funding tests top up.
     const E2E_WALLET: &str = "0x2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e";
+    const OTHER_WALLET: &str = "0x3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e";
+    /// Sepolia's row of the funded table.
+    const SEPOLIA: FundedChain = FUNDED_CHAINS[0];
 
     /// The canonical file with `[funding.<name>]`.
     fn with_funding(name: &str, address: &str, top_up_to_wei: &str) -> String {
@@ -1116,8 +1125,8 @@ google_platform_verifier = "{google}"
         }
     }
 
-    /// A target up to the chain's cap validates, and one wei above it is
-    /// refused naming the chain.
+    /// A single target up to the chain's cap validates, and one wei above it
+    /// is refused naming the chain.
     #[test]
     fn a_funding_target_above_the_chains_cap_is_refused() {
         for chain in FUNDED_CHAINS {
@@ -1138,6 +1147,31 @@ google_platform_verifier = "{google}"
                 chain.network
             );
         }
+    }
+
+    /// Targets that each fit the chain's cap but together exceed it are
+    /// refused: the cap bounds what one run sends on the chain.
+    #[test]
+    fn funding_targets_summing_above_the_chains_cap_are_refused() {
+        let half = SEPOLIA.max_top_up_wei / U256::from(2) + U256::from(1);
+        let text = format!(
+            "{}\n[funding.second]\naddress = \"{OTHER_WALLET}\"\ntop_up_to_wei = \"{half}\"\n",
+            with_funding("e2e", E2E_WALLET, &half.to_string())
+        )
+        .replace(
+            "chain_id = 31337",
+            &format!("chain_id = {}", SEPOLIA.chain_id),
+        );
+        let err = refusal(&text);
+        assert!(
+            err.contains(&format!(
+                "[funding] tops up to {} wei in all, above the {} wei one run may send \
+                 on chain {SEPOLIA}",
+                half * U256::from(2),
+                SEPOLIA.max_top_up_wei
+            )),
+            "{err}"
+        );
     }
 
     /// A zero target, which a blank one parses as, funds nothing and is
