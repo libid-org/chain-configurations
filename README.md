@@ -253,7 +253,7 @@ in the flow is the KMS key, which never leaves AWS.
 | `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_registry`, `handle_escrow`, `google_jwt_roots`, `x_platform_verifier`, `github_platform_verifier`, `google_platform_verifier` — always present, pre-filled with the canonical table, validated against the prediction; `referral_splitter` — on a network that has one, validated the same way |
 | `[referral_splitter]` | input | with `contracts.referral_splitter` and only with it: `share_bps` (0 to 10 000), `fee_wei` (a decimal string above zero: what every bind through the splitter pays, referral or not; the splitter reverts any other amount, and the site reads it from the splitter) and `treasury`. The constructor takes all three; apply sends each setter whose value differs on-chain while the deployer owns the splitter, and otherwise reports the calls its owner signs |
 | `[safes.<name>]` | input + declared | `owners`, `threshold` — what the Safe ends up with; `address` — pre-filled with the address the name predicts, validated against it |
-| `[funding.<name>]` | input | testnet files only: `address` — what `apply --fund` tops up from the deployer, never the deployer itself nor a contract or Safe the file declares; `top_up_to_wei` — the balance it tops up to, a decimal string above zero. See [Testnet top-ups](#testnet-top-ups) |
+| `[funding.<name>]` | input | testnet files only: `address` — what `apply --fund` tops up from the deployer, never the deployer itself nor a contract or Safe the file declares; `top_up_to_wei` — the balance it tops up to, a decimal string above zero and at most the chain's cap. See [Testnet top-ups](#testnet-top-ups) |
 
 The circuit verifiers are not in the file. They are a property of the
 binary's contracts pin — which carries the circuits release — not of a
@@ -362,10 +362,18 @@ without `[funding]` is refused before anything is sent. `plan` prints one
 line per entry: `ok` at or above the target, `configure` with the amount
 `apply --fund` sends below it.
 
-`validate` refuses `[funding]` on any chain but Sepolia (11155111),
-Arbitrum Sepolia (421614), eden-testnet (3735928814) and local-dev's
-anvil (31337), the table in `bin/libid-deploy/src/funding.rs`. Entry names
-are lowercase letters, digits and '_', like Safe names.
+`validate` refuses `[funding]` on any chain but those in the table in
+`bin/libid-deploy/src/funding.rs`, and a `top_up_to_wei` above that chain's
+cap, the most one run sends to one address:
+
+| Chain | Chain id | Cap |
+|---|---|---|
+| Sepolia | 11155111 | 0.74 ETH |
+| Arbitrum Sepolia | 421614 | 0.056 ETH |
+| eden-testnet | 3735928814 | 0.045 TIA |
+| local-dev's anvil | 31337 | 1 ETH |
+
+Entry names are lowercase letters, digits and '_', like Safe names.
 
 ## Running locally
 
