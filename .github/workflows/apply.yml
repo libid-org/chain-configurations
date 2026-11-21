@@ -49,6 +49,10 @@ on:
         description: "Required ONLY when the LibidFactory has no code on-chain (virgin network): that first apply publishes the whole declared stack."
         type: boolean
         default: false
+      fund:
+        description: "Top up each [funding.<name>] address to its declared balance from the deployer (testnet files only). Runs a full apply: run plan first and fund only when it shows nothing but funding.* lines."
+        type: boolean
+        default: false
       source:
         description: "Where the libid-deploy binary comes from"
         type: choice
@@ -265,6 +269,7 @@ jobs:
           AWS_REGION: ${{ steps.cfg.outputs.aws_region }}
           UPGRADE: ${{ inputs.upgrade }}
           CONFIRM_FRESH: ${{ inputs.confirm_fresh_deploy }}
+          FUND: ${{ inputs.fund }}
         run: |
           set -euo pipefail
           redact() { python3 -c 'import os, sys; s = sys.stdin.read(); u = os.environ.get("RPC_URL", ""); sys.stdout.write(s.replace(u, "<RPC_URL>") if u else s)'; }
@@ -272,6 +277,7 @@ jobs:
           # The signer defaults to aws.kms_deployer from the network file.
           [ -n "$UPGRADE" ] && args+=(--upgrade "$UPGRADE")
           [ "$CONFIRM_FRESH" = "true" ] && args+=(--confirm-fresh-deploy)
+          [ "$FUND" = "true" ] && args+=(--fund)
           ./libid-deploy apply "${args[@]}" 2>&1 | tee /tmp/apply.log
           {
             echo "### Apply — ${{ inputs.network }}"
