@@ -701,6 +701,93 @@ async fn apply_upgrades_a_proxy_before_reading_through_it() {
     );
 }
 
+/// The registry's `quoteBindFor` calls the Proof Verifier's `quoteFor`, so
+/// one `apply --upgrade identity-registry,proof-verifier` must upgrade the
+/// Proof Verifier first, whatever order the flag lists them in: apply runs
+/// each upgrade inside its component's step, and the Proof Verifier's step
+/// precedes the registry's. The running Proof Verifier is stood in for by
+/// the Notary Service's implementation, which has no `quoteFor`.
+#[tokio::test]
+async fn apply_upgrades_the_proof_verifier_before_the_registry_that_quotes_through_it() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prefilled_network_file(dir.path(), &anvil.endpoint());
+    apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let proof_verifier: Address = cfg.contracts.ceremony_proof_verifier.get().unwrap();
+    let identity_registry: Address = cfg.contracts.identity_registry.get().unwrap();
+
+    let key: PrivateKeySigner = ANVIL_KEY.parse().unwrap();
+    let owned = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(key))
+        .connect_http(anvil.endpoint_url());
+    let stale_impl = deploy_contract_from(
+        &owned,
+        Artifacts::embedded().bytecode("NotaryService").unwrap(),
+        "an implementation without quoteFor()",
+        None,
+    )
+    .await
+    .expect("stand-in implementation deploys");
+    IUUPSUpgradeable::new(proof_verifier, &owned)
+        .upgradeToAndCall(stale_impl, Bytes::new())
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    let registry = IdentityRegistry::new(identity_registry, &owned);
+    let platform_id = platforms::platform_id(platforms::GITHUB.key);
+    assert!(
+        registry
+            .quoteBindFor(platform_id, LAUNCH_VERIFIER_VERSION, Bytes::new())
+            .call()
+            .await
+            .is_err(),
+        "the stand-in must not answer quoteFor()"
+    );
+
+    let upgraded = apply_with(
+        &path,
+        apply::Options {
+            upgrades: vec![
+                "identity-registry".parse().unwrap(),
+                "proof-verifier".parse().unwrap(),
+            ],
+            ..Default::default()
+        },
+    )
+    .await;
+    let contracts: Vec<&str> = upgraded
+        .upgraded
+        .iter()
+        .map(|line| line.split(" -> ").next().unwrap())
+        .collect();
+    assert_eq!(contracts, ["CeremonyProofVerifier", "IdentityRegistry"]);
+    assert_eq!(
+        registry
+            .quoteBindFor(platform_id, LAUNCH_VERIFIER_VERSION, Bytes::new())
+            .call()
+            .await
+            .unwrap(),
+        registry
+            .quoteBind(platform_id, LAUNCH_VERIFIER_VERSION)
+            .call()
+            .await
+            .unwrap(),
+        "a payload the transaction never verified is quoted at the full price"
+    );
+}
+
 /// The network-invariance proof: run the SAME pre-filled declarative apply
 /// against two completely separate bare anvils (both without even the
 /// CREATE2 deployer) and assert both chains end up with code at the SAME
