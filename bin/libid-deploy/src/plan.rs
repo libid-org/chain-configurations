@@ -8,10 +8,12 @@
 //! a canonical key that does not equal `predict_address(factory, name)`.
 //! Once the factory exists the plan also diffs its on-chain `deployedAt`
 //! records against the config to surface drift. A declared referral
-//! splitter follows the escrow it pays through ([`crate::splitter`]), and
-//! the declared Safes close the plan: see [`crate::safes`].
+//! splitter follows the escrow it pays through ([`crate::splitter`]), the
+//! declared Safes come next ([`crate::safes`]), and the testnet top-ups
+//! close the plan ([`crate::funding`]).
 
 mod checks;
+mod funding;
 mod safes;
 mod splitter;
 
@@ -209,6 +211,7 @@ impl Plan {
         }
         planner.stack().await?;
         planner.safes().await?;
+        planner.funding().await?;
 
         Ok(Plan {
             network: cfg.network.name.clone(),

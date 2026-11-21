@@ -30,8 +30,10 @@
 //! Honk verifiers and a Platform Verifier per platform pinned to one of them
 //! and registered into the Supported Version Set, without which the
 //! registry accepts no binding for the platform. The declared Safes come
-//! last ([`crate::safes`]).
+//! next ([`crate::safes`]), and the testnet top-ups last
+//! ([`crate::funding`]), so a run that fails before them sends no funds.
 
+mod funding;
 mod safes;
 mod splitter;
 
@@ -105,6 +107,7 @@ use crate::{
         NetworkConfig,
         Stack,
     },
+    funding::TopUp,
     names,
     platforms::{
         self,
@@ -231,6 +234,11 @@ pub struct Options {
     /// that first apply publishes the entire declared stack. With the
     /// factory present, apply converges incrementally without the flag.
     pub confirm_fresh_deploy: bool,
+    /// Send each `[funding.<name>]` address below its target the
+    /// shortfall. Without it apply sends no top-up and reports each
+    /// shortfall; with it, a file that declares no `[funding]` is refused
+    /// before anything is sent.
+    pub fund: bool,
 }
 
 /// What an apply run did. The network file is declarative and NEVER
@@ -245,6 +253,11 @@ pub struct Summary {
     /// On-chain configuration changes beyond the always-resent idempotent
     /// ops — signer and fee convergence, wiring, ownership handovers.
     pub configured: Vec<String>,
+    /// Top-ups sent under `--fund`.
+    pub funded: Vec<TopUp>,
+    /// Addresses below their target that a run without `--fund` left
+    /// as they were.
+    pub underfunded: Vec<TopUp>,
 }
 
 impl Summary {
@@ -268,6 +281,29 @@ impl Summary {
         }
         if !self.configured.is_empty() {
             let _ = writeln!(out, "Configured: {}", self.configured.join(", "));
+        }
+        for top_up in &self.funded {
+            let _ = writeln!(
+                out,
+                "Funded: {} {:#x} {} -> {} wei (sent {} wei)",
+                top_up.funding.component(),
+                top_up.funding.address,
+                top_up.balance,
+                top_up.funding.target,
+                top_up.amount()
+            );
+        }
+        for top_up in &self.underfunded {
+            let _ = writeln!(
+                out,
+                "Below its funding target: {} {:#x} holds {} wei, tops up to {} wei — \
+                 apply --fund sends {} wei",
+                top_up.funding.component(),
+                top_up.funding.address,
+                top_up.balance,
+                top_up.funding.target,
+                top_up.amount()
+            );
         }
         let _ = writeln!(out, "Config: declarative — never rewritten");
         out
@@ -361,6 +397,12 @@ impl<'a> Applier<'a> {
                 path.display()
             );
         }
+        if self.opts.fund && self.cfg.funding.is_empty() {
+            bail!(
+                "--fund given but {} declares no [funding] — nothing was sent",
+                path.display()
+            );
+        }
 
         let notary_signer = self.cfg.accounts.notary_address()?;
         let notary_fee = self.cfg.notary_service.fee()?;
@@ -437,6 +479,7 @@ impl<'a> Applier<'a> {
         self.converge_factory_owner(operational_owner).await?;
 
         self.safes().await?;
+        self.funding().await?;
 
         // Nothing is recorded back: the file already declares every
         // canonical address and the chain records the rest.

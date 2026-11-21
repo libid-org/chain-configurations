@@ -107,6 +107,12 @@ enum Command {
         /// With the factory present, apply converges incrementally.
         #[arg(long)]
         confirm_fresh_deploy: bool,
+        /// Top up each `[funding.<name>]` address to its declared balance
+        /// from the deployer, after everything else converged. Without it
+        /// apply sends no top-up and reports each shortfall. Refused when
+        /// the file declares no `[funding]`.
+        #[arg(long)]
+        fund: bool,
     },
 }
 
@@ -194,6 +200,7 @@ async fn main() -> Result<()> {
             upgrade,
             yes,
             confirm_fresh_deploy,
+            fund,
         } => {
             let cfg = NetworkConfig::load(&network)?;
             let rpc = RpcEndpoint::resolve(&cfg, rpc.rpc_url.as_deref())?;
@@ -219,6 +226,7 @@ async fn main() -> Result<()> {
             let opts = apply::Options {
                 upgrades: upgrade,
                 confirm_fresh_deploy,
+                fund,
             };
             let summary = Applier::connect(&cfg, &rpc, &signer, opts)
                 .await?
