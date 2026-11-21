@@ -253,6 +253,7 @@ in the flow is the KMS key, which never leaves AWS.
 | `[contracts]` | declared | `factory`, `notary_service`, `ceremony_proof_verifier`, `identity_registry`, `handle_escrow`, `google_jwt_roots`, `x_platform_verifier`, `github_platform_verifier`, `google_platform_verifier` — always present, pre-filled with the canonical table, validated against the prediction; `referral_splitter` — on a network that has one, validated the same way |
 | `[referral_splitter]` | input | with `contracts.referral_splitter` and only with it: `share_bps` (0 to 10 000), `fee_wei` (a decimal string above zero: what every bind through the splitter pays, referral or not; the splitter reverts any other amount, and the site reads it from the splitter) and `treasury`. The constructor takes all three; apply sends each setter whose value differs on-chain while the deployer owns the splitter, and otherwise reports the calls its owner signs |
 | `[safes.<name>]` | input + declared | `owners`, `threshold` — what the Safe ends up with; `address` — pre-filled with the address the name predicts, validated against it |
+| `[funding.<name>]` | input | testnet files only: `address` — what `apply --fund` tops up from the deployer, never the deployer itself nor a contract or Safe the file declares; `top_up_to_wei` — the balance it tops up to, a decimal string above zero. See [Testnet top-ups](#testnet-top-ups) |
 
 The circuit verifiers are not in the file. They are a property of the
 binary's contracts pin — which carries the circuits release — not of a
@@ -336,6 +337,36 @@ every declared Safe.
 
 `plan --print-addresses` prints each declared Safe's address.
 
+## Testnet top-ups
+
+Each `[funding.<name>]` table names an address the deployer keeps funded,
+such as the wallet the e2e tests bind from:
+
+```toml
+[funding.e2e]
+address = "0x..."
+top_up_to_wei = "740000000000000000"
+```
+
+`apply --fund` sends `top_up_to_wei` minus the address's balance when the
+balance is below `top_up_to_wei`, and nothing otherwise: one run sends at
+most `top_up_to_wei`, and a rerun sends nothing more. Apply checks the
+receipt and reads the balance again; a balance still below the target
+after the top-up is logged, not refused, since the address may spend in
+the same block. The top-ups run last, after the Safes, so a run that
+fails earlier sends none.
+
+Without `--fund` apply sends no top-up, and its summary lists each address
+below its target with the amount `--fund` would send. `--fund` on a file
+without `[funding]` is refused before anything is sent. `plan` prints one
+line per entry: `ok` at or above the target, `configure` with the amount
+`apply --fund` sends below it.
+
+`validate` refuses `[funding]` on any chain but Sepolia (11155111),
+Arbitrum Sepolia (421614), eden-testnet (3735928814) and local-dev's
+anvil (31337), the table in `bin/libid-deploy/src/funding.rs`. Entry names
+are lowercase letters, digits and '_', like Safe names.
+
 ## Running locally
 
 ```sh
@@ -352,7 +383,7 @@ cargo run -- plan --network networks/eden-testnet.toml
 # credentials), or pass a local key for anvil rehearsal
 cargo run -- apply --network networks/eden-testnet.toml \
   --signer <64-hex-key-or-kms-id> [--upgrade identity-registry] [--yes] \
-  [--confirm-fresh-deploy]
+  [--confirm-fresh-deploy] [--fund]
 ```
 
 The `--signer` spec is classified by shape: 64 hex chars is a local private
@@ -502,7 +533,8 @@ release` consumes the newest Linux x86_64 asset.
   the referral splitter — its deploy, a referred fee reconciled between the
   treasury Safe and the escrow, its settings following the file, and its
   landing with the registry upgrade that pays it — the Safes on Safe
-  contracts apply installs,
+  contracts apply installs, the testnet top-ups — to the target exactly,
+  once, only under `--fund`, and after every other step —
   the Platform Verifier deploy/register/rotate path, the network-invariance
   proof: two separate bare anvils converge onto the same
   declared canonical addresses, and the `--rpc-url` contract: the committed

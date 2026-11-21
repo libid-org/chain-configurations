@@ -35,6 +35,10 @@ use libid_contracts::factory::{
 use serde::Deserialize;
 
 use crate::{
+    funding::{
+        Funding,
+        FUNDED_CHAINS,
+    },
     names::{
         self,
         CanonicalContract,
@@ -72,6 +76,10 @@ pub struct NetworkConfig {
     /// The Safe multisigs, by name: `[safes.<name>]`.
     #[serde(default)]
     pub safes: BTreeMap<String, SafeConfig>,
+    /// The addresses `apply --fund` tops up from the deployer, by name:
+    /// `[funding.<name>]`. Testnet files only.
+    #[serde(default)]
+    pub funding: BTreeMap<String, FundingConfig>,
 }
 
 /// `[network]`.
@@ -340,6 +348,50 @@ impl SafeConfig {
     }
 }
 
+/// `[funding.<name>]` — an address `apply --fund` tops up from the
+/// deployer.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FundingConfig {
+    /// The address that receives the top-up.
+    pub address: DeclaredAddress,
+    /// The balance `apply --fund` brings the address up to, in wei, as a
+    /// decimal string; above zero.
+    pub top_up_to_wei: String,
+}
+
+impl FundingConfig {
+    /// The declared top-up under `[funding.<name>]`.
+    pub fn funding(&self, name: &str) -> Result<Funding> {
+        let label = format!("funding.{name}");
+        if !is_table_name(name) {
+            bail!("{label}: a funding name is lowercase letters, digits and '_'");
+        }
+        let target: U256 = self
+            .top_up_to_wei
+            .trim()
+            .parse()
+            .map_err(|e| anyhow!("invalid {label}.top_up_to_wei: {e}"))?;
+        if target.is_zero() {
+            bail!("{label}.top_up_to_wei is 0: a top-up needs a balance above zero");
+        }
+        Ok(Funding {
+            name: name.to_string(),
+            address: self.address.required(&format!("{label}.address"))?,
+            target,
+        })
+    }
+}
+
+/// Whether `name` can key a `[safes]` or `[funding]` table: lowercase
+/// letters, digits and '_'.
+fn is_table_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
 /// The declared addresses of the entry contracts every Platform Verifier
 /// and every wiring check refers to.
 #[derive(Debug, Clone, Copy)]
@@ -449,7 +501,9 @@ impl NetworkConfig {
         }
         self.validate_canonical_addresses()?;
         self.splitter()?;
-        self.validate_safes()
+        self.validate_safes()?;
+        self.funding()?;
+        Ok(())
     }
 
     /// The referral splitter's declared address and settings, when the
@@ -478,17 +532,73 @@ impl NetworkConfig {
         Ok(Some(Splitter { address, settings }))
     }
 
+    /// Every declared top-up, on a chain [`FUNDED_CHAINS`] lists, to an
+    /// address that is neither the deployer it is sent from nor a contract
+    /// or Safe the file declares.
+    pub fn funding(&self) -> Result<Vec<Funding>> {
+        if self.funding.is_empty() {
+            return Ok(Vec::new());
+        }
+        let chain_id = self.network.chain_id;
+        if !FUNDED_CHAINS.iter().any(|c| c.chain_id == chain_id) {
+            bail!(
+                "[funding] is declared on chain {chain_id}, but the deployer funds \
+                 addresses only on {}",
+                FUNDED_CHAINS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let deployer = self.accounts.deployer_address()?;
+        let declared: Vec<(String, Address)> = self
+            .contracts
+            .factory
+            .get()
+            .map(|factory| ("contracts.factory".to_string(), factory))
+            .into_iter()
+            .chain(
+                self.contracts
+                    .canonical()
+                    .map(|(c, address)| (format!("contracts.{}", c.key), address)),
+            )
+            .chain(self.safes.iter().filter_map(|(name, safe)| {
+                Some((format!("safes.{name}"), safe.address.get()?))
+            }))
+            .collect();
+        self.funding
+            .iter()
+            .map(|(name, declared_funding)| {
+                let funding = declared_funding.funding(name)?;
+                let label = funding.component();
+                if funding.address == deployer {
+                    bail!(
+                        "{label}.address is accounts.deployer, which every top-up is \
+                         sent from"
+                    );
+                }
+                if let Some((key, _)) =
+                    declared.iter().find(|(_, a)| *a == funding.address)
+                {
+                    bail!(
+                        "{label}.address {:#x} is {key}: a top-up goes to a key, not to \
+                         a contract or Safe the file declares",
+                        funding.address
+                    );
+                }
+                Ok(funding)
+            })
+            .collect()
+    }
+
     /// Every declared Safe: a name of `[a-z0-9_]`, distinct nonzero owners,
     /// a threshold they can meet, and the address its name predicts.
     fn validate_safes(&self) -> Result<()> {
         let deployer = self.accounts.deployer_address()?;
         for (name, declared) in &self.safes {
             let label = format!("safes.{name}");
-            if name.is_empty()
-                || !name
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-            {
+            if !is_table_name(name) {
                 bail!("{label}: a Safe name is lowercase letters, digits and '_'");
             }
             let expected = Safe { name, deployer }.address();
@@ -924,6 +1034,163 @@ google_platform_verifier = "{google}"
             let cfg: NetworkConfig = toml::from_str(&text).unwrap();
             let err = cfg.validate().unwrap_err().to_string();
             assert!(err.contains(needle), "{needle}: {err}");
+        }
+    }
+
+    /// The address the funding tests top up.
+    const E2E_WALLET: &str = "0x2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e";
+
+    /// The canonical file with `[funding.<name>]`.
+    fn with_funding(name: &str, address: &str, top_up_to_wei: &str) -> String {
+        format!(
+            "{}\n[funding.{name}]\naddress = \"{address}\"\n\
+             top_up_to_wei = \"{top_up_to_wei}\"\n",
+            canonical_toml()
+        )
+    }
+
+    /// The validation error of `text`.
+    fn refusal(text: &str) -> String {
+        let cfg: NetworkConfig = toml::from_str(text).unwrap();
+        cfg.validate().unwrap_err().to_string()
+    }
+
+    /// A declared top-up loads its address and its target as decimal wei.
+    #[test]
+    fn a_declared_funding_entry_loads() {
+        let text = with_funding("e2e", E2E_WALLET, "740000000000000000");
+        let cfg: NetworkConfig = toml::from_str(&text).unwrap();
+        cfg.validate().expect("the top-up validates");
+        assert_eq!(
+            cfg.funding().unwrap(),
+            [Funding {
+                name: "e2e".into(),
+                address: E2E_WALLET.parse().unwrap(),
+                target: U256::from(740_000_000_000_000_000u64),
+            }]
+        );
+    }
+
+    /// A file without `[funding]` declares no top-up.
+    #[test]
+    fn funding_is_optional() {
+        let cfg: NetworkConfig = toml::from_str(&canonical_toml()).unwrap();
+        assert!(cfg.funding().unwrap().is_empty());
+    }
+
+    /// A chain off the funded table, a mainnet's, refuses `[funding]` and
+    /// names its chain id.
+    #[test]
+    fn funding_on_a_mainnet_chain_is_refused_naming_the_chain_id() {
+        for chain_id in [1u64, 42_161, 8_453, 56, 714] {
+            let text = with_funding("e2e", E2E_WALLET, "1")
+                .replace("chain_id = 31337", &format!("chain_id = {chain_id}"));
+            let err = refusal(&text);
+            assert!(
+                err.contains(&format!("[funding] is declared on chain {chain_id},")),
+                "{err}"
+            );
+            assert!(err.contains("11155111 (sepolia)"), "{err}");
+        }
+    }
+
+    /// Every chain on the funded table accepts `[funding]`.
+    #[test]
+    fn every_funded_chain_accepts_funding() {
+        for chain in FUNDED_CHAINS {
+            let text = with_funding("e2e", E2E_WALLET, "1").replace(
+                "chain_id = 31337",
+                &format!("chain_id = {}", chain.chain_id),
+            );
+            let cfg: NetworkConfig = toml::from_str(&text).unwrap();
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{}: {e}", chain.network));
+        }
+    }
+
+    /// A zero target, which a blank one parses as, funds nothing and is
+    /// refused.
+    #[test]
+    fn a_zero_funding_target_is_refused() {
+        for zero in ["0", ""] {
+            let err = refusal(&with_funding("e2e", E2E_WALLET, zero));
+            assert!(
+                err.contains("funding.e2e.top_up_to_wei is 0"),
+                "{zero:?}: {err}"
+            );
+        }
+    }
+
+    /// A target that is not decimal wei is refused.
+    #[test]
+    fn a_funding_target_that_is_not_decimal_wei_is_refused() {
+        for bad in ["1.5", "-1", "0.74 ether"] {
+            let err = refusal(&with_funding("e2e", E2E_WALLET, bad));
+            assert!(
+                err.contains("invalid funding.e2e.top_up_to_wei"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    /// The deployer every top-up is sent from cannot receive one.
+    #[test]
+    fn funding_the_deployer_is_refused() {
+        let err = refusal(&with_funding("e2e", TEST_DEPLOYER, "1"));
+        assert!(
+            err.contains("funding.e2e.address is accounts.deployer"),
+            "{err}"
+        );
+    }
+
+    /// A blank or zero address names no recipient.
+    #[test]
+    fn a_funding_entry_without_an_address_is_refused() {
+        for blank in ["", "0x0000000000000000000000000000000000000000"] {
+            let err = refusal(&with_funding("e2e", blank, "1"));
+            assert!(
+                err.contains("funding.e2e.address must be set to a nonzero address"),
+                "{blank:?}: {err}"
+            );
+        }
+    }
+
+    /// A contract or Safe the file declares is not a top-up recipient.
+    #[test]
+    fn funding_a_declared_contract_or_safe_is_refused() {
+        let factory = format!("{:#x}", test_factory());
+        let registry = format!(
+            "{:#x}",
+            predict_address(test_factory(), names::IDENTITY_REGISTRY)
+        );
+        let safe = test_safe("notary_fees");
+        let with_safe = with_safe("notary_fees", safe, &[TEST_DEPLOYER], 1)
+            + &format!(
+                "\n[funding.e2e]\naddress = \"{safe:#x}\"\ntop_up_to_wei = \"1\"\n"
+            );
+        for (text, key) in [
+            (with_funding("e2e", &factory, "1"), "contracts.factory"),
+            (
+                with_funding("e2e", &registry, "1"),
+                "contracts.identity_registry",
+            ),
+            (with_safe, "safes.notary_fees"),
+        ] {
+            let err = refusal(&text);
+            assert!(err.contains(&format!(" is {key}: ")), "{key}: {err}");
+        }
+    }
+
+    /// A funding name follows the Safe names: lowercase letters, digits
+    /// and '_'.
+    #[test]
+    fn a_funding_name_outside_lowercase_digits_and_underscore_is_refused() {
+        for name in ["E2E", "e2e-wallet", "\"e2e.wallet\"", "\"\""] {
+            let err = refusal(&with_funding(name, E2E_WALLET, "1"));
+            assert!(
+                err.contains("a funding name is lowercase letters, digits and '_'"),
+                "{name}: {err}"
+            );
         }
     }
 

@@ -91,6 +91,7 @@ use libid_deploy::{
         Circuit,
     },
     config::NetworkConfig,
+    funding::TopUp,
     names,
     plan::{
         self,
@@ -2515,4 +2516,311 @@ async fn apply_refuses_safes_over_other_code_at_a_safe_contract_address() {
         .await
         .unwrap()
         .is_empty());
+}
+
+// Anvil accounts #8 and #9, two wallets the deployer tops up.
+const E2E_WALLET: &str = "0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f";
+const OTHER_WALLET: &str = "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720";
+/// The balance the test files top a wallet up to: 0.74 native.
+const TOP_UP_TO_WEI: u64 = 740_000_000_000_000_000;
+/// What a wallet below that target holds: 0.1 native.
+const HELD_WEI: u64 = 100_000_000_000_000_000;
+
+/// Declare in the network file at `path` the wallet `address` topped up to
+/// `top_up_to_wei` under `[funding.<name>]`.
+fn declare_funding(path: &Path, name: &str, address: &str, top_up_to_wei: u64) {
+    let mut body = std::fs::read_to_string(path).expect("read network file");
+    body.push_str(&format!(
+        r#"
+[funding.{name}]
+address = "{address}"
+top_up_to_wei = "{top_up_to_wei}"
+"#
+    ));
+    std::fs::write(path, body).expect("write network file");
+}
+
+/// `apply --fund` tops a wallet below its target up to the target exactly,
+/// and a second `apply --fund` sends nothing.
+#[tokio::test]
+async fn apply_fund_tops_a_wallet_up_to_its_target_once() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_network_file(dir.path(), &anvil.endpoint());
+    declare_funding(&path, "e2e", E2E_WALLET, TOP_UP_TO_WEI);
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let wallet: Address = E2E_WALLET.parse().unwrap();
+    let (held, target) = (U256::from(HELD_WEI), U256::from(TOP_UP_TO_WEI));
+    provider
+        .anvil_set_balance(wallet, held)
+        .await
+        .expect("anvil_setBalance");
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let funding = cfg.funding().unwrap().remove(0);
+
+    let plan = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
+    let line = plan
+        .items
+        .iter()
+        .find(|i| i.component == "funding.e2e")
+        .expect("the funding line");
+    assert_eq!(line.status, Status::Configure);
+    assert_eq!(
+        line.detail,
+        format!(
+            "{wallet:#x} holds {held} wei, tops up to {target} wei — apply --fund sends \
+             {} wei",
+            target - held
+        )
+    );
+
+    let funded = apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            fund: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        funded.funded,
+        [TopUp {
+            funding,
+            balance: held,
+        }]
+    );
+    assert!(funded.underfunded.is_empty(), "{:?}", funded.underfunded);
+    assert_eq!(provider.get_balance(wallet).await.unwrap(), target);
+    assert!(
+        funded.render().contains(&format!(
+            "Funded: funding.e2e {wallet:#x} {held} -> {target} wei (sent {} wei)",
+            target - held
+        )),
+        "{}",
+        funded.render()
+    );
+
+    let deployer: Address = ANVIL_OWNER.parse().unwrap();
+    let nonce = provider.get_transaction_count(deployer).await.unwrap();
+    let again = apply_with(
+        &path,
+        apply::Options {
+            fund: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(again.funded.is_empty(), "{:?}", again.funded);
+    assert!(again.underfunded.is_empty(), "{:?}", again.underfunded);
+    assert_eq!(
+        provider.get_transaction_count(deployer).await.unwrap(),
+        nonce
+    );
+    assert_eq!(provider.get_balance(wallet).await.unwrap(), target);
+    let settled = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
+    assert_eq!(settled.status_of("funding.e2e"), Some(Status::Ok));
+}
+
+/// A wallet at or above its target gets nothing from `apply --fund`.
+#[tokio::test]
+async fn apply_fund_sends_nothing_to_a_wallet_at_or_above_its_target() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_network_file(dir.path(), &anvil.endpoint());
+    declare_funding(&path, "at_target", E2E_WALLET, TOP_UP_TO_WEI);
+    declare_funding(&path, "above_target", OTHER_WALLET, TOP_UP_TO_WEI);
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let target = U256::from(TOP_UP_TO_WEI);
+    let balances = [
+        (E2E_WALLET.parse::<Address>().unwrap(), target),
+        (
+            OTHER_WALLET.parse::<Address>().unwrap(),
+            target + U256::from(1),
+        ),
+    ];
+    for (wallet, balance) in balances {
+        provider
+            .anvil_set_balance(wallet, balance)
+            .await
+            .expect("anvil_setBalance");
+    }
+
+    let summary = apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            fund: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(summary.funded.is_empty(), "{:?}", summary.funded);
+    assert!(summary.underfunded.is_empty(), "{:?}", summary.underfunded);
+    for (wallet, balance) in balances {
+        assert_eq!(provider.get_balance(wallet).await.unwrap(), balance);
+    }
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let plan = Plan::build(&cfg, &file_rpc(&cfg)).await.expect("plan");
+    for component in ["funding.at_target", "funding.above_target"] {
+        assert_eq!(
+            plan.status_of(component),
+            Some(Status::Ok),
+            "{}",
+            plan.render()
+        );
+    }
+}
+
+/// Without `--fund`, apply sends no top-up, and its summary names each
+/// wallet below its target with what `--fund` would send.
+#[tokio::test]
+async fn apply_without_fund_reports_the_shortfall_and_sends_nothing() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_network_file(dir.path(), &anvil.endpoint());
+    declare_funding(&path, "e2e", E2E_WALLET, TOP_UP_TO_WEI);
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let wallet: Address = E2E_WALLET.parse().unwrap();
+    let (held, target) = (U256::from(HELD_WEI), U256::from(TOP_UP_TO_WEI));
+    provider
+        .anvil_set_balance(wallet, held)
+        .await
+        .expect("anvil_setBalance");
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+
+    let summary = apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(provider.get_balance(wallet).await.unwrap(), held);
+    assert!(summary.funded.is_empty(), "{:?}", summary.funded);
+    assert_eq!(
+        summary.underfunded,
+        [TopUp {
+            funding: cfg.funding().unwrap().remove(0),
+            balance: held,
+        }]
+    );
+    assert!(
+        summary.render().contains(&format!(
+            "Below its funding target: funding.e2e {wallet:#x} holds {held} wei, tops up \
+             to {target} wei — apply --fund sends {} wei",
+            target - held
+        )),
+        "{}",
+        summary.render()
+    );
+}
+
+/// `apply --fund` over a file without `[funding]` is refused before
+/// anything is sent: on a virgin chain the factory stays uninstalled.
+#[tokio::test]
+async fn apply_fund_without_a_funding_table_refuses_before_sending() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_network_file(dir.path(), &anvil.endpoint());
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
+    let err = Applier::connect(
+        &cfg,
+        &file_rpc(&cfg),
+        &signer,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            fund: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("apply connects")
+    .run(&path)
+    .await
+    .expect_err("--fund names nothing to fund")
+    .to_string();
+    assert!(
+        err.contains(&format!(
+            "--fund given but {} declares no [funding]",
+            path.display()
+        )),
+        "{err}"
+    );
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let deployer: Address = ANVIL_OWNER.parse().unwrap();
+    assert_eq!(provider.get_transaction_count(deployer).await.unwrap(), 0);
+    assert!(provider
+        .get_code_at(factory_address())
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// Top-ups run last: an apply that stops at the Safes, the step before
+/// them, sends none.
+#[tokio::test]
+async fn an_apply_that_stops_before_its_last_step_sends_no_top_up() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_network_file(dir.path(), &anvil.endpoint());
+    declare_safes(&path, &SAFE_OWNERS, 2);
+    declare_funding(&path, "e2e", E2E_WALLET, TOP_UP_TO_WEI);
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let wallet: Address = E2E_WALLET.parse().unwrap();
+    let held = U256::from(HELD_WEI);
+    provider
+        .anvil_set_balance(wallet, held)
+        .await
+        .expect("anvil_setBalance");
+    provider
+        .anvil_set_code(safes::PROXY_FACTORY, Bytes::from(vec![0x00]))
+        .await
+        .expect("anvil_setCode");
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+
+    let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
+    let err = Applier::connect(
+        &cfg,
+        &file_rpc(&cfg),
+        &signer,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            fund: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("apply connects")
+    .run(&path)
+    .await
+    .expect_err("no Safe over another factory's code")
+    .to_string();
+    assert!(err.contains("no Safe v1.4.1 SafeProxyFactory"), "{err}");
+    assert_eq!(provider.get_balance(wallet).await.unwrap(), held);
+}
+
+/// The `--fund` flag reaches apply: over a file that declares no
+/// `[funding]`, the CLI refuses it before sending anything.
+#[tokio::test]
+async fn the_cli_refuses_fund_over_a_file_without_funding() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_network_file(dir.path(), &anvil.endpoint());
+
+    let apply = Command::new(env!("CARGO_BIN_EXE_libid-deploy"))
+        .arg("apply")
+        .arg("--network")
+        .arg(&path)
+        .args(["--signer", ANVIL_KEY])
+        .args(["--yes", "--confirm-fresh-deploy", "--fund"])
+        .output()
+        .expect("libid-deploy runs");
+    let stderr = String::from_utf8_lossy(&apply.stderr);
+    assert!(!apply.status.success(), "{stderr}");
+    assert!(stderr.contains("--fund given but"), "{stderr}");
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    assert_eq!(provider.get_block_number().await.unwrap(), 0);
 }
