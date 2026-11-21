@@ -26,6 +26,9 @@ pub struct FundedChain {
     pub chain_id: u64,
     /// The network file that describes it.
     pub network: &'static str,
+    /// The largest `top_up_to_wei` its file may declare: the most one run
+    /// sends to one address.
+    pub max_top_up_wei: U256,
 }
 
 impl fmt::Display for FundedChain {
@@ -35,23 +38,32 @@ impl fmt::Display for FundedChain {
 }
 
 /// The chains whose deployer may fund an address: the three testnets and
-/// local-dev's anvil. Their native tokens have no market value.
+/// local-dev's anvil. Their native tokens have no market value; a testnet's cap
+/// is a week of the e2e tests' binds.
 pub const FUNDED_CHAINS: &[FundedChain] = &[
     FundedChain {
         chain_id: 11_155_111,
         network: "sepolia",
+        // 0.74 ETH
+        max_top_up_wei: U256::from_limbs([740_000_000_000_000_000, 0, 0, 0]),
     },
     FundedChain {
         chain_id: 421_614,
         network: "arbitrum-sepolia",
+        // 0.056 ETH
+        max_top_up_wei: U256::from_limbs([56_000_000_000_000_000, 0, 0, 0]),
     },
     FundedChain {
         chain_id: 3_735_928_814,
         network: "eden-testnet",
+        // 0.045 TIA
+        max_top_up_wei: U256::from_limbs([45_000_000_000_000_000, 0, 0, 0]),
     },
     FundedChain {
         chain_id: 31_337,
         network: "local-dev",
+        // 1 ETH
+        max_top_up_wei: U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]),
     },
 ];
 

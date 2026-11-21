@@ -540,7 +540,7 @@ impl NetworkConfig {
             return Ok(Vec::new());
         }
         let chain_id = self.network.chain_id;
-        if !FUNDED_CHAINS.iter().any(|c| c.chain_id == chain_id) {
+        let Some(chain) = FUNDED_CHAINS.iter().find(|c| c.chain_id == chain_id) else {
             bail!(
                 "[funding] is declared on chain {chain_id}, but the deployer funds \
                  addresses only on {}",
@@ -550,7 +550,7 @@ impl NetworkConfig {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-        }
+        };
         let deployer = self.accounts.deployer_address()?;
         let declared: Vec<(String, Address)> = self
             .contracts
@@ -572,6 +572,14 @@ impl NetworkConfig {
             .map(|(name, declared_funding)| {
                 let funding = declared_funding.funding(name)?;
                 let label = funding.component();
+                if funding.target > chain.max_top_up_wei {
+                    bail!(
+                        "{label}.top_up_to_wei is {} wei, above the {} wei one run may \
+                         send on chain {chain}",
+                        funding.target,
+                        chain.max_top_up_wei
+                    );
+                }
                 if funding.address == deployer {
                     bail!(
                         "{label}.address is accounts.deployer, which every top-up is \
@@ -1105,6 +1113,30 @@ google_platform_verifier = "{google}"
             let cfg: NetworkConfig = toml::from_str(&text).unwrap();
             cfg.validate()
                 .unwrap_or_else(|e| panic!("{}: {e}", chain.network));
+        }
+    }
+
+    /// A target up to the chain's cap validates, and one wei above it is
+    /// refused naming the chain.
+    #[test]
+    fn a_funding_target_above_the_chains_cap_is_refused() {
+        for chain in FUNDED_CHAINS {
+            let on_chain = |target: U256| {
+                with_funding("e2e", E2E_WALLET, &target.to_string()).replace(
+                    "chain_id = 31337",
+                    &format!("chain_id = {}", chain.chain_id),
+                )
+            };
+            let cfg: NetworkConfig =
+                toml::from_str(&on_chain(chain.max_top_up_wei)).unwrap();
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{}: {e}", chain.network));
+            let err = refusal(&on_chain(chain.max_top_up_wei + U256::from(1)));
+            assert!(
+                err.contains(&format!("one run may send on chain {chain}")),
+                "{}: {err}",
+                chain.network
+            );
         }
     }
 
