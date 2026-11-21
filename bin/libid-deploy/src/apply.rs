@@ -80,9 +80,11 @@ use libid_contracts::{
         escrow::HandleEscrow,
         factory::LibidFactory,
         identity::IdentityRegistry,
-        proxy::IUUPSUpgradeable,
     },
-    deploy::deploy_contract_from,
+    deploy::{
+        deploy_contract_from,
+        upgrade_uups,
+    },
     factory::{
         ensure_create2_deployer,
         predict_address,
@@ -169,12 +171,6 @@ impl Upgrade {
             Self::GitHubPlatformVerifier => platforms::GITHUB.contract(),
             Self::GooglePlatformVerifier => platforms::GOOGLE.contract(),
         }
-    }
-
-    /// The implementation creation code, from the bytecode
-    /// `libid-contracts` embeds.
-    fn implementation_code(self, artifacts: &Artifacts) -> Result<Bytes> {
-        Ok(artifacts.bytecode(self.contract())?)
     }
 
     /// Every value `--upgrade` accepts, for the CLI help and the error.
@@ -1280,24 +1276,18 @@ impl<'a> Applier<'a> {
 
     /// Replace a UUPS proxy's implementation with a freshly deployed one of
     /// `upgrade`'s contract. The entry address, its storage and its owner
-    /// all survive.
+    /// all survive; an upgrade the proxy's EIP-1967 slot does not show is an
+    /// error.
     async fn upgrade_proxy(&self, upgrade: Upgrade, proxy: Address) -> Result<Address> {
-        let label = upgrade.contract();
-        let new_impl = deploy_contract_from(
+        Ok(upgrade_uups(
             &self.provider,
-            upgrade.implementation_code(&self.artifacts)?,
-            &format!("{label} (new impl)"),
+            &self.artifacts,
+            proxy,
+            upgrade.contract(),
+            Bytes::new(),
             Some(self.sender),
         )
-        .await?;
-        let proxied = IUUPSUpgradeable::new(proxy, &self.provider);
-        send_with_nonce_retry!(
-            proxied.upgradeToAndCall(new_impl, Bytes::new()),
-            format!("{label}.upgradeToAndCall"),
-            &self.provider,
-            self.sender
-        )?;
-        Ok(new_impl)
+        .await?)
     }
 
     /// Run the `--upgrade`s that name the proxy under `[contracts].<key>`.
