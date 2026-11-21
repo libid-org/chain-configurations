@@ -134,3 +134,9 @@ threshold = 1
 address = "0x19bcbc5cf49025a8330e4fc32b4192bd08783096"
 owners = ["0xdaeb247f5a90c53f2d7a80a81f6cb6acb0d8b907"]
 threshold = 1
+
+# The wallet libID's live e2e tests bind from, the key alias/libid-testnet-e2e
+# in the libid-testnet AWS account: kept at the chain's cap, a week of binds.
+[funding.e2e]
+address = "0xd332b3a4a04a71fab8c7236c137519b0c70f25b7"
+top_up_to_wei = "56000000000000000"
