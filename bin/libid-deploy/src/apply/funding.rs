@@ -1,16 +1,15 @@
 //! Topping up the declared `[funding.<name>]` addresses from the deployer.
 
 use alloy::{
+    contract::RawCallBuilder,
     eips::BlockId,
-    network::TransactionBuilder,
-    providers::Provider,
-    rpc::types::TransactionRequest,
+    primitives::Bytes,
 };
-use anyhow::{
-    anyhow,
-    Result,
+use anyhow::Result;
+use libid_contracts::{
+    deploy::Mined,
+    send_with_nonce_retry,
 };
-use libid_contracts::deploy::Mined;
 
 use super::Applier;
 use crate::funding::TopUp;
@@ -50,24 +49,14 @@ impl Applier<'_> {
         let funding = &top_up.funding;
         let label = funding.component();
         let amount = top_up.amount();
-        let nonce = self
-            .provider
-            .get_transaction_count(self.sender)
-            .await
-            .map_err(|e| anyhow!("{label} top-up failed to fetch nonce: {e}"))?;
-        let tx = TransactionRequest::default()
-            .with_to(funding.address)
-            .with_value(amount)
-            .with_nonce(nonce);
-        let receipt = self
-            .provider
-            .send_transaction(tx)
-            .await
-            .map_err(|e| anyhow!("{label} top-up send failed: {e}"))?
-            .get_receipt()
-            .await
-            .map_err(|e| anyhow!("{label} top-up confirmation failed: {e}"))?
-            .succeeded(&format!("{label} top-up"))?;
+        let receipt = send_with_nonce_retry!(
+            RawCallBuilder::new_raw(&self.provider, Bytes::new())
+                .to(funding.address)
+                .value(amount),
+            format!("{label} top-up"),
+            &self.provider,
+            self.sender
+        )?;
         let after = funding.balance(&self.provider, receipt.block()).await?;
         if after < funding.target {
             tracing::warn!(

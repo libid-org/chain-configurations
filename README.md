@@ -356,6 +356,9 @@ after the top-up is logged, not refused, since the address may spend in
 the same block. The top-ups run last, after the Safes, so a run that
 fails earlier sends none.
 
+`--fund` runs a full apply: run `plan` first and fund only when it shows
+nothing but `funding.*` lines.
+
 Without `--fund` apply sends no top-up, and its summary lists each address
 below its target with the amount `--fund` would send. `--fund` on a file
 without `[funding]` is refused before anything is sent. `plan` prints one
