@@ -301,6 +301,27 @@ Declared-address semantics:
 - After registration apply reads `acceptsBindings` for every platform and
   fails if the registry still refuses one.
 
+## The agent link's fee bound
+
+An agent links an X or GitHub account with one `bindWithFeeCall`, worth
+the splitter's `fee_wei` plus two attestations at the Notary Service's
+`fee_wei`. The handles.link agent skill names a `MAX` per chain
+(https://handles.link/SKILL.md for the mainnets,
+https://testnet.handles.link/SKILL.md for the testnets), and an agent that
+meets a bind worth more stops and asks its human first. So on every network
+the skill lists:
+
+```text
+MAX >= referral_splitter.fee_wei + 2 * notary_service.fee_wei
+```
+
+The skill rounds that sum up to two significant digits, so the room left
+for a raise can be under one percent. Past `MAX`, every X and GitHub agent
+link on the chain stops at its human, so the handles.link release that
+raises `MAX` goes live before the apply that raises the fee. A Google
+binding carries no attestation and stays within the bound. The bound is
+checked by hand against the live skill before a raise.
+
 ## Safe multisigs
 
 Each `[safes.<name>]` table is a Safe multisig at an address that depends

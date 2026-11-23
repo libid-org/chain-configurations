@@ -64,6 +64,7 @@ owner = ""
 # mainnet's fee. A TLSNotary profile carries two attestations, so an X or
 # GitHub binding pays 0.00036 ETH; Google's carries none. Editing it makes
 # apply send `setFee`.
+# The agent skill's MAX bounds it: README, "The agent link's fee bound".
 fee_wei = "180000000000000"
 # The notary_fees Safe below: `sweep` sends the accrued fees there, and
 # anyone may call it. Editing it makes apply send `setFeeRecipient`.
@@ -107,6 +108,7 @@ referral_splitter = "0x7a1b71e0337dd42dfb15752374c87f39e8cbfcc9"
 share_bps = 3000
 # 0.0055 ETH, about $10: what every bind through the splitter pays; any
 # other amount reverts the bind.
+# The agent skill's MAX bounds it: README, "The agent link's fee bound".
 fee_wei = "5500000000000000"
 # The registry_fees Safe below.
 treasury = "0x19bcbc5cf49025a8330e4fc32b4192bd08783096"
