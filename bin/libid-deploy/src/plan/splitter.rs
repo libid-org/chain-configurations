@@ -2,7 +2,10 @@
 //! pays it, whether it exists, what it pays through, and whether its
 //! settings are the declared ones.
 
-use alloy::primitives::Address;
+use alloy::{
+    eips::BlockId,
+    primitives::Address,
+};
 use anyhow::{
     anyhow,
     Result,
@@ -166,7 +169,7 @@ impl Planner<'_> {
             .code("contracts.referral_splitter", splitter.address)
             .await?;
         let held = if present {
-            match splitter.on_chain(&self.provider).await {
+            match splitter.on_chain(&self.provider, BlockId::latest()).await {
                 Ok(on_chain) => {
                     self.push(SplitterWiring { stack, on_chain });
                     Ok((on_chain.owner, on_chain.settings))

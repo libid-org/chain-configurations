@@ -13,6 +13,8 @@
 //! name)` — exactly the addresses the file declared before the chain even
 //! existed.
 
+mod skewed_rpc;
+
 use std::{
     collections::BTreeMap,
     net::TcpListener,
@@ -24,6 +26,7 @@ use std::{
 };
 
 use alloy::{
+    eips::BlockId,
     network::EthereumWallet,
     node_bindings::{
         Anvil,
@@ -105,6 +108,10 @@ use libid_deploy::{
     rpc::RpcEndpoint,
     safes,
     signer::SignerSource,
+};
+use skewed_rpc::{
+    Skew,
+    SkewedRpc,
 };
 
 // The canonical anvil account #0 key. Public test material, not a secret.
@@ -1621,7 +1628,10 @@ async fn the_committed_local_dev_file_converges_an_anvil_through_rpc_url() {
     // The splitter holds the file's settings and pays the registry_fees
     // Safe, which apply created on the Safe contracts it installed.
     let splitter = cfg.splitter().unwrap().expect("local-dev declares one");
-    let on_chain = splitter.on_chain(&provider).await.unwrap();
+    let on_chain = splitter
+        .on_chain(&provider, BlockId::latest())
+        .await
+        .unwrap();
     assert_eq!(on_chain.settings, splitter.settings);
     assert_eq!(on_chain.owner, ANVIL_OWNER.parse::<Address>().unwrap());
     let registry_fees = cfg
@@ -2469,6 +2479,109 @@ async fn the_splitter_lands_with_the_registry_upgrade_that_pays_it() {
         settled.status_of("identity_registry.fee_call"),
         Some(Status::Ok)
     );
+}
+
+/// An existing stack upgraded and given its splitter through an endpoint
+/// whose `latest` state is one block behind the head, as a load-balanced RPC
+/// answers from a backend that has not seen the newest block: apply reads
+/// what it just deployed at the block that mined it, so the run converges.
+#[tokio::test]
+async fn apply_reads_back_a_deploy_at_the_block_that_mined_it() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_network_file(dir.path(), &anvil.endpoint());
+    apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let behind = SkewedRpc::start(anvil.endpoint_url(), Skew::LatestBehind).await;
+    write_network_file(dir.path(), behind.endpoint());
+    declare_splitter(&path, TREASURY, 3_000, SPLITTER_FEE_WEI);
+    let converged = apply_with(
+        &path,
+        apply::Options {
+            upgrades: vec![
+                "identity-registry".parse().unwrap(),
+                "proof-verifier".parse().unwrap(),
+            ],
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(converged.upgraded.len(), 2, "{:?}", converged.upgraded);
+    assert_eq!(
+        converged.deployed,
+        [(
+            "contracts.referral_splitter".to_string(),
+            splitter_address()
+        )]
+    );
+
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let direct = override_rpc(&cfg, &anvil.endpoint());
+    let settled = Plan::build(&cfg, &direct).await.expect("plan");
+    assert!(!settled.has_deploys(), "{}", settled.render());
+    for component in [
+        "contracts.referral_splitter",
+        "referral_splitter.wiring",
+        "referral_splitter.settings",
+        "identity_registry.fee_call",
+    ] {
+        assert_eq!(
+            settled.status_of(component),
+            Some(Status::Ok),
+            "{component}: {}",
+            settled.render()
+        );
+    }
+}
+
+/// A factory deploy that is mined and reverts, here out of gas under an
+/// estimate too low, stops apply with the revert and its transaction.
+#[tokio::test]
+async fn apply_stops_at_a_factory_deploy_that_reverted() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_network_file(dir.path(), &anvil.endpoint());
+    apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let short = SkewedRpc::start(anvil.endpoint_url(), Skew::HalfGasEstimate).await;
+    write_network_file(dir.path(), short.endpoint());
+    declare_splitter(&path, TREASURY, 3_000, SPLITTER_FEE_WEI);
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
+    let err = Applier::connect(&cfg, &file_rpc(&cfg), &signer, apply::Options::default())
+        .await
+        .expect("apply connects")
+        .run(&path)
+        .await
+        .expect_err("the splitter deploy reverted")
+        .to_string();
+    assert!(
+        err.starts_with(&format!(
+            "reverted: factory deploy of {} in transaction 0x",
+            names::REFERRAL_SPLITTER
+        )),
+        "got: {err}"
+    );
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    assert!(provider
+        .get_code_at(splitter_address())
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 /// Code at a Safe contract's address that is not the release's stops

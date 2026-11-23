@@ -49,5 +49,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
 [dev-dependencies]
-alloy = { version = "2", features = ["node-bindings"] }
+alloy = { version = "2", features = ["json-rpc", "node-bindings"] }
+# The anvil suite's JSON-RPC endpoint whose `latest` lags the head.
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 tempfile = "3"
+tokio = { version = "1", features = ["net"] }

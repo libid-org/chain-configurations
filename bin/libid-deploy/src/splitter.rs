@@ -9,6 +9,7 @@ use std::fmt;
 
 use alloy::{
     contract::Error as ContractError,
+    eips::BlockId,
     primitives::{
         Address,
         Bytes,
@@ -124,16 +125,20 @@ impl Splitter {
         Ok(code.into())
     }
 
-    /// What the chain holds at its address.
-    pub async fn on_chain<P: Provider>(&self, provider: &P) -> Result<OnChain> {
+    /// What the chain holds at its address, at `block`.
+    pub async fn on_chain<P: Provider>(
+        &self,
+        provider: &P,
+        block: BlockId,
+    ) -> Result<OnChain> {
         let contract = ReferralSplitter::new(self.address, provider);
         let (registry, escrow, owner, treasury, share_bps, fee) = (
-            contract.REGISTRY(),
-            contract.ESCROW(),
-            contract.owner(),
-            contract.treasury(),
-            contract.shareBps(),
-            contract.fee(),
+            contract.REGISTRY().block(block),
+            contract.ESCROW().block(block),
+            contract.owner().block(block),
+            contract.treasury().block(block),
+            contract.shareBps().block(block),
+            contract.fee().block(block),
         );
         let (registry, escrow, owner, treasury, share_bps, fee) = tokio::try_join!(
             registry.call(),

@@ -1,5 +1,6 @@
 //! Deploying the referral splitter and converging its settings.
 
+use alloy::eips::BlockId;
 use anyhow::{
     anyhow,
     bail,
@@ -62,29 +63,32 @@ impl Applier<'_> {
             return Ok(());
         };
         let stack = self.stack;
-        if !self.code_present(splitter.address).await? {
+        let block = if self.code_present(splitter.address).await? {
+            BlockId::latest()
+        } else {
             let owner = IdentityRegistry::new(stack.identity_registry, &self.provider)
                 .owner()
                 .call()
                 .await
                 .map_err(|e| anyhow!("IdentityRegistry.owner read failed: {e}"))?;
             let code = splitter.creation_code(&self.artifacts, &stack, owner)?;
-            let addr = self
+            let deployed = self
                 .factory_deploy_named(names::REFERRAL_SPLITTER, code)
                 .await?;
             tracing::info!(
-                %addr,
+                addr = %deployed.address,
                 name = names::REFERRAL_SPLITTER,
                 %owner,
                 "ReferralSplitter deployed"
             );
-            debug_assert_eq!(addr, splitter.address);
+            debug_assert_eq!(deployed.address, splitter.address);
             self.summary
                 .deployed
-                .push(("contracts.referral_splitter".into(), addr));
-        }
+                .push(("contracts.referral_splitter".into(), deployed.address));
+            deployed.block
+        };
 
-        let on_chain = splitter.on_chain(&self.provider).await?;
+        let on_chain = splitter.on_chain(&self.provider, block).await?;
         if !on_chain.wired_to(&stack) {
             bail!(
                 "the ReferralSplitter at {:#x} takes fees from {:#x} and pays through \

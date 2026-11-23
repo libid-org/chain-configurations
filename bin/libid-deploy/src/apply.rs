@@ -45,6 +45,8 @@ use std::{
 };
 
 use alloy::{
+    contract::RawCallBuilder,
+    eips::BlockId,
     network::TransactionBuilder,
     primitives::{
         utils::Unit,
@@ -86,6 +88,7 @@ use libid_contracts::{
     deploy::{
         deploy_contract_from,
         upgrade_uups,
+        Mined,
     },
     factory::{
         ensure_create2_deployer,
@@ -329,6 +332,14 @@ pub struct Applier<'a> {
     /// deploys or rotates does not move the answer for the platform after
     /// it.
     circuits: BTreeMap<Circuit, Site>,
+}
+
+/// A contract the factory deployed under a name.
+struct Named {
+    address: Address,
+    /// The block to read it at: the one that mined its deploy, or `latest`
+    /// for one an earlier run deployed.
+    block: BlockId,
 }
 
 impl<'a> Applier<'a> {
@@ -1020,12 +1031,14 @@ impl<'a> Applier<'a> {
     /// single-use name.
     ///
     /// The returned address is verified to equal `predict_address(factory,
-    /// name)` — the whole point of the exercise.
+    /// name)` — the whole point of the exercise. A deploy is read back in
+    /// the block that mined it: a load-balanced RPC may answer `latest`
+    /// from a node that has not seen that block yet.
     async fn factory_deploy_named(
         &self,
         name: &str,
         creation_code: Bytes,
-    ) -> Result<Address> {
+    ) -> Result<Named> {
         let (factory, sender) = (self.factory, self.sender);
         let contract = LibidFactory::new(factory, &self.provider);
         let predicted = predict_address(factory, name);
@@ -1043,7 +1056,10 @@ impl<'a> Applier<'a> {
                      {predicted:#x} — the deterministic invariant is broken"
                 );
             }
-            return Ok(existing);
+            return Ok(Named {
+                address: existing,
+                block: BlockId::latest(),
+            });
         }
 
         // `deploy` is sent as raw calldata: alloy's `sol!` reserves the
@@ -1052,29 +1068,17 @@ impl<'a> Applier<'a> {
             name: name.to_string(),
             creationCode: creation_code,
         };
-        let nonce = self
-            .provider
-            .get_transaction_count(sender)
-            .await
-            .map_err(|e| {
-                anyhow!("factory deploy of {name} failed to fetch nonce: {e}")
-            })?;
-        let tx = TransactionRequest::default()
-            .with_to(factory)
-            .with_input(Bytes::from(call.abi_encode()))
-            .with_nonce(nonce);
-        let pending = self
-            .provider
-            .send_transaction(tx)
-            .await
-            .map_err(|e| anyhow!("factory deploy of {name} send failed: {e}"))?;
-        pending
-            .get_receipt()
-            .await
-            .map_err(|e| anyhow!("factory deploy of {name} confirmation failed: {e}"))?;
-
+        let receipt = send_with_nonce_retry!(
+            RawCallBuilder::new_raw(&self.provider, Bytes::from(call.abi_encode()))
+                .to(factory),
+            format!("factory deploy of {name}"),
+            &self.provider,
+            sender
+        )?;
+        let block = receipt.block();
         let deployed = contract
             .deployedAt(name.to_string())
+            .block(block)
             .call()
             .await
             .map_err(|e| anyhow!("factory deployedAt({name}) re-read failed: {e}"))?;
@@ -1084,7 +1088,10 @@ impl<'a> Applier<'a> {
                  {predicted:#x} — the deterministic invariant is broken"
             );
         }
-        Ok(deployed)
+        Ok(Named {
+            address: deployed,
+            block,
+        })
     }
 
     /// Deploy `contract`'s implementation via plain CREATE (its address is
@@ -1105,7 +1112,7 @@ impl<'a> Applier<'a> {
             .await
             .map_err(|e| anyhow!("factory deployedAt({name}) read failed: {e}"))?;
         if record != Address::ZERO {
-            return self.factory_deploy_named(name, Bytes::new()).await;
+            return Ok(self.factory_deploy_named(name, Bytes::new()).await?.address);
         }
 
         let implementation = deploy_contract_from(
@@ -1116,7 +1123,10 @@ impl<'a> Applier<'a> {
         )
         .await?;
         let creation_code = self.proxy_creation_code(implementation, init_data)?;
-        self.factory_deploy_named(name, creation_code).await
+        Ok(self
+            .factory_deploy_named(name, creation_code)
+            .await?
+            .address)
     }
 
     /// The circuit verifier for `circuit`: the one its Platform Verifiers
@@ -1131,7 +1141,10 @@ impl<'a> Applier<'a> {
         };
         if !self.code_present(address).await? {
             let creation_code = self.artifacts.bytecode(circuit.contract())?;
-            let deployed = self.factory_deploy_named(&name, creation_code).await?;
+            let deployed = self
+                .factory_deploy_named(&name, creation_code)
+                .await?
+                .address;
             tracing::info!(
                 circuit = circuit.name(),
                 %deployed,
