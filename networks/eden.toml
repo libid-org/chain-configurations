@@ -58,13 +58,12 @@ notary = "0xcb5bf326745666041f57af74c27a43da822081c1"
 owner = ""
 
 [notary_service]
-# What one attestation verification costs, in wei: 0.78 TIA, Ethereum
-# mainnet's 0.00018 ETH at $2,330 per ETH and $0.538 per TIA (2026-10-29). A
-# TLSNotary profile carries two attestations, so an X or GitHub binding pays
-# 1.56 TIA; Google's carries none. The fee
-# accrues in the Notary Service until it is swept to fee_recipient. Editing it
-# makes apply send `setFee`.
-fee_wei = "780000000000000000"
+# What one attestation verification costs, in wei: 1.482 TIA, about $0.50 at
+# $0.3375 per TIA (DefiLlama, 2026-11-23 12:00 UTC). A TLSNotary profile
+# carries two attestations, so an X or GitHub binding pays 2.964 TIA; Google's
+# carries none. The fee accrues in the Notary Service until it is swept to
+# fee_recipient. Editing it makes apply send `setFee`.
+fee_wei = "1482000000000000000"
 # The notary_fees Safe below: `sweep` sends the accrued fees there, and
 # anyone may call it. Editing it makes apply send `setFeeRecipient`.
 fee_recipient = "0x757b1a49b38b31c1be0456bbd77ae7c9c9eff65d"
