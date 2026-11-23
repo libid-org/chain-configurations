@@ -63,6 +63,7 @@ owner = ""
 # carries two attestations, so an X or GitHub binding pays 0.000562 ETH;
 # Google's carries none. The fee accrues in the Notary Service until it is
 # swept to fee_recipient. Editing it makes apply send `setFee`.
+# The agent skill's MAX bounds it: README, "The agent link's fee bound".
 fee_wei = "281000000000000"
 # The notary_fees Safe below: `sweep` sends the accrued fees there, and
 # anyone may call it. Editing it makes apply send `setFeeRecipient`.
@@ -107,6 +108,7 @@ share_bps = 3000
 # 0.005806 ETH, about $10 at $1,722.42 per ETH (DefiLlama, 2026-11-23 12:00
 # UTC): what every bind through the splitter pays; any other amount reverts the
 # bind.
+# The agent skill's MAX bounds it: README, "The agent link's fee bound".
 fee_wei = "5806000000000000"
 # The registry_fees Safe below.
 treasury = "0xca5b1b4b68b89ecd2aa25b8822b317741bb702ba"
