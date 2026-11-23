@@ -26,11 +26,11 @@ name: Apply
 # The run's plan and apply summaries land in the step summary.
 #
 # THE BINARY IS NAMED AT DISPATCH. `source: release` runs the asset of the
-# tag in `release`, never "the latest", so a plan run and the apply run that
-# follows it name the same binary; the summary prints the tag and the
-# tarball's sha256 for comparing them. A branch build, and a `contracts_ref`,
-# run only on a network whose file signs with the testnet deployer key: the
-# `guard` job refuses them anywhere else before an approval is asked for.
+# tag in `release`, never "the latest". The `guard` job shows that asset's
+# sha256 before an approval is asked for, and the apply job refuses a
+# download with any other. A branch build, and a `contracts_ref`, run only on
+# a network whose file signs with the testnet deployer key: the guard refuses
+# them anywhere else.
 
 on:
   workflow_dispatch:
@@ -97,11 +97,18 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+    outputs:
+      asset: ${{ steps.check.outputs.asset }}
+      sha256: ${{ steps.check.outputs.sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # With source: release it also reads the Linux asset's sha256 from the
+      # release, writes it to the summary the approver sees, and hands it to
+      # the apply job, which refuses any other bytes.
       - name: Refuse a binary this network may not run
+        id: check
         env:
           GH_TOKEN: ${{ github.token }}
           NETWORK: ${{ inputs.network }}
@@ -125,8 +132,22 @@ jobs:
               [[ "$RELEASE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
                 { echo "::error::source: release needs release, a tag such as v0.23.0"; exit 1; }
               [ -z "$CONTRACTS_REF" ] || { echo "::error::contracts_ref needs source: branch"; exit 1; }
-              gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" --json tagName > /dev/null ||
+              asset="libid-deploy-${RELEASE#v}-x86_64-unknown-linux-gnu.tar.gz"
+              # shellcheck disable=SC2016 # $ENV is jq's, read from the ASSET variable
+              digest=$(ASSET="$asset" gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE" \
+                         --jq '.assets[] | select(.name == $ENV.ASSET) | .digest') ||
                 { echo "::error::no release $RELEASE in $GITHUB_REPOSITORY"; exit 1; }
+              [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+                { echo "::error::release $RELEASE has no $asset with a sha256 digest"; exit 1; }
+              {
+                echo "asset=$asset"
+                echo "sha256=${digest#sha256:}"
+              } >> "$GITHUB_OUTPUT"
+              {
+                echo "### Binary"
+                echo "- libid-deploy $RELEASE"
+                echo "- $asset sha256 \`${digest#sha256:}\`; the apply job refuses any other bytes"
+              } >> "$GITHUB_STEP_SUMMARY"
               ;;
             branch)
               [ -z "$RELEASE" ] || { echo "::error::release names a tag for source: release; leave it empty with source: branch"; exit 1; }
@@ -176,30 +197,29 @@ jobs:
           echo "endpoint: the RPC_URL secret of the ${{ inputs.network }} environment"
 
       # ── The binary: the named release's asset, or cargo from the branch ─
-      # A release asset can be replaced under its tag, so the run checks the
-      # binary's own version against the tag and prints the tarball's sha256.
+      # A release asset can be replaced under its tag, so the tarball must
+      # match the sha256 the guard job showed before approval, and the binary
+      # must report the tag's version.
       - name: Download libid-deploy ${{ inputs.release }}
         if: inputs.source == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE: ${{ inputs.release }}
+          ASSET: ${{ needs.guard.outputs.asset }}
+          SHA256: ${{ needs.guard.outputs.sha256 }}
         run: |
           set -euo pipefail
-          version="${RELEASE#v}"
-          asset="libid-deploy-$version-x86_64-unknown-linux-gnu.tar.gz"
           gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" \
-            --pattern "$asset" --output libid-deploy.tar.gz
+            --pattern "$ASSET" --output libid-deploy.tar.gz
           sum=$(sha256sum libid-deploy.tar.gz | cut -d' ' -f1)
+          [ "$sum" = "$SHA256" ] ||
+            { echo "::error::$ASSET has sha256 $sum, not $SHA256, which the guard job showed before approval"; exit 1; }
           tar -xzf libid-deploy.tar.gz --strip-components=1
           chmod +x libid-deploy
           reported=$(./libid-deploy --version)
-          [ "$reported" = "libid-deploy $version" ] ||
-            { echo "::error::the $RELEASE asset reports \"$reported\", not \"libid-deploy $version\""; exit 1; }
-          echo "libid-deploy $RELEASE, $asset sha256 $sum"
-          {
-            echo "- libid-deploy $RELEASE"
-            echo "- $asset sha256 \`$sum\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$reported" = "libid-deploy ${RELEASE#v}" ] ||
+            { echo "::error::the $RELEASE asset reports \"$reported\", not \"libid-deploy ${RELEASE#v}\""; exit 1; }
+          echo "libid-deploy $RELEASE, $ASSET sha256 $SHA256"
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         if: inputs.source == 'branch'
