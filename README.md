@@ -449,19 +449,26 @@ apply initiates it and, on anvil, completes it by impersonation.
 1. Inputs: `network` (choice), `mode` (`plan` default / `apply`), `upgrade`
    (comma list), `confirm_fresh_deploy`, `fund` (passes `--fund`: tops up
    each `[funding.<name>]` address, testnet files only), `source`
-   (`release` downloads the latest release binary; `branch` builds with
-   cargo), `contracts_ref` (with `branch`: a libid-contracts commit whose
-   artifacts are built and vendored in the run, patched in for the
+   (`release` downloads the binary of the tag named in `release`; `branch`
+   builds with cargo), `release` (with `release`: the tag, such as
+   `v0.23.0`), `contracts_ref` (with `branch`: a libid-contracts commit
+   whose artifacts are built and vendored in the run, patched in for the
    crates.io crate).
-2. Assumes `AWS_DEPLOYER_ROLE_ARN` via GitHub OIDC in the region parsed
+2. A `guard` job with no environment checks the inputs before any approval
+   or AWS credential. `source: branch` and `contracts_ref` run only on a
+   network whose `aws.kms_deployer` is `alias/libid-testnet-deployer`.
+   `source: release` needs a `release` tag that exists. The run checks
+   that the downloaded binary's `--version` matches the tag, and the step
+   summary names the tag and the tarball's sha256.
+3. Assumes `AWS_DEPLOYER_ROLE_ARN` via GitHub OIDC in the region parsed
    from the network file.
-3. KMS preflight before any transaction: `describe-key` must report an
+4. KMS preflight before any transaction: `describe-key` must report an
    enabled `ECC_SECG_P256K1`/`SIGN_VERIFY` key, the deployer address is
    derived from `get-public-key` via `cast keccak`, and its balance must be
    nonzero.
-4. Runs `plan` always; `apply` only when `mode: apply`. Both render into
+5. Runs `plan` always; `apply` only when `mode: apply`. Both render into
    the step summary.
-5. There is **no write-back and no PR step**: the file already declares
+6. There is **no write-back and no PR step**: the file already declares
    every canonical address, so an apply discovers nothing to record — a
    post-apply check fails the job if the working tree changed at all. The
    permissions are read-only on repo contents accordingly.
@@ -526,7 +533,7 @@ checks on the released ref, then builds `libid-deploy` for four targets —
 `aarch64-apple-darwin` and `x86_64-apple-darwin`, each natively on a runner
 of its architecture — and uploads `libid-deploy-<version>-<target>.tar.gz`
 for each as a release asset. The apply workflow's default `source:
-release` consumes the newest Linux x86_64 asset.
+release` runs the Linux x86_64 asset of the tag its `release` input names.
 
 ## Development
 
