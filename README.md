@@ -457,9 +457,10 @@ apply initiates it and, on anvil, completes it by impersonation.
 2. A `guard` job with no environment checks the inputs before any approval
    or AWS credential. `source: branch` and `contracts_ref` run only on a
    network whose `aws.kms_deployer` is `alias/libid-testnet-deployer`.
-   `source: release` needs a `release` tag that exists. The run checks
-   that the downloaded binary's `--version` matches the tag, and the step
-   summary names the tag and the tarball's sha256.
+   `source: release` needs a `release` tag that exists. The guard reads
+   the Linux asset's sha256 from the release and shows it in the step
+   summary before the approval; the apply job refuses a download with any
+   other sha256, or a binary whose `--version` differs from the tag.
 3. Assumes `AWS_DEPLOYER_ROLE_ARN` via GitHub OIDC in the region parsed
    from the network file.
 4. KMS preflight before any transaction: `describe-key` must report an
