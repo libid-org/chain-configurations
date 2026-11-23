@@ -34,6 +34,7 @@
 //! ([`crate::funding`]), so a run that fails before them sends no funds.
 
 mod funding;
+mod read_at;
 mod safes;
 mod splitter;
 
@@ -46,7 +47,6 @@ use std::{
 
 use alloy::{
     contract::RawCallBuilder,
-    eips::BlockId,
     network::TransactionBuilder,
     primitives::{
         utils::Unit,
@@ -88,7 +88,6 @@ use libid_contracts::{
     deploy::{
         deploy_contract_from,
         upgrade_uups,
-        Mined,
     },
     factory::{
         ensure_create2_deployer,
@@ -123,6 +122,7 @@ use crate::{
     },
     signer::SignerSource,
 };
+use read_at::ReadAt;
 
 /// A component an operator can explicitly upgrade. Every one is a UUPS
 /// proxy: the implementation is replaced and the entry address, its
@@ -337,9 +337,9 @@ pub struct Applier<'a> {
 /// A contract the factory deployed under a name.
 struct Named {
     address: Address,
-    /// The block to read it at: the one that mined its deploy, or `latest`
-    /// for one an earlier run deployed.
-    block: BlockId,
+    /// Where to read it: the block that mined its deploy, or `latest` for
+    /// one an earlier run deployed.
+    at: ReadAt,
 }
 
 impl<'a> Applier<'a> {
@@ -1031,9 +1031,9 @@ impl<'a> Applier<'a> {
     /// single-use name.
     ///
     /// The returned address is verified to equal `predict_address(factory,
-    /// name)` — the whole point of the exercise. A deploy is read back in
-    /// the block that mined it: a load-balanced RPC may answer `latest`
-    /// from a node that has not seen that block yet.
+    /// name)` — the whole point of the exercise. A deploy is read back at
+    /// the block that mined it ([`ReadAt::Mined`]): a load-balanced RPC may
+    /// answer `latest` from a node that has not seen that block yet.
     async fn factory_deploy_named(
         &self,
         name: &str,
@@ -1058,7 +1058,7 @@ impl<'a> Applier<'a> {
             }
             return Ok(Named {
                 address: existing,
-                block: BlockId::latest(),
+                at: ReadAt::Latest,
             });
         }
 
@@ -1075,13 +1075,17 @@ impl<'a> Applier<'a> {
             &self.provider,
             sender
         )?;
-        let block = receipt.block();
-        let deployed = contract
-            .deployedAt(name.to_string())
-            .block(block)
-            .call()
-            .await
-            .map_err(|e| anyhow!("factory deployedAt({name}) re-read failed: {e}"))?;
+        let at = ReadAt::of(&receipt);
+        let deployed = at
+            .read("factory deployedAt", |block| {
+                let read = contract.deployedAt(name.to_string()).block(block);
+                async move {
+                    read.call().await.map_err(|e| {
+                        anyhow!("factory deployedAt({name}) re-read failed: {e}")
+                    })
+                }
+            })
+            .await?;
         if deployed != predicted {
             bail!(
                 "factory deployed {name} at {deployed:#x} but predict says \
@@ -1090,7 +1094,7 @@ impl<'a> Applier<'a> {
         }
         Ok(Named {
             address: deployed,
-            block,
+            at,
         })
     }
 

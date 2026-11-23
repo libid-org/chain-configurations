@@ -1,6 +1,5 @@
 //! Deploying the referral splitter and converging its settings.
 
-use alloy::eips::BlockId;
 use anyhow::{
     anyhow,
     bail,
@@ -16,6 +15,7 @@ use libid_contracts::{
 
 use super::{
     Applier,
+    ReadAt,
     Upgrade,
 };
 use crate::{
@@ -63,8 +63,8 @@ impl Applier<'_> {
             return Ok(());
         };
         let stack = self.stack;
-        let block = if self.code_present(splitter.address).await? {
-            BlockId::latest()
+        let at = if self.code_present(splitter.address).await? {
+            ReadAt::Latest
         } else {
             let owner = IdentityRegistry::new(stack.identity_registry, &self.provider)
                 .owner()
@@ -85,10 +85,14 @@ impl Applier<'_> {
             self.summary
                 .deployed
                 .push(("contracts.referral_splitter".into(), deployed.address));
-            deployed.block
+            deployed.at
         };
 
-        let on_chain = splitter.on_chain(&self.provider, block).await?;
+        let on_chain = at
+            .read("ReferralSplitter", |block| {
+                splitter.on_chain(&self.provider, block)
+            })
+            .await?;
         if !on_chain.wired_to(&stack) {
             bail!(
                 "the ReferralSplitter at {:#x} takes fees from {:#x} and pays through \

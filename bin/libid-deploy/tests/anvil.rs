@@ -2541,6 +2541,48 @@ async fn apply_reads_back_a_deploy_at_the_block_that_mined_it() {
     }
 }
 
+/// The splitter deploy through an endpoint whose backend has not seen the
+/// block that mined it, so the first reads at that block answer `header not
+/// found`: apply reads it again until the block is there.
+#[tokio::test]
+async fn apply_reads_a_deploy_back_again_while_the_rpc_lacks_its_block() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write_network_file(dir.path(), &anvil.endpoint());
+    apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let unseen = SkewedRpc::start(anvil.endpoint_url(), Skew::UnseenBlock(2)).await;
+    write_network_file(dir.path(), unseen.endpoint());
+    declare_splitter(&path, TREASURY, 3_000, SPLITTER_FEE_WEI);
+    let converged = apply_with(&path, apply::Options::default()).await;
+    assert_eq!(
+        converged.deployed,
+        [(
+            "contracts.referral_splitter".to_string(),
+            splitter_address()
+        )]
+    );
+
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let direct = override_rpc(&cfg, &anvil.endpoint());
+    let settled = Plan::build(&cfg, &direct).await.expect("plan");
+    for component in ["referral_splitter.wiring", "referral_splitter.settings"] {
+        assert_eq!(
+            settled.status_of(component),
+            Some(Status::Ok),
+            "{component}: {}",
+            settled.render()
+        );
+    }
+}
+
 /// A factory deploy that is mined and reverts, here out of gas under an
 /// estimate too low, stops apply with the revert and its transaction.
 #[tokio::test]
