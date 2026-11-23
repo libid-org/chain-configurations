@@ -58,12 +58,12 @@ notary = "0xcb5bf326745666041f57af74c27a43da822081c1"
 owner = ""
 
 [notary_service]
-# What one attestation verification costs, in wei: 0.00018 ETH, about $0.50 at
-# $2,718 per ETH (2026-10-05). A TLSNotary profile carries two attestations,
-# so an X or GitHub binding pays 0.00036 ETH; Google's carries none. The fee
-# accrues in the Notary Service until it is swept to fee_recipient. Editing it
-# makes apply send `setFee`.
-fee_wei = "180000000000000"
+# What one attestation verification costs, in wei: 0.0002903 ETH, about $0.50
+# at $1,722.42 per ETH (DefiLlama, 2026-11-23 12:00 UTC). A TLSNotary profile
+# carries two attestations, so an X or GitHub binding pays 0.0005806 ETH;
+# Google's carries none. The fee accrues in the Notary Service until it is
+# swept to fee_recipient. Editing it makes apply send `setFee`.
+fee_wei = "290300000000000"
 # The notary_fees Safe below: `sweep` sends the accrued fees there, and
 # anyone may call it. Editing it makes apply send `setFeeRecipient`.
 fee_recipient = "0x757b1a49b38b31c1be0456bbd77ae7c9c9eff65d"
@@ -87,6 +87,8 @@ google_jwt_roots = "0xa2c959b2940bdb8f97af52401c1603000a3aa46b"
 x_platform_verifier = "0xe9b6d548a070fcaa5b43344c0b495d982aaa9fc4"
 github_platform_verifier = "0x4f6d4a3486a00b260a1dd91f9dde6f333de6861f"
 google_platform_verifier = "0x731f3943879ccf40a21a7b84e9b7ec01776cb9cc"
+# The fee receiver of a bind, set up by [referral_splitter] below.
+referral_splitter = "0xc22bc309d7f2c7d921835d0cbfef02ebc84f7c98"
 
 # The ceremony circuit verifiers are NOT declared here. `libid-deploy`
 # carries them: `libid-contracts` embeds each circuit's bb-generated
@@ -95,6 +97,19 @@ google_platform_verifier = "0x731f3943879ccf40a21a7b84e9b7ec01776cb9cc"
 # deploys one through the factory under a CREATE3 name carrying that
 # release. Each Platform Verifier implementation compiles in the code
 # hash of its circuit's verifier.
+
+# The referral splitter. A bind through it pays exactly `fee_wei` here; with
+# a referral the splitter delivers `share_bps` of it to the referrer's handle
+# through the handle escrow, and the rest goes to `treasury`. Its owner is
+# the identity registry's owner, and a held share waits for its referrer.
+[referral_splitter]
+share_bps = 3000
+# 0.005806 ETH, about $10 at $1,722.42 per ETH (DefiLlama, 2026-11-23 12:00
+# UTC): what every bind through the splitter pays; any other amount reverts the
+# bind.
+fee_wei = "5806000000000000"
+# The registry_fees Safe below.
+treasury = "0xca5b1b4b68b89ecd2aa25b8822b317741bb702ba"
 
 # Safe multisigs, one per [safes.<name>] table. A Safe's address follows from
 # its name and accounts.deployer alone: apply creates it through the Safe v1.4.1
