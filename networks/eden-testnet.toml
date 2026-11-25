@@ -101,10 +101,10 @@ referral_splitter = "0x7a1b71e0337dd42dfb15752374c87f39e8cbfcc9"
 # the identity registry's owner, and a held share waits for its referrer.
 [referral_splitter]
 share_bps = 3000
-# 28 TIA, about $10: what every bind through the splitter pays; any other
-# amount reverts the bind.
+# 0.0028 TIA, what faucet TIA covers: what every bind through the splitter
+# pays; any other amount reverts the bind.
 # The agent skill's MAX bounds it: README, "The agent link's fee bound".
-fee_wei = "28000000000000000000"
+fee_wei = "2800000000000000"
 # The registry_fees Safe below.
 treasury = "0x19bcbc5cf49025a8330e4fc32b4192bd08783096"
 
