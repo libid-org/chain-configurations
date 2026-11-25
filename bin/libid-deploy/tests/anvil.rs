@@ -77,22 +77,25 @@ use libid_contracts::{
         referral::ReferralSplitter,
     },
     circuits::deploy_honk_verifier,
-    deploy::deploy_contract_from,
+    deploy::{
+        deploy_contract_from,
+        ProxyReads,
+    },
     factory::{
         predict_address,
         FactoryGenesis,
+        CREATE2_DEPLOYER,
     },
     Artifacts,
+    Error,
 };
 use libid_deploy::{
     apply::{
         self,
         Applier,
     },
-    circuits::{
-        self,
-        Circuit,
-    },
+    circuits::Circuit,
+    code::Code,
     config::NetworkConfig,
     funding::TopUp,
     names,
@@ -117,6 +120,8 @@ use skewed_rpc::{
 // The canonical anvil account #0 key. Public test material, not a secret.
 const ANVIL_KEY: &str =
     "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+// Code that takes any call and does nothing.
+const STOP: Bytes = Bytes::from_static(&[0x00]);
 // The address of anvil account #0 — the deployer and the declared
 // operational owner in the local dev config, exactly as
 // networks/local-dev.toml describes it.
@@ -231,8 +236,8 @@ google_platform_verifier = "{google}"
 
 /// A second copy of `circuit`'s verifier at a plain CREATE address, to drift
 /// a trust root onto. `setTrustRoots` accepts any address holding the code
-/// the implementation pins, so a copy off the canonical CREATE3 address is
-/// the drift apply must pull back.
+/// the implementation pins, so a copy off the address of its code is the
+/// drift apply must pull back.
 async fn deploy_verifier_copy(rpc: &str, key: &str, circuit: Circuit) -> Address {
     let signer: PrivateKeySigner = key.parse().unwrap();
     let provider = ProviderBuilder::new()
@@ -298,12 +303,108 @@ async fn honk_log_n<P: Provider>(provider: &P, verifier: Address) -> u64 {
     decoded._0.to::<u64>()
 }
 
-/// The address apply deploys a circuit's Honk verifier to: CREATE3 under a
-/// name carrying the pinned circuits release, so it is known before the
-/// chain has anything on it.
+/// Where `contract`'s code deploys: its CREATE2 address, so it is known
+/// before the chain has anything on it.
+fn code_address(contract: &str) -> Address {
+    Code::of(&Artifacts::embedded(), contract)
+        .expect("the release holds the contract")
+        .address()
+}
+
+/// The address apply deploys a circuit's Honk verifier to.
 fn circuit_verifier_address(circuit: Circuit) -> Address {
-    let factory = factory_address();
-    predict_address(factory, &circuits::factory_name(circuit).unwrap())
+    code_address(circuit.contract())
+}
+
+/// Every proxy an `--upgrade` moves and the contract it runs.
+fn upgradable(cfg: &NetworkConfig) -> Vec<(Address, &'static str)> {
+    let contracts = &cfg.contracts;
+    [
+        ("notary_service", "NotaryService"),
+        ("ceremony_proof_verifier", "CeremonyProofVerifier"),
+        ("identity_registry", "IdentityRegistry"),
+        ("handle_escrow", "HandleEscrow"),
+        ("google_jwt_roots", "GoogleJwtRoots"),
+        ("x_platform_verifier", "XPlatformVerifier"),
+        ("github_platform_verifier", "GitHubPlatformVerifier"),
+        ("google_platform_verifier", "GooglePlatformVerifier"),
+    ]
+    .map(|(key, contract)| (contracts.address(key).unwrap(), contract))
+    .to_vec()
+}
+
+/// Every `--upgrade` there is.
+fn every_upgrade() -> Vec<apply::Upgrade> {
+    apply::Upgrade::VALUES
+        .iter()
+        .map(|value| value.parse().expect("value parses"))
+        .collect()
+}
+
+/// Move each proxy in `proxies` onto its contract's code at an address the
+/// deployer's nonce picks, another one than the code's own.
+async fn run_from_another_address(
+    anvil: &AnvilInstance,
+    proxies: &[(Address, &'static str)],
+) {
+    let key: PrivateKeySigner = ANVIL_KEY.parse().unwrap();
+    let owned = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(key))
+        .connect_http(anvil.endpoint_url());
+    let artifacts = Artifacts::embedded();
+    for (proxy, contract) in proxies {
+        let code = artifacts.bytecode(contract).unwrap();
+        let elsewhere = deploy_contract_from(&owned, code, contract, None)
+            .await
+            .expect("the implementation deploys");
+        assert_ne!(elsewhere, code_address(contract), "{contract}");
+        IUUPSUpgradeable::new(*proxy, &owned)
+            .upgradeToAndCall(elsewhere, Bytes::new())
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+    }
+}
+
+/// Why apply stops on `--upgrade <value>`.
+async fn refused_upgrade(cfg: &NetworkConfig, path: &Path, value: &str) -> String {
+    let signer = SignerSource::from_spec(ANVIL_KEY).expect("local signer");
+    let opts = apply::Options {
+        upgrades: vec![value.parse().expect("value parses")],
+        ..Default::default()
+    };
+    Applier::connect(cfg, &file_rpc(cfg), &signer, opts)
+        .await
+        .expect("apply connects")
+        .run(path)
+        .await
+        .expect_err("apply stops at the upgrade")
+        .to_string()
+}
+
+/// Take `contract`'s code off the chain, as a chain the release has not
+/// reached yet.
+async fn forget_code<P: Provider>(provider: &P, contract: &str) {
+    let address = code_address(contract);
+    provider
+        .anvil_set_code(address, Bytes::new())
+        .await
+        .expect("anvil_setCode");
+    provider
+        .anvil_set_nonce(address, 0)
+        .await
+        .expect("anvil_setNonce");
+}
+
+/// The deployer's nonce: how many transactions it has sent.
+async fn sent<P: Provider>(provider: &P) -> u64 {
+    provider
+        .get_transaction_count(ANVIL_OWNER.parse().unwrap())
+        .await
+        .expect("nonce")
 }
 
 /// The critical test: pre-filled declarative config → fresh apply on a
@@ -463,14 +564,11 @@ async fn declarative_apply_cycle_never_touches_the_config() {
     );
 
     // Every explicit upgrade runs, and the state behind each proxy survives.
-    let upgrades: Vec<apply::Upgrade> = apply::Upgrade::VALUES
-        .iter()
-        .map(|v| v.parse().expect("value parses"))
-        .collect();
+    run_from_another_address(&anvil, &upgradable(&cfg)).await;
     let upgraded = apply_with(
         &path,
         apply::Options {
-            upgrades,
+            upgrades: every_upgrade(),
             ..Default::default()
         },
     )
@@ -732,6 +830,7 @@ async fn apply_upgrades_the_proof_verifier_before_the_registry_that_quotes_throu
     let cfg = NetworkConfig::load(&path).expect("config loads");
     let proof_verifier: Address = cfg.contracts.ceremony_proof_verifier.get().unwrap();
     let identity_registry: Address = cfg.contracts.identity_registry.get().unwrap();
+    run_from_another_address(&anvil, &upgradable(&cfg)).await;
 
     let key: PrivateKeySigner = ANVIL_KEY.parse().unwrap();
     let owned = ProviderBuilder::new()
@@ -796,10 +895,84 @@ async fn apply_upgrades_the_proof_verifier_before_the_registry_that_quotes_throu
     );
 }
 
+/// `--upgrade` moves each proxy to the address of the release's code, with
+/// one transaction where the chain holds that code and two where it does
+/// not. A run that repeats it sends nothing.
+#[tokio::test]
+async fn an_upgrade_lands_at_the_address_of_its_code_and_runs_once() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prefilled_network_file(dir.path(), &anvil.endpoint());
+    apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let proxies = upgradable(&cfg);
+    run_from_another_address(&anvil, &proxies).await;
+    forget_code(&provider, "HandleEscrow").await;
+
+    let before = sent(&provider).await;
+    let upgraded = apply_with(
+        &path,
+        apply::Options {
+            upgrades: every_upgrade(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(upgraded.upgraded.len(), proxies.len());
+    assert!(upgraded.current.is_empty(), "{:?}", upgraded.current);
+    assert!(upgraded.deployed.is_empty(), "{:?}", upgraded.deployed);
+    assert!(upgraded.configured.is_empty(), "{:?}", upgraded.configured);
+    assert_eq!(
+        sent(&provider).await - before,
+        proxies.len() as u64 + 1,
+        "one upgrade each, and the escrow's code"
+    );
+    for (proxy, contract) in &proxies {
+        assert_eq!(
+            provider
+                .implementation_of(*proxy, BlockId::latest())
+                .await
+                .unwrap(),
+            code_address(contract),
+            "{contract}"
+        );
+    }
+
+    let before = sent(&provider).await;
+    let again = apply_with(
+        &path,
+        apply::Options {
+            upgrades: every_upgrade(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(sent(&provider).await, before, "a repeated upgrade sent one");
+    assert!(again.upgraded.is_empty(), "{:?}", again.upgraded);
+    assert_eq!(again.current.len(), proxies.len());
+    assert!(
+        again
+            .render()
+            .contains(&format!("HandleEscrow {:#x}", code_address("HandleEscrow"))),
+        "{}",
+        again.render()
+    );
+}
+
 /// The network-invariance proof: run the SAME pre-filled declarative apply
 /// against two completely separate bare anvils (both without even the
-/// CREATE2 deployer) and assert both chains end up with code at the SAME
-/// declared canonical addresses. Integration tests can therefore use
+/// CREATE2 deployer, the deployer at another nonce on the second) and assert
+/// both chains end up with code at the SAME declared canonical addresses,
+/// every proxy on the SAME implementation and every Platform Verifier on the
+/// SAME circuit verifier. Integration tests can therefore use
 /// identical config data regardless of which chain they run on.
 #[tokio::test]
 async fn fresh_apply_addresses_are_network_invariant() {
@@ -810,6 +983,11 @@ async fn fresh_apply_addresses_are_network_invariant() {
         let sub = dir.path().join(format!("chain{index}"));
         std::fs::create_dir_all(&sub).expect("subdir");
         let path = prefilled_network_file(&sub, &anvil.endpoint());
+        ProviderBuilder::new()
+            .connect_http(anvil.endpoint_url())
+            .anvil_set_nonce(ANVIL_OWNER.parse().unwrap(), u64::from(index) * 100)
+            .await
+            .expect("anvil_setNonce");
         apply_with(
             &path,
             apply::Options {
@@ -825,6 +1003,25 @@ async fn fresh_apply_addresses_are_network_invariant() {
         let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
         let cfg = NetworkConfig::load(path).expect("config loads");
         assert_declared_and_present(&provider, &cfg).await;
+        for (proxy, contract) in upgradable(&cfg) {
+            assert_eq!(
+                provider
+                    .implementation_of(proxy, BlockId::latest())
+                    .await
+                    .unwrap(),
+                code_address(contract),
+                "{contract}"
+            );
+        }
+        let wired = wired_verifiers(&provider, &cfg).await;
+        for platform in platforms::LAUNCH {
+            assert_eq!(
+                wired[platform.label],
+                circuit_verifier_address(platform.circuit()),
+                "{}",
+                platform.label
+            );
+        }
     }
 
     // Same declarations, so the same addresses — the whole cross-network
@@ -881,8 +1078,8 @@ async fn platform_verifiers_deploy_wire_and_register() {
         fresh.deployed
     );
 
-    // Both circuit verifiers are real Honk verifiers at their CREATE3
-    // addresses, over DIFFERENT circuits. A bb verifier has no getter for
+    // Both circuit verifiers are real Honk verifiers at the addresses of
+    // their code, over DIFFERENT circuits. A bb verifier has no getter for
     // its verification key; the one thing it says about itself is the logN
     // a wrong-length proof comes back with, so that is what separates a
     // real verifier from a contract that merely has code.
@@ -1061,14 +1258,11 @@ async fn platform_verifiers_deploy_wire_and_register() {
     }
 
     // Every verifier upgrades, and its trust roots survive.
-    let upgrades: Vec<apply::Upgrade> = apply::Upgrade::VALUES
-        .iter()
-        .map(|v| v.parse().expect("value parses"))
-        .collect();
+    run_from_another_address(&anvil, &upgradable(&cfg)).await;
     let upgraded = apply_with(
         &path,
         apply::Options {
-            upgrades,
+            upgrades: every_upgrade(),
             ..Default::default()
         },
     )
@@ -1095,8 +1289,8 @@ async fn platform_verifiers_deploy_wire_and_register() {
 }
 
 /// Each Platform Verifier on its own copy of the vendored verifiers, every
-/// one of them at a plain CREATE address. The verifiers at the release's
-/// names stay where the fresh apply put them.
+/// one of them at a plain CREATE address. The verifiers at the addresses of
+/// their code stay where the fresh apply put them.
 async fn wire_onto_copies(
     anvil: &AnvilInstance,
     cfg: &NetworkConfig,
@@ -1147,13 +1341,12 @@ async fn wired_verifiers<P: Provider>(
     wired
 }
 
-/// A Platform Verifier on a verifier with the vendored code keeps it, under
-/// whatever name it was deployed, X and GitHub each on a copy of their own:
-/// a circuits release that rebuilds the same verifiers finds nothing at its
-/// new names and still deploys and rotates nothing. The release is stood in
-/// for by clearing the code at the release's names.
+/// A Platform Verifier on a verifier with the vendored code keeps it, at
+/// whatever address it was deployed, X and GitHub each on a copy of their
+/// own: with nothing at the addresses of the code, apply still deploys and
+/// rotates nothing.
 #[tokio::test]
-async fn platform_verifiers_keep_a_verifier_with_the_vendored_code_under_any_name() {
+async fn platform_verifiers_keep_a_verifier_with_the_vendored_code_at_any_address() {
     let anvil = spawn_anvil();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = prefilled_network_file(dir.path(), &anvil.endpoint());
@@ -1209,14 +1402,14 @@ async fn platform_verifiers_keep_a_verifier_with_the_vendored_code_under_any_nam
                 .await
                 .unwrap()
                 .is_empty(),
-            "{} was deployed under its release name",
+            "{} was deployed at the address of its code",
             circuit.name()
         );
     }
 }
 
 /// A Platform Verifier whose verifier no longer holds the vendored code is
-/// rotated onto the verifier at the release's name with `setTrustRoots`,
+/// rotated onto the verifier at the address of its code with `setTrustRoots`,
 /// and the proxy and its registration stay. Swapping the code under the
 /// copies stands in for verifiers of another circuits release.
 #[tokio::test]
@@ -1279,12 +1472,79 @@ async fn platform_verifiers_off_the_vendored_code_rotate_onto_the_release_verifi
     );
 }
 
-/// A canonical circuit verifier whose code is not the one the Platform
-/// Verifier implementation pins cannot be rotated onto: plan warns, and
-/// apply stops before `setTrustRoots`, naming the `--upgrade` that ships
-/// an implementation pinning it. The test swaps the code under the
-/// canonical address, as a circuits release would move it, and under the
-/// copy the Platform Verifiers use, so none holds the vendored code.
+/// A circuit verifier deploys while another key owns the factory: it goes
+/// through the CREATE2 deployer, which has no owner.
+#[tokio::test]
+async fn circuit_verifiers_deploy_while_another_key_owns_the_factory() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prefilled_network_file(dir.path(), &anvil.endpoint());
+    let body = std::fs::read_to_string(&path).expect("read network file");
+    std::fs::write(
+        &path,
+        body.replace(
+            &format!("owner = \"{ANVIL_OWNER}\""),
+            &format!("owner = \"{OTHER_OWNER}\""),
+        ),
+    )
+    .expect("write network file");
+    apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    assert_eq!(
+        LibidFactory::new(factory_address(), &provider)
+            .owner()
+            .call()
+            .await
+            .unwrap(),
+        OTHER_OWNER.parse::<Address>().unwrap()
+    );
+    for copy in wire_onto_copies(&anvil, &cfg).await.into_values() {
+        provider
+            .anvil_set_code(copy, Bytes::from(vec![0x00]))
+            .await
+            .expect("anvil_setCode");
+    }
+    for circuit in platforms::circuits() {
+        forget_code(&provider, circuit.contract()).await;
+    }
+
+    let rotated = apply_with(&path, apply::Options::default()).await;
+    let verifiers: Vec<_> = platforms::circuits()
+        .into_iter()
+        .map(|circuit| {
+            (
+                format!("circuits.{}", circuit.name()),
+                circuit_verifier_address(circuit),
+            )
+        })
+        .collect();
+    assert_eq!(rotated.deployed, verifiers);
+    let wired = wired_verifiers(&provider, &cfg).await;
+    for platform in platforms::LAUNCH {
+        assert_eq!(
+            wired[platform.label],
+            circuit_verifier_address(platform.circuit()),
+            "{}",
+            platform.label
+        );
+    }
+}
+
+/// A circuit verifier at the address of its code whose code is not the one
+/// the Platform Verifier implementation pins cannot be rotated onto: plan
+/// warns, and apply stops before `setTrustRoots`, naming the `--upgrade`
+/// that ships an implementation pinning it. The test swaps the code there,
+/// as a circuits release would move it, and under the copy the Platform
+/// Verifiers use, so none holds the vendored code.
 #[tokio::test]
 async fn apply_refuses_a_rotation_onto_code_the_implementation_does_not_pin() {
     let anvil = spawn_anvil();
@@ -1699,7 +1959,7 @@ async fn rpc_override_moves_only_the_transport() {
         let addr = circuit_verifier_address(circuit);
         assert!(
             !provider.get_code_at(addr).await.unwrap().is_empty(),
-            "{} has no code at its CREATE3 address {addr:#x}",
+            "{} has no code at {addr:#x}, the address of its code",
             circuit.name()
         );
     }
@@ -2499,6 +2759,14 @@ async fn apply_reads_back_a_deploy_at_the_block_that_mined_it() {
     )
     .await;
 
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    run_from_another_address(&anvil, &upgradable(&cfg)).await;
+    forget_code(
+        &ProviderBuilder::new().connect_http(anvil.endpoint_url()),
+        "IdentityRegistry",
+    )
+    .await;
+
     let behind = SkewedRpc::start(anvil.endpoint_url(), Skew::LatestBehind).await;
     write_network_file(dir.path(), behind.endpoint());
     declare_splitter(&path, TREASURY, 3_000, SPLITTER_FEE_WEI);
@@ -2624,6 +2892,131 @@ async fn apply_stops_at_a_factory_deploy_that_reverted() {
         .await
         .unwrap()
         .is_empty());
+}
+
+/// A code deploy that is mined and reverts, here out of gas under an
+/// estimate too low, stops apply with the revert and its transaction before
+/// the proxy moves.
+#[tokio::test]
+async fn apply_stops_at_a_code_deploy_that_reverted() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prefilled_network_file(dir.path(), &anvil.endpoint());
+    apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    run_from_another_address(&anvil, &upgradable(&cfg)).await;
+    forget_code(&provider, "HandleEscrow").await;
+    let escrow = cfg.contracts.address("handle_escrow").unwrap();
+    let before = provider
+        .implementation_of(escrow, BlockId::latest())
+        .await
+        .unwrap();
+
+    let short = SkewedRpc::start(anvil.endpoint_url(), Skew::HalfGasEstimate).await;
+    write_network_file(dir.path(), short.endpoint());
+    let err = refused_upgrade(
+        &NetworkConfig::load(&path).expect("config loads"),
+        &path,
+        "handle-escrow",
+    )
+    .await;
+    assert!(
+        err.starts_with("reverted: CREATE2 deploy of HandleEscrow in transaction 0x"),
+        "got: {err}"
+    );
+    assert!(provider
+        .get_code_at(code_address("HandleEscrow"))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        provider
+            .implementation_of(escrow, BlockId::latest())
+            .await
+            .unwrap(),
+        before
+    );
+}
+
+/// A chain whose account at the CREATE2 deployer's address is not the
+/// deployer takes the transaction and deploys nothing: apply stops there,
+/// before the proxy moves.
+#[tokio::test]
+async fn apply_stops_at_a_code_deploy_that_left_no_code() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prefilled_network_file(dir.path(), &anvil.endpoint());
+    apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    run_from_another_address(&anvil, &upgradable(&cfg)).await;
+    forget_code(&provider, "HandleEscrow").await;
+    provider
+        .anvil_set_code(CREATE2_DEPLOYER, STOP)
+        .await
+        .expect("anvil_setCode");
+
+    let err = refused_upgrade(&cfg, &path, "handle-escrow").await;
+    assert_eq!(
+        err,
+        format!(
+            "the CREATE2 deploy of HandleEscrow left no code at {:#x}",
+            code_address("HandleEscrow")
+        )
+    );
+}
+
+/// An upgrade the proxy's slot does not show stops apply: here the proxy
+/// takes the call and changes nothing.
+#[tokio::test]
+async fn apply_stops_at_an_upgrade_the_slot_does_not_show() {
+    let anvil = spawn_anvil();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = prefilled_network_file(dir.path(), &anvil.endpoint());
+    apply_with(
+        &path,
+        apply::Options {
+            confirm_fresh_deploy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let cfg = NetworkConfig::load(&path).expect("config loads");
+    run_from_another_address(&anvil, &upgradable(&cfg)).await;
+    let escrow = cfg.contracts.address("handle_escrow").unwrap();
+    let found = provider
+        .implementation_of(escrow, BlockId::latest())
+        .await
+        .unwrap();
+    provider
+        .anvil_set_code(escrow, STOP)
+        .await
+        .expect("anvil_setCode");
+
+    let err = refused_upgrade(&cfg, &path, "handle-escrow").await;
+    let unmoved = Error::NotUpgraded {
+        contract: "HandleEscrow".into(),
+        proxy: escrow,
+        wanted: code_address("HandleEscrow"),
+        found,
+    };
+    assert_eq!(err, unmoved.to_string());
 }
 
 /// Code at a Safe contract's address that is not the release's stops

@@ -21,14 +21,12 @@
 //! `libid.HandleEscrow.3` is the 0.19 escrow, and `libid.HandleEscrow.2`
 //! belongs to the factory before this one.
 //!
-//! Two kinds of contract are NOT in this table. Proxy implementations
-//! deploy via plain CREATE: their addresses are referenced by a proxy
-//! slot, and an upgrade replaces one without moving any entry address. The
-//! ceremony circuits' Honk verifiers do go through the factory — see
-//! [`crate::circuits::factory_name`] — but under a name carrying the
-//! circuits release rather than a frozen one, because a Honk verifier IS
-//! its verification key: a release with new code must be a new address,
-//! not a silent replacement. Neither is declared in a network file.
+//! Two kinds of contract are NOT in this table and in no network file:
+//! proxy implementations, which a proxy slot references and an upgrade
+//! replaces without moving any entry address, and the ceremony circuits'
+//! Honk verifiers, which a Platform Verifier references. Both deploy at the
+//! CREATE2 address of their code ([`crate::code`]): a release with new code
+//! is a new address, not a silent replacement.
 
 use libid_contracts::factory::{
     predict_address,
@@ -36,7 +34,8 @@ use libid_contracts::factory::{
 };
 
 use crate::{
-    circuits,
+    apply::Upgrade,
+    code::Code,
     platforms,
 };
 
@@ -140,8 +139,9 @@ pub fn canonical_name(key: &str) -> Option<&'static str> {
 }
 
 /// Render the full address table of one deployer: the CREATE2 deployer, the
-/// factory, and every canonical contract. The same on every EVM chain that
-/// deployer deploys to. Pure computation — no RPC.
+/// factory, every canonical contract, and where this release's
+/// implementations and circuit verifiers deploy. The same on every EVM chain
+/// that deployer deploys to. Pure computation — no RPC.
 pub fn render_address_table(genesis: FactoryGenesis) -> anyhow::Result<String> {
     use std::fmt::Write;
 
@@ -174,25 +174,33 @@ pub fn render_address_table(genesis: FactoryGenesis) -> anyhow::Result<String> {
             c.name
         );
     }
-    // Not declared in any network file, but just as deterministic: where
-    // apply deploys a circuit verifier when no Platform Verifier uses one
-    // with its code, through the same factory under a name carrying the
-    // circuits release.
-    for circuit in platforms::circuits() {
-        let name = circuits::factory_name(circuit)?;
-        let addr = predict_address(factory, &name);
-        let _ = writeln!(
-            out,
-            "  {:<34} {:<34} {addr:#x}",
-            format!("circuits.{}", circuit.name()),
-            name
-        );
+    // Not declared in any network file, but just as deterministic: the
+    // implementation an upgrade moves its proxy to, and a circuit verifier
+    // no Platform Verifier uses yet.
+    let implementations = Upgrade::VALUES.iter().map(|value| {
+        let upgrade: Upgrade = value.parse()?;
+        anyhow::Ok((
+            format!("implementations.{}", upgrade.contracts_key()),
+            upgrade.contract(),
+        ))
+    });
+    let verifiers = platforms::circuits()
+        .into_iter()
+        .map(|circuit| Ok((format!("circuits.{}", circuit.name()), circuit.contract())));
+    for row in implementations.chain(verifiers) {
+        let (component, contract) = row?;
+        let addr = Code::of(&artifacts, contract)?.address();
+        let _ = writeln!(out, "  {component:<34} {contract:<34} {addr:#x}");
     }
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use alloy::primitives::Address;
+
     use super::*;
 
     /// Names are the sole input to an address, so a duplicate key or a
@@ -204,6 +212,28 @@ mod tests {
                 assert_ne!(a.key, b.key, "duplicate key {}", a.key);
                 assert_ne!(a.name, b.name, "duplicate name {}", a.name);
             }
+        }
+    }
+
+    /// The printed table holds every implementation and circuit verifier of
+    /// the release at the address of its code, each its own.
+    #[test]
+    fn the_printed_table_holds_the_release_code_addresses() {
+        let artifacts = libid_contracts::Artifacts::embedded();
+        let genesis = FactoryGenesis {
+            admin: Address::repeat_byte(0x11),
+        };
+        let table = render_address_table(genesis).unwrap();
+        let mut printed = BTreeSet::new();
+        for contract in Upgrade::VALUES
+            .iter()
+            .map(|value| value.parse::<Upgrade>().unwrap().contract())
+            .chain(platforms::circuits().into_iter().map(|c| c.contract()))
+        {
+            let address = Code::of(&artifacts, contract).unwrap().address();
+            let row = format!(" {contract:<34} {address:#x}\n");
+            assert!(table.contains(&row), "{contract} is missing:\n{table}");
+            assert!(printed.insert(address), "{contract} shares an address");
         }
     }
 

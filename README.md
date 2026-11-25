@@ -64,9 +64,9 @@ after the identity registry it resolves through:
 Then two steps `Deploy.s.sol` does not have:
 
 6. **A Honk verifier per ceremony circuit** — the bb-generated UltraHonk
-   verifier each platform's proofs are checked under, deployed through the
-   factory under a CREATE3 name carrying the pinned circuits release,
-   unless the Platform Verifiers already use one with the same code.
+   verifier each platform's proofs are checked under, deployed at the
+   CREATE2 address of its code unless the Platform Verifiers already use
+   one with the same code.
 7. **A Platform Verifier per platform** — `XPlatformVerifier`,
    `GitHubPlatformVerifier`, `GooglePlatformVerifier` — deployed behind its
    own CREATE3 proxy, initialized with `(owner, notary, honkVerifier)`
@@ -105,11 +105,8 @@ pins in `bin/libid-deploy/Cargo.toml` are the one place every artifact
 moves from — the circuits release the Honk verifiers derive from included
 — and `Cargo.lock` is the only other file a bump touches.
 
-The circuits release the embedded verifiers came from is read back out of
-the crate (`libid_contracts::circuits::version`) and becomes part of each
-verifier's factory name below, so the name follows the pin and cannot be
-restated. The crate's bindings are `sol!` over the compiled ABIs, so they
-cannot drift from the artifacts.
+The crate's bindings are `sol!` over the compiled ABIs, so they cannot
+drift from the artifacts.
 
 ### How the circuit verifier is wired
 
@@ -126,15 +123,15 @@ circuits, not three: `oidc-google` proves the Google JWT, and
 because their statements are byte-identical — so both TLSNotary platforms
 pin one deployed verifier.
 
-A Platform Verifier whose verifier holds the vendored code keeps it,
-under whatever name it was deployed, so a circuits release that rebuilds
-the same verifiers deploys and rotates nothing. Otherwise the verifier
-deploys through the factory under `libid.circuits.<circuit>.<version>`,
-and a second run finds code at that address and sends nothing. A
-circuits release with new code is a new name and a new address, and a new
-Platform Verifier implementation that pins its hash: apply rotates onto it
-only with `--upgrade <platform>-platform-verifier` in the same run, then
-sends `setTrustRoots`. The proxy and its registration do not move.
+A Platform Verifier whose verifier holds the vendored code keeps it, at
+whatever address it was deployed, so a circuits release that rebuilds the
+same verifiers deploys and rotates nothing. Otherwise the verifier deploys
+at the [address of its code](#one-address-for-the-code), and a second run
+finds code there and sends nothing. A circuits release with new code is a
+new address, and a new Platform Verifier implementation that pins its hash:
+apply rotates onto it only with `--upgrade <platform>-platform-verifier` in
+the same run, then sends `setTrustRoots`. The proxy and its registration do
+not move.
 
 Each verifier is bb's optimized template, one contract that links
 nothing: a fresh chain pays for two verifiers, and a verifier's code hash —
@@ -192,27 +189,31 @@ The mainnet table, deployer `0x7e00d33b5c571ca2b2879309c4846ddd80f4128e`
 | `contracts.github_platform_verifier` | `0x4f6d4a3486a00b260a1dd91f9dde6f333de6861f` |
 | `contracts.google_platform_verifier` | `0x731f3943879ccf40a21a7b84e9b7ec01776cb9cc` |
 
-The circuit verifiers go through the same factory but are not in that
-table and not in any network file: their names carry the circuits release
-`libid-contracts` vendors, so a release with new code moves them. The
-verifiers in use are `libid-circuits` 0.7.1's, under its names;
-`libid-circuits` 0.8.0 builds the same code, so they stay:
+### One address for the code
 
-| Component | Name | Address (testnet) |
+The implementations and the circuit verifiers deploy through the keyless
+CREATE2 deployer with a zero salt, so each one's address is a function of
+its creation code alone:
+
+```
+keccak256(0xff ++ 0x4e59b44847b379578588920cA78FbF26c0B4956C ++ 0x00…00 ++ keccak256(creationCode))[12:]
+```
+
+It is the same address on every network and for every deployer, and the
+code there came from that creation code, whoever sent it. `plan
+--print-addresses` prints them beside the canonical table, under
+`implementations.*` and `circuits.*`, so a release gives every address its
+`--upgrade`s can move a proxy to without reading a chain.
+
+They are not in any network file. A proxy's implementation is the one in its
+EIP-1967 slot, which moves only with `--upgrade`, **without moving any entry
+address**. A chain keeps the verifiers its Platform Verifiers use while
+their code matches the pin. The verifiers in use:
+
+| Component | Testnet | Mainnet |
 |---|---|---|
-| `circuits.bearer-link` | `libid.circuits.bearer-link.0.7.1` | `0x90aefe0648a496183c18bef07245c5ed253bee2c` |
-| `circuits.oidc-google` | `libid.circuits.oidc-google.0.7.1` | `0x787117a19f0bb1df86be05094a749c47d2bd1633` |
-
-On mainnet they are `0xae0674895f5a8a63d2fa94a9e50f41152b9de50b` and
-`0xaa3e32ccd6bb0c497bf203deb3608eb986d3b571`.
-
-`plan --print-addresses` prints the canonical table and the addresses the
-pinned circuits release names, where a verifier deploys when no Platform
-Verifier uses one with its code.
-
-Implementations stay plain CREATE deploys: their addresses are referenced
-by a proxy slot, not canonical, and upgrades replace them **without moving
-any entry address**.
+| `circuits.bearer-link` | `0x90aefe0648a496183c18bef07245c5ed253bee2c` | `0xae0674895f5a8a63d2fa94a9e50f41152b9de50b` |
+| `circuits.oidc-google` | `0x787117a19f0bb1df86be05094a749c47d2bd1633` | `0xaa3e32ccd6bb0c497bf203deb3608eb986d3b571` |
 
 How apply gets there, in order:
 
@@ -258,8 +259,7 @@ in the flow is the KMS key, which never leaves AWS.
 The circuit verifiers are not in the file. They are a property of the
 binary's contracts pin — which carries the circuits release — not of a
 network: a chain keeps the verifiers its Platform Verifiers use while their
-code matches the pin, and a new one's address derives from the pin the same
-way the canonical table derives from its names.
+code matches the pin, and a new one deploys at the address of its code.
 
 The `[accounts].owner` flow: the factory's genesis owner is
 `accounts.deployer`, the apply signer. `apply` needs factory ownership only
@@ -407,8 +407,9 @@ cargo run -- validate --network networks/eden-testnet.toml
 
 # read-only diff against the chain; --json for machine output. The plan
 # leads with the onboarding gate (CREATE2 deployer + factory) and quotes
-# the predicted CREATE3 address of everything missing — even on an empty
-# chain. --print-addresses prints the canonical table offline and exits.
+# the predicted address of everything missing — even on an empty chain.
+# --print-addresses prints the canonical table and the addresses of the
+# release's code offline and exits.
 cargo run -- plan --network networks/eden-testnet.toml
 
 # converge; the signer defaults to aws.kms_deployer (needs ambient AWS
@@ -449,7 +450,9 @@ Upgrade components: `notary-service`, `proof-verifier`, `identity-registry`,
 `github-platform-verifier`, `google-platform-verifier`. Each is a UUPS
 `upgradeToAndCall`: the entry address, its storage and its owner all
 survive, so an upgrade never moves a canonical address and never disturbs
-a registration. Each upgrade runs inside its component's own step, before
+a registration. It points the proxy at the address of the release's code,
+deploying the code where the chain lacks it: one transaction or two, and
+none where the proxy is on that address already. Each upgrade runs inside its component's own step, before
 apply reads or wires that component: a proxy whose running implementation
 predates a getter the wiring reads (`plan` flags it as `WARN ... read
 failed`) converges in the same `apply --upgrade` run instead of aborting
@@ -578,8 +581,10 @@ release` runs the Linux x86_64 asset of the tag its `release` input names.
   contracts apply installs, the testnet top-ups — to the target exactly,
   once, only under `--fund`, and after every other step —
   the Platform Verifier deploy/register/rotate path, the network-invariance
-  proof: two separate bare anvils converge onto the same
-  declared canonical addresses, and the `--rpc-url` contract: the committed
+  proof: two separate bare anvils, the deployer at another nonce on each,
+  converge onto the same declared canonical addresses, implementations and
+  circuit verifiers, the upgrades — each proxy onto the address of its
+  code, a repeated one sending nothing — and the `--rpc-url` contract: the committed
   local-dev file, unmodified, converges an anvil the file does not name,
   while a wrong chain id or a dead override is refused. The circuit
   verifiers those tests deploy are the real Honk verifiers: each is handed

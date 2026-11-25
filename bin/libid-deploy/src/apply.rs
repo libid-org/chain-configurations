@@ -15,9 +15,10 @@
 //! CREATE2 addresses differently and the run aborts), and then every entry
 //! contract deploys THROUGH the factory via CREATE3 under its canonical
 //! name from [`crate::names`], so its address is a pure function of the
-//! name — identical on every network. Implementations stay plain CREATE
-//! deploys: their addresses are referenced by a proxy slot, not canonical,
-//! and upgrades replace them without moving any entry address.
+//! name — identical on every network. Implementations and circuit verifiers
+//! deploy through the CREATE2 deployer at the address of their code
+//! ([`crate::code`]): a proxy slot or a Platform Verifier references them,
+//! and an upgrade replaces one without moving any entry address.
 //!
 //! The stack order is `script/Deploy.s.sol`'s: the Notary Service every
 //! notarized session is authenticated through, the Proof Verifier the
@@ -84,18 +85,18 @@ use libid_contracts::{
         escrow::HandleEscrow,
         factory::LibidFactory,
         identity::IdentityRegistry,
+        proxy::IUUPSUpgradeable,
     },
-    deploy::{
-        deploy_contract_from,
-        upgrade_uups,
-    },
+    deploy::ProxyReads,
     factory::{
         ensure_create2_deployer,
         predict_address,
         FactoryGenesis,
+        CREATE2_DEPLOYER,
     },
     send_with_nonce_retry,
     Artifacts,
+    Error,
 };
 
 use crate::{
@@ -105,6 +106,7 @@ use crate::{
         Verifiers,
         Wired,
     },
+    code::Code,
     config::{
         NetworkConfig,
         Stack,
@@ -152,7 +154,7 @@ pub enum Upgrade {
 
 impl Upgrade {
     /// The proxy's `[contracts]` key.
-    fn contracts_key(self) -> &'static str {
+    pub(crate) fn contracts_key(self) -> &'static str {
         match self {
             Self::NotaryService => "notary_service",
             Self::ProofVerifier => "ceremony_proof_verifier",
@@ -165,8 +167,8 @@ impl Upgrade {
         }
     }
 
-    /// The compiled contract whose implementation is redeployed.
-    fn contract(self) -> &'static str {
+    /// The compiled contract whose implementation the proxy moves to.
+    pub(crate) fn contract(self) -> &'static str {
         match self {
             Self::NotaryService => "NotaryService",
             Self::ProofVerifier => "CeremonyProofVerifier",
@@ -253,6 +255,9 @@ pub struct Summary {
     pub deployed: Vec<(String, Address)>,
     /// Explicitly upgraded components.
     pub upgraded: Vec<String>,
+    /// Components an `--upgrade` named that run this release's
+    /// implementation already.
+    pub current: Vec<String>,
     /// On-chain configuration changes beyond the always-resent idempotent
     /// ops — signer and fee convergence, wiring, ownership handovers.
     pub configured: Vec<String>,
@@ -281,6 +286,9 @@ impl Summary {
             let _ = writeln!(out, "Upgraded: none");
         } else {
             let _ = writeln!(out, "Upgraded: {}", self.upgraded.join(", "));
+        }
+        if !self.current.is_empty() {
+            let _ = writeln!(out, "Already on this release: {}", self.current.join(", "));
         }
         if !self.configured.is_empty() {
             let _ = writeln!(out, "Configured: {}", self.configured.join(", "));
@@ -448,13 +456,8 @@ impl<'a> Applier<'a> {
             let declared = self.cfg.contracts.address(platform.contracts_key)?;
             needs_factory_deploy |= !self.code_present(declared).await?;
         }
-        // A circuit verifier no Platform Verifier uses yet deploys through
-        // the factory too, under a name carrying the pinned circuits release.
         for circuit in platforms::circuits() {
             let site = self.verifiers().site(circuit).await?;
-            if let Site::Named { address, .. } = site {
-                needs_factory_deploy |= !self.code_present(address).await?;
-            }
             self.circuits.insert(circuit, site);
         }
         if needs_factory_deploy {
@@ -477,12 +480,12 @@ impl<'a> Applier<'a> {
 
         // Every requested upgrade ran inside its component's section above;
         // a component none of them owns would have been silently dropped.
-        if self.summary.upgraded.len() != self.opts.upgrades.len() {
+        let applied = self.summary.upgraded.len() + self.summary.current.len();
+        if applied != self.opts.upgrades.len() {
             bail!(
-                "{} upgrade(s) requested, {} applied — a requested component has \
-                 no section in apply",
+                "{} upgrade(s) requested, {applied} applied — a requested component \
+                 has no section in apply",
                 self.opts.upgrades.len(),
-                self.summary.upgraded.len()
             );
         }
 
@@ -880,18 +883,26 @@ impl<'a> Applier<'a> {
             provider: &self.provider,
             artifacts: &self.artifacts,
             contracts: &self.cfg.contracts,
-            factory: self.factory,
         }
     }
 
     /// Whether `addr` has code on-chain — the declarative presence check.
     async fn code_present(&self, addr: Address) -> Result<bool> {
-        Ok(!self
-            .provider
-            .get_code_at(addr)
-            .await
-            .map_err(|e| anyhow!("get_code({addr:#x}) failed: {e}"))?
-            .is_empty())
+        self.code_present_at(addr, ReadAt::Latest).await
+    }
+
+    /// Whether `addr` has code on-chain, read at `at`.
+    async fn code_present_at(&self, addr: Address, at: ReadAt) -> Result<bool> {
+        let code = at
+            .read("get_code", |block| {
+                let read = self.provider.get_code_at(addr).block_id(block);
+                async move {
+                    read.await
+                        .map_err(|e| anyhow!("get_code({addr:#x}) failed: {e}"))
+                }
+            })
+            .await?;
+        Ok(!code.is_empty())
     }
 
     /// Hand the factory over to `desired`, the declared `[accounts].owner`
@@ -1098,17 +1109,45 @@ impl<'a> Applier<'a> {
         })
     }
 
-    /// Deploy `contract`'s implementation via plain CREATE (its address is
-    /// referenced, not canonical), then CREATE3-deploy an ERC1967 proxy for
-    /// it under `name` through the factory, initialized with the ABI-encoded
-    /// `init_data`. The named-proxy shape of every UUPS entry contract.
+    /// Deploy `code`, `contract`'s, through the CREATE2 deployer. Code at its
+    /// address came from the same creation code, whoever sent it, so a caller
+    /// that finds some there has nothing to deploy.
+    async fn deploy_code(&self, contract: &str, code: &Code) -> Result<()> {
+        let receipt = send_with_nonce_retry!(
+            RawCallBuilder::new_raw(&self.provider, code.calldata()).to(CREATE2_DEPLOYER),
+            format!("CREATE2 deploy of {contract}"),
+            &self.provider,
+            self.sender
+        )?;
+        let address = code.address();
+        if !self.code_present_at(address, ReadAt::of(&receipt)).await? {
+            bail!("the CREATE2 deploy of {contract} left no code at {address:#x}");
+        }
+        tracing::info!(contract, %address, "code deployed at its CREATE2 address");
+        Ok(())
+    }
+
+    /// The address of `contract`'s implementation, deployed if the chain
+    /// lacks it.
+    async fn implementation(&self, contract: &str) -> Result<Address> {
+        let code = Code::of(&self.artifacts, contract)?;
+        let address = code.address();
+        if !self.code_present(address).await? {
+            self.deploy_code(contract, &code).await?;
+        }
+        Ok(address)
+    }
+
+    /// Put `contract`'s [`implementation`](Self::implementation) in place,
+    /// then CREATE3-deploy an ERC1967 proxy for it under `name` through the
+    /// factory, initialized with the ABI-encoded `init_data`. The named-proxy
+    /// shape of every UUPS entry contract.
     async fn deploy_named_proxy(
         &self,
         name: &str,
         contract: &str,
         init_data: Bytes,
     ) -> Result<Address> {
-        let implementation_code = self.artifacts.bytecode(contract)?;
         // Reuse before paying for an implementation nobody will point at.
         let record = LibidFactory::new(self.factory, &self.provider)
             .deployedAt(name.to_string())
@@ -1119,13 +1158,7 @@ impl<'a> Applier<'a> {
             return Ok(self.factory_deploy_named(name, Bytes::new()).await?.address);
         }
 
-        let implementation = deploy_contract_from(
-            &self.provider,
-            implementation_code,
-            &format!("{contract} (impl)"),
-            Some(self.sender),
-        )
-        .await?;
+        let implementation = self.implementation(contract).await?;
         let creation_code = self.proxy_creation_code(implementation, init_data)?;
         Ok(self
             .factory_deploy_named(name, creation_code)
@@ -1134,31 +1167,21 @@ impl<'a> Applier<'a> {
     }
 
     /// The circuit verifier for `circuit`: the one its Platform Verifiers
-    /// already use, or the copy under [`crate::circuits::factory_name`],
-    /// deployed if the chain lacks it. A second apply finds code at the same
-    /// address and sends nothing.
+    /// already use, or the one at its code's address, deployed if the chain
+    /// lacks it. A second apply finds code at the same address and sends
+    /// nothing.
     async fn circuit_verifier(&mut self, circuit: Circuit) -> Result<Address> {
-        let (name, address) = match self.circuits.get(&circuit) {
+        let address = match self.circuits.get(&circuit) {
             Some(Site::InUse(address)) => return Ok(*address),
-            Some(Site::Named { name, address }) => (name.clone(), *address),
+            Some(Site::Vendored(address)) => *address,
             None => bail!("{} verifier was not located", circuit.name()),
         };
         if !self.code_present(address).await? {
-            let creation_code = self.artifacts.bytecode(circuit.contract())?;
-            let deployed = self
-                .factory_deploy_named(&name, creation_code)
-                .await?
-                .address;
-            tracing::info!(
-                circuit = circuit.name(),
-                %deployed,
-                %name,
-                "circuit verifier deployed"
-            );
-            debug_assert_eq!(deployed, address);
+            let code = Code::of(&self.artifacts, circuit.contract())?;
+            self.deploy_code(circuit.contract(), &code).await?;
             self.summary
                 .deployed
-                .push((format!("circuits.{}", circuit.name()), deployed));
+                .push((format!("circuits.{}", circuit.name()), address));
         }
         Ok(address)
     }
@@ -1214,11 +1237,10 @@ impl<'a> Applier<'a> {
 
     /// Point a Platform Verifier at its circuit's verifier when the one it
     /// uses lacks the vendored code; one that holds it stays, whatever its
-    /// address. A circuits release with new code lands under a new factory
-    /// name, and the proxy's implementation compiles in the code hash it
-    /// accepts, so the rotation needs `--upgrade` of that Platform Verifier
-    /// in the same run; without it apply stops before sending
-    /// `setTrustRoots`.
+    /// address. A circuits release with new code lands at a new address, and
+    /// the proxy's implementation compiles in the code hash it accepts, so
+    /// the rotation needs `--upgrade` of that Platform Verifier in the same
+    /// run; without it apply stops before sending `setTrustRoots`.
     ///
     /// The surface is `PlatformVerifierBase`'s, identical in every Platform
     /// Verifier. The Notary Service the proxy holds is kept: zero for
@@ -1334,20 +1356,51 @@ impl<'a> Applier<'a> {
         Ok(())
     }
 
-    /// Replace a UUPS proxy's implementation with a freshly deployed one of
-    /// `upgrade`'s contract. The entry address, its storage and its owner
-    /// all survive; an upgrade the proxy's EIP-1967 slot does not show is an
-    /// error.
-    async fn upgrade_proxy(&self, upgrade: Upgrade, proxy: Address) -> Result<Address> {
-        Ok(upgrade_uups(
+    /// Move a UUPS proxy to this release's implementation of `upgrade`'s
+    /// contract; one that runs it already is left as it is. The entry
+    /// address, its storage and its owner all survive; an upgrade the proxy's
+    /// EIP-1967 slot does not show is an error.
+    async fn upgrade_proxy(&mut self, upgrade: Upgrade, proxy: Address) -> Result<()> {
+        let contract = upgrade.contract();
+        let wanted = Code::of(&self.artifacts, contract)?.address();
+        if self.implementation_at(proxy, ReadAt::Latest).await? == wanted {
+            tracing::info!(contract, %proxy, %wanted, "proxy runs this release already");
+            self.summary.current.push(format!("{contract} {wanted:#x}"));
+            return Ok(());
+        }
+
+        self.implementation(contract).await?;
+        let receipt = send_with_nonce_retry!(
+            IUUPSUpgradeable::new(proxy, &self.provider)
+                .upgradeToAndCall(wanted, Bytes::new()),
+            format!("{contract}.upgradeToAndCall"),
             &self.provider,
-            &self.artifacts,
-            proxy,
-            upgrade.contract(),
-            Bytes::new(),
-            Some(self.sender),
-        )
-        .await?)
+            self.sender
+        )?;
+        let found = self.implementation_at(proxy, ReadAt::of(&receipt)).await?;
+        if found != wanted {
+            return Err(Error::NotUpgraded {
+                contract: contract.to_string(),
+                proxy,
+                wanted,
+                found,
+            }
+            .into());
+        }
+        tracing::info!(contract, %proxy, new_impl = %wanted, "proxy upgraded");
+        self.summary
+            .upgraded
+            .push(format!("{contract} -> {wanted:#x}"));
+        Ok(())
+    }
+
+    /// The implementation the proxy at `proxy` runs, from its EIP-1967 slot
+    /// read at `at`.
+    async fn implementation_at(&self, proxy: Address, at: ReadAt) -> Result<Address> {
+        at.read("implementation slot", |block| async move {
+            Ok(self.provider.implementation_of(proxy, block).await?)
+        })
+        .await
     }
 
     /// Run the `--upgrade`s that name the proxy under `[contracts].<key>`.
@@ -1366,16 +1419,7 @@ impl<'a> Applier<'a> {
             .filter(|u| u.contracts_key() == key)
             .collect();
         for upgrade in requested {
-            let new_impl = self.upgrade_proxy(upgrade, proxy).await?;
-            tracing::info!(
-                contract = upgrade.contract(),
-                %proxy,
-                %new_impl,
-                "proxy upgraded"
-            );
-            self.summary
-                .upgraded
-                .push(format!("{} -> {new_impl:#x}", upgrade.contract()));
+            self.upgrade_proxy(upgrade, proxy).await?;
         }
         Ok(())
     }

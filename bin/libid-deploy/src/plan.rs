@@ -318,9 +318,8 @@ impl Planner<'_> {
 
         // ── The ceremony circuit verifiers ───────────────────────────────
         // The one the Platform Verifiers use when it holds the vendored
-        // code; otherwise apply deploys one through the factory under a name
-        // carrying the pinned circuits release, known here before the chain
-        // has anything on it.
+        // code; otherwise apply deploys one at the address of its code, known
+        // here before the chain has anything on it.
         let mut verifiers: BTreeMap<Circuit, Address> = BTreeMap::new();
         for circuit in platforms::circuits() {
             verifiers.insert(circuit, self.circuit(circuit).await?);
@@ -456,21 +455,19 @@ impl Planner<'_> {
         self.push(RootsRotation { needed });
     }
 
-    /// Reads which circuit verifiers the Platform Verifiers use, a new one
-    /// deploying under the declared factory.
-    fn verifiers(&self) -> Result<Verifiers<'_>> {
-        Ok(Verifiers {
+    /// Reads which circuit verifiers the Platform Verifiers use.
+    fn verifiers(&self) -> Verifiers<'_> {
+        Verifiers {
             provider: &self.provider,
             artifacts: &self.artifacts,
             contracts: &self.cfg.contracts,
-            factory: self.cfg.contracts.address("factory")?,
-        })
+        }
     }
 
     /// A ceremony circuit's verifier; returns where it is, or would be,
     /// deployed.
     async fn circuit(&mut self, circuit: Circuit) -> Result<Address> {
-        let verifiers = self.verifiers()?;
+        let verifiers = self.verifiers();
         let site = verifiers.site(circuit).await?;
         let address = site.address();
         let codehash = verifiers.code_hash(address).await?;
@@ -500,7 +497,7 @@ impl Planner<'_> {
 
         if self.code(&platform.component(), proxy).await? {
             let wired = self
-                .verifiers()?
+                .verifiers()
                 .wired(platform)
                 .await
                 .map_err(|e| format!("{e:#}"));

@@ -372,7 +372,7 @@ impl From<CircuitVerifier> for Item {
             vendored,
         } = check;
         let component = format!("circuits.{}", circuit.name());
-        let (address, name) = match site {
+        let address = match site {
             Site::InUse(address) => {
                 return Item::new(
                     component,
@@ -383,21 +383,21 @@ impl From<CircuitVerifier> for Item {
                     ),
                 )
             }
-            Site::Named { name, address } => (address, name),
+            Site::Vendored(address) => address,
         };
         match codehash {
             None => Item::new(
                 component,
                 Status::Deploy,
                 format!(
-                    "declared at {address:#x} — no code on-chain; apply would deploy \
-                     '{name}' there"
+                    "no code at {address:#x}, the CREATE2 address of its code; apply \
+                     would deploy it there"
                 ),
             ),
             Some(hash) if hash == vendored => Item::new(
                 component,
                 Status::Ok,
-                format!("{address:#x} (codehash {vendored:#x}, '{name}')"),
+                format!("{address:#x} (codehash {vendored:#x})"),
             ),
             Some(hash) => Item::new(
                 component,
@@ -775,18 +775,15 @@ mod tests {
     fn a_circuit_verifier_with_foreign_code_warns() {
         let item = Item::from(CircuitVerifier {
             circuit: X.circuit(),
-            site: Site::Named {
-                name: "libid.circuits.test".into(),
-                address: DECLARED,
-            },
+            site: Site::Vendored(DECLARED),
             codehash: Some(B256::repeat_byte(0xbb)),
             vendored: B256::repeat_byte(0xaa),
         });
         assert_eq!(item.status, Status::Warn);
     }
 
-    /// A circuit verifier the Platform Verifiers use is in place, whatever
-    /// name it was deployed under.
+    /// A circuit verifier the Platform Verifiers use is in place, wherever
+    /// it was deployed.
     #[test]
     fn a_circuit_verifier_in_use_is_ok() {
         let vendored = B256::repeat_byte(0xaa);
